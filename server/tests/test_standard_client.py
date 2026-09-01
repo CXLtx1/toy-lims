@@ -85,6 +85,18 @@ class StandardInstrumentClientTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_mol_instrument_is_available_as_moles_per_liter(self):
+        created = self.client.post("/api/instruments", json={
+            "name": "摩尔浓度仪", "itype": "mol",
+        })
+        self.assertEqual(200, created.status_code, created.get_data(as_text=True))
+        instruments = self.client.get("/api/instrument/standard/instruments").get_json()["instruments"]
+        mol = next(item for item in instruments if item["name"] == "摩尔浓度仪")
+        self.assertEqual("mol", mol["itype"])
+        self.assertEqual("mol/L", mol["input_unit"])
+        task = {"itype": "mol", "prep_factor": 99}
+        self.assertEqual((0.025, "mol/L"), lims.reading_value(task, False, 0.025, {}))
+
     def test_user_login_start_measurement_and_expiry(self):
         sid, instrument = self.create_queued_sample()
         connection = sqlite3.connect(lims.DB)

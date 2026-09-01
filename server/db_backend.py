@@ -30,7 +30,7 @@ IDENTITY_TABLES = {
 
 POSTGRES_TABLE_ORDER = (
     "analytes", "chemical_elements", "common_oxides", "instruments", "instr_analytes", "dilutions",
-    "volume_presets", "methods", "templates", "preparation_combinations", "report_profiles",
+    "volume_presets", "methods", "method_catalog_migrations", "templates", "preparation_combinations", "report_profiles",
     "result_order_templates",
     "special_methods", "users", "samples", "special_results",
     "preparations", "sample_analytes", "results", "readings",
@@ -268,7 +268,10 @@ class PostgresConnection:
                 self.raw.execute("BEGIN")
             return EmptyCursor()
         statement = _postgres_sql(sql)
-        cursor = self.raw.execute(statement, tuple(params))
+        # Passing an empty parameter tuple makes psycopg parse literal percent signs
+        # as placeholders (for example DEFAULT '%').
+        cursor = (self.raw.execute(statement, tuple(params)) if params
+                  else self.raw.execute(statement))
         returned = cursor.fetchall() if re.search(r"\bRETURNING\b", statement, re.IGNORECASE) else ()
         return PostgresCursor(cursor, returned)
 

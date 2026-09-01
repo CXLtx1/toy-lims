@@ -114,31 +114,50 @@ class SampleApiTest(unittest.TestCase):
     def test_formula_auto_detects_variables_and_method_note_is_editable(self):
         created = self.client.post("/api/methods", json={
             "name": "自动变量公式", "itype": "function", "formula": "(A1/A2)*50",
-            "constants": {}, "note": "先加入指示剂，再缓慢滴定。",
+            "constants": {}, "note": "先加入指示剂，再缓慢滴定。", "output_unit": "mol/L",
         })
         self.assertEqual(200, created.status_code, created.get_data(as_text=True))
         method = next(item for item in self.client.get("/api/meta").get_json()["methods"]
                       if item["name"] == "自动变量公式")
         updated = self.client.put(f"/api/methods/{method['id']}/note", json={
-            "note": "滴定至终点颜色保持 30 秒。",
+            "note": "滴定至终点颜色保持 30 秒。", "active": 0,
         })
         self.assertEqual(200, updated.status_code, updated.get_data(as_text=True))
         saved = next(item for item in self.client.get("/api/meta").get_json()["methods"]
                      if item["id"] == method["id"])
         self.assertEqual("滴定至终点颜色保持 30 秒。", saved["note"])
+        self.assertEqual("mol/L", saved["output_unit"])
+        self.assertEqual(0, saved["active"])
 
         task = {
             "itype": "function", "formula": "(A1/A2)*50", "method_constants": "{}",
-            "prep_mass": 1, "prep_vol": 250, "prep_factor": 1,
+            "method_output_unit": "mol/L", "prep_mass": 1, "prep_vol": 250,
+            "prep_factor": 1,
         }
-        self.assertEqual((100.0, "%"), lims.reading_value(task, False, None, {"A1": 4, "A2": 2}))
+        self.assertEqual((100.0, "mol/L"), lims.reading_value(task, False, None, {"A1": 4, "A2": 2}))
         task["formula"] = "m/v*100"
-        self.assertEqual((0.4, "%"), lims.reading_value(task, False, None, {}))
+        task["method_output_unit"] = "g/L"
+        self.assertEqual((0.4, "g/L"), lims.reading_value(task, False, None, {}))
 
         rejected = self.client.post("/api/methods", json={
             "name": "非法公式", "itype": "function", "formula": "A1.__class__", "constants": {},
         })
         self.assertEqual(400, rejected.status_code)
+        bad_unit = self.client.post("/api/methods", json={
+            "name": "非法单位", "itype": "function", "formula": "V",
+            "constants": {}, "output_unit": "kg/L",
+        })
+        self.assertEqual(400, bad_unit.status_code)
+
+    def test_methods_can_be_reordered_for_picker(self):
+        methods = self.client.get("/api/meta").get_json()["methods"]
+        reversed_ids = [method["id"] for method in reversed(methods)]
+        response = self.client.put("/api/methods/order", json={"ids": reversed_ids})
+        self.assertEqual(200, response.status_code, response.get_data(as_text=True))
+        ordered = self.client.get("/api/meta").get_json()["methods"]
+        self.assertEqual(reversed_ids, [method["id"] for method in ordered])
+        self.assertEqual(list(range(1, len(ordered) + 1)),
+                         [method["sort_order"] for method in ordered])
 
     def test_multistage_dilution_multiplies_factor_and_preserves_steps(self):
         dilution = next(d for d in self.meta["dilutions"] if d["label"] == "5/250")

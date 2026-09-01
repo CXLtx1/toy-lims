@@ -382,6 +382,7 @@
           <option value="xrf">XRF（独立仪器数据）</option>
           <option value="ppm">ppm（mg/L 换算）</option>
           <option value="ppb">ppb（μg/L 换算）</option>
+          <option value="mol">mol（mol/L 直读）</option>
           <option value="percent">percent（% 直读）</option>
           <option value="function">function（公式换算）</option>
           <option value="ph">pH（直读）</option>
@@ -394,11 +395,13 @@
       <h2>分析方法</h2>
       <p class="hint">公式中的英文标识符会自动识别为变量，例如 (A1/A2)*50。m 固定取称样量(g)，v 固定取定容体积(mL)；其他变量可录入，或在方法常数中固定。</p>
       <div class="row"><select id="m-type"><option value="function">公式方法</option><option value="xrf">XRF 方法</option></select>
+        <select id="m-output-unit" title="公式计算结果的单位"><option value="%">输出 %</option><option value="ppm">输出 ppm</option><option value="ppb">输出 ppb</option><option value="mol/L">输出 mol/L</option><option value="g/L">输出 g/L</option></select>
         <input id="m-name" placeholder="方法名，如 WUNI0820"><input id="m-formula" placeholder="滴定公式（XRF 方法留空）" style="flex:1">
         <button id="m-add">添加</button></div>
       <div class="row"><input id="m-constants" placeholder="固定常数，如 A2=10 或 M=65.38">
         <textarea id="m-note" rows="3" placeholder="滴定说明（可自定义，详情弹窗中显示）" style="flex:1"></textarea></div>
-      <table id="m-table"><thead><tr><th>类型</th><th>名称</th><th>公式</th><th>固定常数</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
+      <p class="hint">方法在下表中的顺序，也是来样和模板中方法选择弹窗的显示顺序。</p>
+      <table id="m-table"><thead><tr><th>启用</th><th>类型</th><th>名称</th><th>输出</th><th>公式</th><th>固定常数</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
     </div>
     <div class="panel template-panel">
       <div class="section-head"><h2 id="t-editor-title">样品模板</h2><button id="t-cancel" type="button" hidden>取消编辑</button></div>
@@ -491,11 +494,21 @@
   </form>
 </section>
 
+<div id="method-picker-backdrop" class="dialog-backdrop" hidden>
+  <section class="method-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="method-picker-title">
+    <button id="method-picker-x" class="dialog-x" type="button" aria-label="关闭">×</button>
+    <div class="method-picker-heading"><div><span>公式方法</span><h2 id="method-picker-title">选择滴定方法</h2></div><b id="method-picker-count"></b></div>
+    <label class="method-picker-search"><span aria-hidden="true">⌕</span><input id="method-picker-search" type="search" autocomplete="off" placeholder="搜索方法名称、公式或说明"></label>
+    <div id="method-picker-list" class="method-picker-list"></div>
+    <div class="method-picker-footer"><button id="method-picker-clear" type="button">不选择方法</button><span>可在设置页调整显示顺序</span></div>
+  </section>
+</div>
+
 <div id="method-detail-backdrop" class="dialog-backdrop" hidden>
   <section class="method-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="method-detail-title">
     <button id="method-detail-x" class="dialog-x" type="button" aria-label="关闭">×</button>
     <h2 id="method-detail-title">滴定方法详情</h2>
-    <dl class="method-detail-meta"><dt>公式</dt><dd id="method-detail-formula"></dd><dt>固定参数</dt><dd id="method-detail-constants"></dd></dl>
+    <dl class="method-detail-meta"><dt>输出单位</dt><dd id="method-detail-output-unit"></dd><dt>公式</dt><dd id="method-detail-formula"></dd><dt>固定参数</dt><dd id="method-detail-constants"></dd></dl>
     <h3>滴定说明</h3><div id="method-detail-note"></div>
     <div class="dialog-actions"><button id="method-detail-close" type="button" class="primary">关闭</button></div>
   </section>

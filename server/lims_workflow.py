@@ -57,6 +57,7 @@ _AUDIT_FIELD_LABELS = {
     "aux": "辅助数据", "expected": "标称", "measured": "回读", "use": "带标",
     "use_avg": "参与计算", "is_final": "旧终值标记", "active": "启用状态",
     "role": "旧角色", "permissions": "能力", "display_name": "显示名称", "formula": "公式", "constants": "固定常数",
+    "output_unit": "输出单位",
     "note": "备注", "factor": "倍数", "aliquot_ml": "移取体积(mL)",
     "final_volume_ml": "再次定容(mL)", "analyte_ids": "测定项目",
     "sort_order": "排序",

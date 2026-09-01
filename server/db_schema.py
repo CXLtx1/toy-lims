@@ -151,6 +151,37 @@ SPECIAL_METHOD_SEEDS = [
     ("calorimeter", "量热分析", "量热仪", {"title":"量热仪分析原始记录","groups":[{"name":"热值结果","fields":[{"key":"analysis_time","label":"分析时间","type":"datetime-local"},{"key":"hhv","label":"高位热值 HHV","unit":"cal/g","required":True},{"key":"lhv","label":"低位热值 LHV","unit":"cal/g","required":True}]}]})
 ]
 
+FORMULA_METHOD_CATALOG_VERSION = "lims-formulas-summary-v1"
+FORMULA_METHOD_CATALOG = [
+    ("Cu-碘量法", "c*V*63.55/m/1000*100", "%", "c=硫代硫酸钠浓度(mol/L)，V=消耗体积(mL)，m=称样质量(g)。"),
+    ("Zn-EDTA滴定法", "c*V*65.38*v/Va/m/1000*100", "%", "c=EDTA浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("Cl-硝酸银滴定法", "c*V*35.5*v/Va/m/1000*100", "%", "c=硝酸银浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("Al2O3-硫酸铜反滴定法", "c*V*50.98*v/Va/m/1000*100", "%", "c=硫酸铜浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("Cr-硫酸亚铁铵滴定法", "V2/V1*58.37", "%", "V1=58.37%铬标准样消耗体积(mL)，V2=样品消耗体积(mL)。"),
+    ("P-铋盐钼蓝分光光度法", "A2/A1*0.073", "%", "A1=0.073%磷标准样吸光度，A2=样品吸光度。"),
+    ("Ca-EDTA滴定法", "c*V*40.08*v/Va/m/1000*100", "%", "c=EDTA浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("CaO-EDTA滴定法", "c*V*56.08*v/Va/m/1000*100", "%", "c=EDTA浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("CaCO3-EDTA滴定法", "c*V*100.09*v/Va/m/1000*100", "%", "c=EDTA浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("Ca(OH)2-EDTA滴定法", "c*V*74.096*v/Va/m/1000*100", "%", "c=EDTA浓度(mol/L)，V=消耗体积(mL)，v=消解定容体积(mL)，Va=分取母液体积(mL)，m=称样质量(g)。"),
+    ("Cu-分光光度法（一次稀释）", "c*V1*v*A2/(A1*V5*m*1000000)*100", "%", "c=铜标准液浓度(mg/L)，V1=标准液移取体积，v=样品定容体积，V5=显色取样量，A1/A2=标准/试样吸光度，m=称样质量。"),
+    ("Cu-分光光度法（二次稀释）", "c*V1*v*A2*V3/(A1*V4*V5*m*1000000)*100", "%", "V3/V4=中间定容/分取体积；其余变量同一次稀释法。"),
+    ("Ni-丁二酮肟分光光度法", "A2/A1*4.04", "%", "A1=4.04%镍标准样吸光度，A2=样品吸光度。"),
+    ("H+-酸碱滴定法", "c*V2/V1", "mol/L", "c=NaOH浓度(mol/L)，V1=样品移取体积(mL)，V2=NaOH消耗体积(mL)。"),
+    ("OH--酸碱滴定法", "c*V2/V1", "mol/L", "c=HCl浓度(mol/L)，V1=样品移取体积(mL)，V2=HCl消耗体积(mL)。"),
+    ("HCl-酸碱滴定法", "c*V*36.45/m/1000*100", "%", "c=NaOH浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)。"),
+    ("H2SO4-酸碱滴定法", "c*V*(98.08/2)/m/1000*100", "%", "c=NaOH浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)。"),
+    ("NaClO-硫代硫酸钠滴定法", "c*V*37.221/m/1000*100", "%", "c=硫代硫酸钠浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)。"),
+    ("NaOH-酸碱滴定法", "c*V*40/m/1000*100", "%", "c=HCl浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)。"),
+    ("Na2CO3-酸碱滴定法", "c*V*105.98/m/1000*100", "%", "c=HCl浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)；按汇总文件原公式。"),
+    ("NH3-酸碱滴定法", "c*V*17.03/m/1000*100", "%", "c=HCl浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)。"),
+    ("H2O2-高锰酸钾滴定法", "c*V*34.01*2.5/m/1000*100", "%", "c=KMnO4物质的量浓度(mol/L)，V=消耗体积(mL)，m=试样质量(g)。"),
+    ("水分-干燥失重法", "(m-(m3-m1))/m*100", "%", "m1=空白称量瓶质量(g)，m=试样质量(g)，m3=干燥后试样与称量瓶总质量(g)。"),
+    ("COD-重铬酸钾法", "c*(V0-V1)*8000/V2*f", "ppm", "c=硫酸亚铁铵浓度(mol/L)，V0/V1=空白/水样消耗体积，V2=水样体积，f=人工录入稀释倍数；ppm按mg/L使用。"),
+    ("Cl-比浊法（一次稀释）", "c*V1*v*A2/(A1*V5*m*1000000)*100", "%", "c=氯标准液浓度(mg/L)，V1=标准液移取体积，v=样品定容体积，V5=比浊取样量，A1/A2=标准/试样吸光度，m=称样质量。"),
+    ("Cl-比浊法（二次稀释）", "c*V1*v*A2*V3/(A1*V4*V5*m*1000000)*100", "%", "V3/V4=中间定容/分取体积；其余变量同一次稀释法。"),
+    ("TN-总氮浓度计算", "C/V*f", "ppm", "C=仪器测得总氮含量(μg)，V=对应样品体积(mL)，f=人工录入稀释倍数；ppm按mg/L使用。"),
+]
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS analytes(
@@ -178,7 +209,7 @@ CREATE TABLE IF NOT EXISTS instruments(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     itype TEXT NOT NULL,
-    sort_order INTEGER DEFAULT 0);   -- xrf | ppm | ppb | percent | function | ph
+    sort_order INTEGER DEFAULT 0);   -- xrf | ppm | ppb | mol | percent | function | ph
 CREATE TABLE IF NOT EXISTS instr_analytes(
     instrument_id INTEGER NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
     analyte_id INTEGER NOT NULL REFERENCES analytes(id) ON DELETE CASCADE,
@@ -198,7 +229,13 @@ CREATE TABLE IF NOT EXISTS methods(           -- 仪器方法
     itype TEXT DEFAULT 'function',
     formula TEXT NOT NULL,   -- 变量: V V0 c M m, 结果以质量分数%计
     constants TEXT DEFAULT '{}', -- 方法固定常数，如原子量 {"M":65.38}
-    note TEXT DEFAULT '');
+    note TEXT DEFAULT '',
+    output_unit TEXT DEFAULT '%',
+    active INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS method_catalog_migrations(
+    version TEXT PRIMARY KEY,
+    applied_at TEXT DEFAULT (datetime('now','localtime')));
 CREATE TABLE IF NOT EXISTS templates(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -492,6 +529,22 @@ def _upgrade_sqlite_terminal_kinds(db):
         DROP TABLE terminals_old_kind;""")
 
 
+def _install_formula_method_catalog(db):
+    """Install the approved catalog once while preserving historical method rows."""
+    if db.execute("SELECT 1 FROM method_catalog_migrations WHERE version=?",
+                  (FORMULA_METHOD_CATALOG_VERSION,)).fetchone():
+        return
+    db.execute("UPDATE methods SET active=0 WHERE itype='function'")
+    next_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM methods").fetchone()[0]
+    for offset, (name, formula, output_unit, note) in enumerate(FORMULA_METHOD_CATALOG):
+        db.execute("""INSERT INTO methods(
+            name,itype,formula,constants,note,output_unit,active,sort_order)
+            VALUES(?,'function',?,'{}',?,?,1,?)""",
+            (name, formula, note, output_unit, next_order + offset))
+    db.execute("INSERT INTO method_catalog_migrations(version) VALUES(?)",
+               (FORMULA_METHOD_CATALOG_VERSION,))
+
+
 def _seed_reference_data(db):
     """参考数据种子(幂等)。SQLite 与 PostgreSQL 初始化共用。"""
     first_run = not db.execute("SELECT COUNT(*) FROM analytes").fetchone()[0]
@@ -525,7 +578,9 @@ def _seed_reference_data(db):
                 "Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Ru Rh Pd Ag Cd "
                 "In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Sm Eu Gd Tb Dy Ho Er Tm Yb Lu "
                 "Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi").split()
-    analytes = elements + ["pH", "TOC", "NPOC"]
+    analytes = elements + ["pH", "TOC", "NPOC", "H+", "OH-", "HCl", "H2SO4",
+        "NaClO", "NaOH", "Na2CO3", "NH3", "H2O2", "水分", "COD", "TN",
+        "Al2O3", "CaO", "CaCO3", "Ca(OH)2"]
     db.executemany("INSERT OR IGNORE INTO analytes(name) VALUES(?)", [(a,) for a in analytes])
     instruments = [
         ("X射线荧光光谱仪(XRF)", "xrf"),
@@ -563,7 +618,9 @@ def _seed_reference_data(db):
         "TOC分析仪": ["TOC", "NPOC"],
         "pH计": ["pH"],
         "氟离子选择电极": ["F"],
-        "滴定": ["Fe", "Al", "Ca", "Mg", "Cl", "F", "Cu", "Zn", "Mn"],
+        "滴定": ["Fe", "Al", "Ca", "Mg", "Cl", "F", "Cu", "Zn", "Mn", "Cr", "P",
+               "Ni", "H+", "OH-", "HCl", "H2SO4", "NaClO", "NaOH", "Na2CO3",
+               "NH3", "H2O2", "水分", "COD", "TN", "Al2O3", "CaO", "CaCO3", "Ca(OH)2"],
     }
     for iname, alist in caps.items():
         db.executemany("INSERT OR IGNORE INTO instr_analytes VALUES(?,?)",
@@ -585,37 +642,11 @@ def _seed_reference_data(db):
         db.execute("""INSERT INTO volume_presets(volume_ml) SELECT ?
                       WHERE NOT EXISTS(SELECT 1 FROM volume_presets WHERE volume_ml=?)""",
                    (volume_ml, volume_ml))
-    # 原子量按 CIAAW 标准原子量四舍五入到小数点后两位。固定常数不会要求操作者重复录入。
-    # 公式变量: V=样品消耗标准液体积(mL), V0=空白体积(mL), c=标准液浓度(mol/L),
-    #           M=待测组分摩尔质量(g/mol), m=称样量(g, 取溶样称样量), 结果以质量分数%计。
-    titration_methods = [
-        ("Zn-EDTA络合滴定", "(V-V0)*c*M/m/1000*100", {"M": 65.38},
-         "EDTA与Zn按1:1计算；c为EDTA的mol/L浓度。参考ISO 1784，具体前处理和终点按实验室SOP执行。"),
-        ("Fe-EDTA络合滴定", "(V-V0)*c*M/m/1000*100", {"M": 55.85},
-         "EDTA与Fe按1:1计算；c为EDTA的mol/L浓度。参考ISO 4748，具体前处理和终点按实验室SOP执行。"),
-        ("Fe-重铬酸钾滴定", "(V-V0)*c*6*M/m/1000*100", {"M": 55.85},
-         "c为K2Cr2O7的mol/L浓度，1 mol重铬酸根氧化6 mol Fe(II)。参考ISO 2597-1。"),
-        ("Cl-硝酸银滴定法", "(V-V0)*c*M/m/1000*100", {"M": 35.45},
-         "Ag+与Cl-按1:1反应生成AgCl沉淀，铬酸钾指示剂；c为AgNO3标准溶液的mol/L浓度，结果以Cl计。参考GB/T 11896；固体样品按实验室SOP溶样移取后测定。"),
-        ("Al2O3-EDTA络合硫酸铜返滴定", "(V-V0)*c*M/2/m/1000*100", {"M": 101.96},
-         "先加入过量EDTA与Al按1:1络合，再用CuSO4标准溶液返滴定（PAN指示剂）；V为EDTA加入体积，V0为CuSO4返滴体积，c按两标准溶液等浓度(mol/L)计，不等时请先折算；结果以Al2O3计，n(Al2O3)=n(EDTA净耗)/2。参考GB/T 176。"),
-        ("Cu-碘量法", "(V-V0)*c*M/m/1000*100", {"M": 63.55},
-         "Cu(II)氧化I-析出I2，淀粉指示剂；c为Na2S2O3标准溶液的mol/L浓度，1 mol Na2S2O3相当于1 mol Cu。参考GB/T 3884.1。"),
-        ("Ca-EDTA络合滴定", "(V-V0)*c*M/m/1000*100", {"M": 40.08},
-         "EDTA与Ca按1:1计算；c为EDTA的mol/L浓度；KOH调节pH>12.5，钙黄绿素类指示剂，结果以Ca计。参考GB/T 176。"),
-        ("酸碱滴定(通用)", "(V-V0)*c*M/m/1000*100", {},
-         "通用酸碱滴定；M由操作者录入待测组分的摩尔质量(g/mol)，非1:1反应时取克当量；c为标准滴定液的mol/L浓度。标准滴定液的配制与标定参考GB/T 601。"),
-        ("有效氯-碘量法(次氯酸钠)", "(V-V0)*c*M/m/1000*100", {"M": 35.45},
-         "OCl-氧化I-析出I2后用Na2S2O3滴定，淀粉指示剂；结果以有效氯(以Cl计)%表示，1 mol Na2S2O3相当于1 mol Cl；c为Na2S2O3标准溶液的mol/L浓度。参考GB/T 19106。"),
-    ]
-    for name, formula, constants, note in titration_methods:
-        db.execute("""INSERT INTO methods(name,itype,formula,constants,note)
-                      SELECT ?,'function',?,?,? WHERE NOT EXISTS(
-                          SELECT 1 FROM methods WHERE name=?)""",
-                   (name, formula, json.dumps(constants), note, name))
-    db.execute("""INSERT INTO methods(name,itype,formula,constants,note)
-                  SELECT 'WUNI0820','xrf','', '{}','XRF 定量方法'
-                  WHERE NOT EXISTS(SELECT 1 FROM methods WHERE name='WUNI0820')""")
+    _install_formula_method_catalog(db)
+    db.execute("""INSERT INTO methods(name,itype,formula,constants,note,sort_order)
+                   SELECT 'WUNI0820','xrf','', '{}','XRF 定量方法',
+                          COALESCE((SELECT MAX(sort_order)+1 FROM methods),1)
+                   WHERE NOT EXISTS(SELECT 1 FROM methods WHERE name='WUNI0820')""")
     for sort_order, (code, name, instrument, schema) in enumerate(SPECIAL_METHOD_SEEDS, 1):
         db.execute("""INSERT INTO special_methods(code,name,instrument,schema_json,sort_order)
             VALUES(?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,
@@ -685,6 +716,12 @@ def initialize_database(database):
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_label TEXT DEFAULT ''")
         db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS report_excludes TEXT DEFAULT '[]'")
         db.execute("ALTER TABLE xrf_values ADD COLUMN IF NOT EXISTS alt_name TEXT DEFAULT ''")
+        db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0")
+        db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS output_unit TEXT DEFAULT '%'")
+        db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS active INTEGER DEFAULT 1")
+        db.execute("UPDATE methods SET sort_order=id WHERE sort_order IS NULL OR sort_order=0")
+        db.execute("UPDATE methods SET output_unit='%' WHERE output_unit IS NULL OR output_unit=''")
+        db.execute("UPDATE methods SET active=1 WHERE active IS NULL")
         _backfill_preparation_dilutions(db)
         _upgrade_postgres_terminal_kinds(db)
         _upgrade_review_workflow(db)
@@ -839,6 +876,15 @@ def initialize_database(database):
         db.execute("ALTER TABLE methods ADD COLUMN itype TEXT DEFAULT 'function'")
     if "constants" not in method_cols:
         db.execute("ALTER TABLE methods ADD COLUMN constants TEXT DEFAULT '{}'")
+    if "sort_order" not in method_cols:
+        db.execute("ALTER TABLE methods ADD COLUMN sort_order INTEGER DEFAULT 0")
+    if "output_unit" not in method_cols:
+        db.execute("ALTER TABLE methods ADD COLUMN output_unit TEXT DEFAULT '%'")
+    if "active" not in method_cols:
+        db.execute("ALTER TABLE methods ADD COLUMN active INTEGER DEFAULT 1")
+    db.execute("UPDATE methods SET sort_order=id WHERE sort_order IS NULL OR sort_order=0")
+    db.execute("UPDATE methods SET output_unit='%' WHERE output_unit IS NULL OR output_unit=''")
+    db.execute("UPDATE methods SET active=1 WHERE active IS NULL")
     # 仪器类型只描述数据单位/换算方式，不再重复表达 ICP、AAS、TOC 等仪器技术名称。
     db.execute("""UPDATE instruments SET itype=CASE
         WHEN lower(itype)='titration' THEN 'function'

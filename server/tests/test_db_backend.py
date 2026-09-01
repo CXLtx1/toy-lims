@@ -155,29 +155,67 @@ class DatabaseBackendTest(unittest.TestCase):
             db_backend.PostgresConnection("postgresql://example")
         fake_raw.execute.assert_called_once_with("SET TIME ZONE 'Asia/Shanghai'")
 
-    def test_builtin_titration_methods_are_seeded(self):
+    def test_postgres_execute_does_not_parse_percent_without_parameters(self):
+        fake_raw = mock.MagicMock()
+        cursor = mock.MagicMock(description=None, rowcount=0)
+        with mock.patch.object(db_backend, "psycopg") as fake_psycopg:
+            fake_psycopg.connect.return_value = fake_raw
+            fake_raw.execute.return_value = cursor
+            connection = db_backend.PostgresConnection("postgresql://example")
+            fake_raw.execute.reset_mock()
+            connection.execute("ALTER TABLE methods ADD output_unit TEXT DEFAULT '%'")
+        fake_raw.execute.assert_called_once_with(
+            "ALTER TABLE methods ADD output_unit TEXT DEFAULT '%'")
+
+    def test_approved_formula_catalog_is_seeded_once(self):
         with tempfile.TemporaryDirectory() as directory:
-            initialize_database(os.path.join(directory, "fresh.db"))
-            db = sqlite3.connect(os.path.join(directory, "fresh.db"))
+            database = os.path.join(directory, "fresh.db")
+            initialize_database(database)
+            db = sqlite3.connect(database)
             db.row_factory = sqlite3.Row
             try:
-                rows = {r["name"]: r for r in db.execute(
-                    "SELECT name,formula,constants,note FROM methods WHERE itype='function'")}
-                expected = {
-                    "Cl-硝酸银滴定法": 35.45,
-                    "Cu-碘量法": 63.55,
-                    "Ca-EDTA络合滴定": 40.08,
-                    "有效氯-碘量法(次氯酸钠)": 35.45,
-                    "Zn-EDTA络合滴定": 65.38,
-                }
-                for name, molar_mass in expected.items():
-                    self.assertIn(name, rows)
-                    self.assertEqual(molar_mass, json.loads(rows[name]["constants"])["M"])
-                    self.assertEqual("(V-V0)*c*M/m/1000*100", rows[name]["formula"])
-                alumina = rows["Al2O3-EDTA络合硫酸铜返滴定"]
-                self.assertEqual("(V-V0)*c*M/2/m/1000*100", alumina["formula"])
-                self.assertEqual(101.96, json.loads(alumina["constants"])["M"])
-                self.assertEqual("{}", rows["酸碱滴定(通用)"]["constants"])
+                rows = list(db.execute("""SELECT name,formula,output_unit,active
+                    FROM methods WHERE itype='function' ORDER BY sort_order,id"""))
+                self.assertEqual(27, len(rows))
+                self.assertTrue(all(row["active"] == 1 for row in rows))
+                self.assertEqual("Cu-碘量法", rows[0]["name"])
+                self.assertEqual("TN-总氮浓度计算", rows[-1]["name"])
+                self.assertEqual("ppm", next(row["output_unit"] for row in rows
+                                              if row["name"] == "COD-重铬酸钾法"))
+                self.assertEqual("mol/L", next(row["output_unit"] for row in rows
+                                                if row["name"] == "H+-酸碱滴定法"))
+                for row in rows:
+                    import app as lims
+                    lims.formula_variables(row["formula"])
+            finally:
+                db.close()
+            initialize_database(database)
+            db = sqlite3.connect(database)
+            try:
+                self.assertEqual(27, db.execute(
+                    "SELECT COUNT(*) FROM methods WHERE itype='function'").fetchone()[0])
+                self.assertEqual(1, db.execute(
+                    "SELECT COUNT(*) FROM method_catalog_migrations").fetchone()[0])
+            finally:
+                db.close()
+
+    def test_existing_formula_methods_are_disabled_during_catalog_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = os.path.join(directory, "legacy-methods.db")
+            initialize_database(database)
+            db = sqlite3.connect(database)
+            db.execute("DELETE FROM method_catalog_migrations")
+            db.execute("INSERT INTO methods(name,itype,formula,active) VALUES('旧方法','function','V',1)")
+            legacy_id = db.execute("SELECT id FROM methods WHERE name='旧方法'").fetchone()[0]
+            db.commit()
+            db.close()
+            initialize_database(database)
+            db = sqlite3.connect(database)
+            try:
+                self.assertEqual(0, db.execute(
+                    "SELECT active FROM methods WHERE id=?", (legacy_id,)).fetchone()[0])
+                self.assertEqual(27, db.execute(
+                    "SELECT COUNT(*) FROM methods WHERE itype='function' AND active=1").fetchone()[0])
             finally:
                 db.close()
 

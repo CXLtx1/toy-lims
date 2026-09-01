@@ -75,7 +75,8 @@ if REQUEST_LOG_ENABLED and not REQUEST_LOGGER.handlers:
     REQUEST_LOGGER.setLevel(logging.INFO)
     REQUEST_LOGGER.propagate = False
 METHOD_FIXED_VARS = {"m", "v"}
-INSTRUMENT_TYPES = {"xrf", "ppm", "ppb", "percent", "function", "ph"}
+METHOD_OUTPUT_UNITS = {"%", "ppm", "ppb", "mol/L", "g/L"}
+INSTRUMENT_TYPES = {"xrf", "ppm", "ppb", "mol", "percent", "function", "ph"}
 
 # Database schema and initialization live in db_schema.py.
 
@@ -308,6 +309,8 @@ def reading_value(sa, is_liquid, raw, extra):
         return (None, "未选仪器")
     if it == "ph":
         return (raw, "pH") if raw is not None else (None, "未录入")
+    if it == "mol":
+        return (raw, "mol/L") if raw is not None else (None, "未录入")
     if it == "xrf":
         return (raw, "%") if raw is not None else (None, "未录入")
     factor = sa["prep_factor"] or 1
@@ -329,7 +332,7 @@ def reading_value(sa, is_liquid, raw, extra):
             val = special_formula_value(sa["formula"], env)
             if not math.isfinite(float(val)):
                 raise ValueError("计算结果不是有限数值")
-            return (float(val), "%")
+            return (float(val), sa.get("method_output_unit") or "%")
         except Exception as e:
             return (None, f"公式错误: {e}")
     if raw is None:
@@ -408,7 +411,7 @@ def task_defaults(db, instrument_map, analyte_id):
         return None, None
     method_id = config.get("method_id") if instrument["itype"] in {"function", "xrf"} else None
     if method_id and not db.execute(
-            "SELECT 1 FROM methods WHERE id=? AND itype=?",
+            "SELECT 1 FROM methods WHERE id=? AND itype=? AND active=1",
             (method_id, instrument["itype"])).fetchone():
         method_id = None
     return instrument_id, method_id
@@ -640,7 +643,7 @@ def meta():
         "dilutions": rows("SELECT * FROM dilutions ORDER BY active DESC,factor,id"),
         "volume_presets": rows("SELECT * FROM volume_presets ORDER BY active DESC,volume_ml,id"),
         "default_volume_ml": 250,
-        "methods": rows("SELECT * FROM methods ORDER BY id"),
+        "methods": rows("SELECT * FROM methods ORDER BY sort_order,id"),
         "special_methods": special_methods,
         "templates": rows("SELECT * FROM templates ORDER BY id"),
         "preparation_combinations": combinations,
@@ -1254,7 +1257,8 @@ def update_order(table, ids):
         if item_id in existing and item_id not in ordered:
             ordered.append(item_id)
     ordered.extend(sorted(existing - set(ordered)))
-    entity_type = "instrument" if table == "instruments" else "analyte"
+    entity_type = {"instruments": "instrument", "analytes": "analyte",
+                   "methods": "method"}[table]
     for position, item_id in enumerate(ordered, 1):
         db.execute(f"UPDATE {table} SET sort_order=? WHERE id=?", (position, item_id))
         audit_event(db, "reorder", entity_type, item_id,
@@ -1276,6 +1280,13 @@ def reorder_instruments():
 def reorder_analytes():
     return jsonify(ok=True, ids=update_order(
         "analytes", (request.json or {}).get("ids", [])))
+
+
+@app.route("/api/methods/order", methods=["PUT"])
+@capability_required("settings_manage")
+def reorder_methods():
+    return jsonify(ok=True, ids=update_order(
+        "methods", (request.json or {}).get("ids", [])))
 
 
 @app.route("/api/dilutions", methods=["POST"])
@@ -1514,14 +1525,18 @@ def add_method():
     note = str(d.get("note", "")).strip()
     if len(note) > 2000:
         return jsonify(ok=False, error="方法说明不能超过 2000 个字符"), 400
+    output_unit = str(d.get("output_unit") or "%").strip()
+    if output_unit not in METHOD_OUTPUT_UNITS:
+        return jsonify(ok=False, error="公式输出单位无效"), 400
     db = get_db()
     if itype == "xrf":
-        f, constants = "", {}
-    cur = db.execute("INSERT INTO methods(name,itype,formula,constants,note) VALUES(?,?,?,?,?)",
-                     (d["name"].strip(), itype, f, json.dumps(constants), note))
+        f, constants, output_unit = "", {}, "%"
+    cur = db.execute("""INSERT INTO methods(name,itype,formula,constants,note,output_unit,sort_order)
+                      VALUES(?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM methods),1))""",
+                     (d["name"].strip(), itype, f, json.dumps(constants), note, output_unit))
     audit_event(db, "create", "method", cur.lastrowid,
                 after={"name": d["name"].strip(), "itype": itype,
-                       "formula": f, "constants": constants})
+                        "formula": f, "constants": constants, "output_unit": output_unit})
     db.commit()
     return jsonify(ok=True)
 
@@ -1533,10 +1548,21 @@ def update_method_note(mid):
     before = db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone()
     if not before:
         return jsonify(ok=False, error="分析方法不存在"), 404
-    note = str((request.json or {}).get("note", "")).strip()
+    data = request.json or {}
+    note = str(data.get("note", "")).strip()
     if len(note) > 2000:
         return jsonify(ok=False, error="方法说明不能超过 2000 个字符"), 400
-    db.execute("UPDATE methods SET note=? WHERE id=?", (note, mid))
+    output_unit = str(data.get("output_unit") or before["output_unit"] or "%").strip()
+    if output_unit not in METHOD_OUTPUT_UNITS:
+        return jsonify(ok=False, error="公式输出单位无效"), 400
+    if before["itype"] == "xrf":
+        output_unit = "%"
+    try:
+        active = 1 if int(data.get("active", before["active"])) else 0
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="启用状态无效"), 400
+    db.execute("UPDATE methods SET note=?,output_unit=?,active=? WHERE id=?",
+               (note, output_unit, active, mid))
     audit_event(db, "update", "method", mid, before=before,
                 after=db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone())
     db.commit()
@@ -1548,8 +1574,8 @@ def update_method_note(mid):
 def del_method(mid):
     db = get_db()
     before = db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone()
-    # 解除已有任务对该方法的引用,否则外键 RESTRICT 会阻止删除
-    db.execute("UPDATE sample_analytes SET method_id=NULL WHERE method_id=?", (mid,))
+    if db.execute("SELECT 1 FROM sample_analytes WHERE method_id=? LIMIT 1", (mid,)).fetchone():
+        return jsonify(ok=False, error="方法已被样品使用，请改为停用以保留历史结果"), 409
     db.execute("DELETE FROM methods WHERE id=?", (mid,))
     if before:
         audit_event(db, "delete", "method", mid, before=before)
@@ -1846,7 +1872,8 @@ def sample_detail(sid):
                            i.name AS instrument, i.itype,
                            i.sort_order AS instrument_sort_order,
                            m.name AS method_name, m.formula, m.note AS method_note,
-                           m.constants AS method_constants, r.raw, r.extra, r.aux,
+                            m.constants AS method_constants, m.output_unit AS method_output_unit,
+                            r.raw, r.extra, r.aux,
                            p.name AS prep_name, p.mass_g AS prep_mass,
                            p.volume_ml AS prep_vol, p.dilution_factor AS prep_factor,
                            p.dilution_label AS prep_dilution
@@ -2234,7 +2261,7 @@ def del_reading(rid):
 # ---------------------------------------------------------------- 标准数值仪器客户端
 
 _STANDARD_INPUT_UNITS = {
-    "ppm": "mg/L", "ppb": "μg/L", "percent": "%", "ph": "pH",
+    "ppm": "mg/L", "ppb": "μg/L", "mol": "mol/L", "percent": "%", "ph": "pH",
 }
 _STANDARD_SESSION_SECONDS = 10 * 60
 
@@ -2325,7 +2352,7 @@ def standard_client_logout():
 @standard_client_required
 def standard_client_instruments():
     instruments = rows("""SELECT id,name,itype,sort_order FROM instruments
-        WHERE itype IN ('ppm','ppb','percent','ph') ORDER BY sort_order,id""")
+        WHERE itype IN ('ppm','ppb','mol','percent','ph') ORDER BY sort_order,id""")
     for instrument in instruments:
         instrument["input_unit"] = _STANDARD_INPUT_UNITS[instrument["itype"]]
     return jsonify(ok=True, instruments=instruments,
@@ -2346,7 +2373,7 @@ def standard_client_status():
         return jsonify(ok=False, error="缺少终端标识"), 400
     db = get_db()
     if not db.execute("""SELECT 1 FROM instruments WHERE id=?
-            AND itype IN ('ppm','ppb','percent','ph')""", (instrument_id,)).fetchone():
+            AND itype IN ('ppm','ppb','mol','percent','ph')""", (instrument_id,)).fetchone():
         return jsonify(ok=False, error="仪器不存在或不支持标准单值录入"), 404
     user = _standard_session_user(db)
     db.execute("""INSERT INTO standard_client_status(
@@ -2374,7 +2401,7 @@ def standard_client_tasks():
     if not _standard_session_user(db):
         return _standard_authorization_error()
     instrument = db.execute("""SELECT id,name,itype FROM instruments WHERE id=?
-        AND itype IN ('ppm','ppb','percent','ph')""", (instrument_id,)).fetchone()
+        AND itype IN ('ppm','ppb','mol','percent','ph')""", (instrument_id,)).fetchone()
     if not instrument:
         return jsonify(ok=False, error="仪器不存在或不支持单值录入"), 404
     task_rows = db.execute("""SELECT sa.id AS task_id,sa.status AS task_status,
@@ -2479,7 +2506,7 @@ def standard_client_submit():
         response["duplicate"] = True
         return jsonify(response)
     instrument = db.execute("""SELECT id,name,itype FROM instruments WHERE id=?
-        AND itype IN ('ppm','ppb','percent','ph')""", (instrument_id,)).fetchone()
+        AND itype IN ('ppm','ppb','mol','percent','ph')""", (instrument_id,)).fetchone()
     if not instrument:
         return jsonify(ok=False, error="仪器不存在或不支持单值录入"), 404
     clean = []
@@ -3261,7 +3288,7 @@ def build_report_payload(db, sid):
     items = [dict(row) for row in db.execute("""SELECT sa.*,a.name AS analyte,
         a.sort_order AS analyte_sort_order,i.name AS instrument,i.itype,
         i.sort_order AS instrument_sort_order,m.name AS method_name,m.formula,m.note AS method_note,
-        m.constants AS method_constants,r.raw,r.extra,r.aux,p.name AS prep_name,
+        m.constants AS method_constants,m.output_unit AS method_output_unit,r.raw,r.extra,r.aux,p.name AS prep_name,
         p.mass_g AS prep_mass,p.volume_ml AS prep_vol,p.dilution_factor AS prep_factor,
         p.dilution_label AS prep_dilution FROM sample_analytes sa JOIN analytes a ON a.id=sa.analyte_id
         LEFT JOIN instruments i ON i.id=sa.instrument_id LEFT JOIN methods m ON m.id=sa.method_id
