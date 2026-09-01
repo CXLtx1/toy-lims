@@ -2884,7 +2884,8 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
         if existing_sample and existing_sample["status"] in {"reviewed", "reported", "cancelled"}:
             return {"ok": True, "duplicate": True, "analysis_id": existing["id"],
                     "matched": True, "sample_id": existing["sample_id"],
-                    "sample_locked": True, "imported": [], "skipped": skipped}, 200
+                    "sample_locked": True, "imported": [],
+                    "skipped": list(skipped.values())}, 200
     linked_sample = db.execute("SELECT * FROM samples WHERE id=?", (existing["sample_id"],)).fetchone() \
         if existing and existing["sample_id"] else None
     options = data.get("options") if isinstance(data.get("options"), dict) else {}
