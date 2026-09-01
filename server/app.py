@@ -2926,7 +2926,7 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
     return {"ok": True, "duplicate": existing is not None, "analysis_id": analysis["id"],
             "matched": linked_sample is not None, "sample_id": linked_sample["id"] if linked_sample else None,
             "sample_locked": False, "manual_assignment_required": linked_sample is None,
-            "imported": imported, "skipped": skipped}, 200
+            "imported": imported, "skipped": list(skipped.values())}, 200
 
 
 def _ordinary_scan_payload(data):
