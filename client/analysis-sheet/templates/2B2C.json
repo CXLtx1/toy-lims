@@ -1,0 +1,20 @@
+{
+  "name": "2B2C（渣）",
+  "workbook": "2B2C.xlsx",
+  "worksheet": "渣",
+  "outputSheetName": "分析单",
+  "dateCell": "A2",
+  "timeCell": "E2",
+  "printArea": "$A$1:$G$14",
+  "resultFormats": {},
+  "slots": [
+    {
+      "name": "2B", "sampleCell": "A4", "elementColumn": "B", "resultColumn": "C", "startRow": 5, "endRow": 13,
+      "elements": ["SiO2", "MgO", "Al2O3", "CaO", "Fe", "Ni", "Cu", "Cr", "Zn"]
+    },
+    {
+      "name": "2C", "sampleCell": "E4", "elementColumn": "F", "resultColumn": "G", "startRow": 5, "endRow": 13,
+      "elements": ["SiO2", "MgO", "Al2O3", "CaO", "Fe", "Ni", "Cu", "Cr", "Zn"]
+    }
+  ]
+}

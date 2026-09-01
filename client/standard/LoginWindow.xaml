@@ -1,0 +1,17 @@
+<Window x:Class="ToyLims.StandardClient.LoginWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="用户登录" Width="390" Height="235" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" Background="#F3F6F7" FontFamily="Segoe UI, Microsoft YaHei">
+  <Grid Margin="22">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBlock Text="标准仪器用户登录" Foreground="#243D4C" FontSize="18" FontWeight="SemiBold"/>
+    <TextBlock Grid.Row="1" Margin="0,5,0,13" Text="请输入具备“检测数据录入”权限的用户密码。连续 10 分钟没有录入操作后需要重新登录。" TextWrapping="Wrap" Foreground="#677A84"/>
+    <PasswordBox Grid.Row="2" x:Name="PasswordBox" Padding="8,6" FontSize="14" KeyDown="PasswordBox_KeyDown"/>
+    <TextBlock Grid.Row="3" x:Name="ErrorText" Foreground="#B13C31" Margin="0,6,0,0" TextWrapping="Wrap"/>
+    <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button Content="取消" Padding="13,5" Margin="3" Click="Cancel_Click"/>
+      <Button Content="登录" Padding="16,5" Margin="3" Background="#168E96" Foreground="White" BorderBrush="#168E96" FontWeight="SemiBold" Click="Login_Click"/>
+    </StackPanel>
+  </Grid>
+</Window>

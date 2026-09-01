@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# .NET
+bin/
+obj/
+publish/
+
+# Databases / backups
+*.db
+*.db-shm
+*.db-wal
+server/backups/
+server/instance/
+
+# Archives
+*.zip
+
+# Node
+node_modules/
+
+# OS
+Thumbs.db
+Desktop.ini

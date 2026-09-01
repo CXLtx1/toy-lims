@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>初始化 · toy-lims</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/static/toy-lims.ico?v=20260830">
+<link rel="stylesheet" href="/static/style.css?v=20260830-brand-scope"></head>
+<body class="auth-page"><form class="auth-card" method="post">
+  <h1>系统初始化</h1>
+  {% if has_users %}
+  <p>检测到已有用户。初始化终端不会修改或删除现有用户，请使用具备用户管理能力的现有用户密码确认迁移。</p>
+  {% else %}
+  <p>创建具备全部能力的首个用户 <b>cxl</b>，并为初始普通终端和管理终端设置各自的入口密码。</p>
+  {% endif %}
+  {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
+  {% if has_users %}
+  <label>现有管理用户密码<input name="password" type="password" autocomplete="current-password" required autofocus></label>
+  {% else %}
+  <input name="username" type="hidden" value="cxl">
+  <label>首个用户<input value="cxl" disabled></label>
+  <label>显示姓名<input name="display_name" autocomplete="name" required autofocus></label>
+  <label>用户密码<input name="password" type="password" autocomplete="new-password" required></label>
+  {% endif %}
+  <div class="auth-divider"><span>终端入口</span></div>
+  <label>标准终端密码<input name="normal_terminal_password" type="password" autocomplete="new-password" required></label>
+  <small class="auth-hint">用于日常浏览；修改数据时再验证具体用户。</small>
+  <label>管理终端密码<input name="admin_terminal_password" type="password" autocomplete="new-password" required></label>
+  <small class="auth-hint">用于受控的管理终端入口，请使用不同密码。</small>
+  <button class="primary" type="submit">完成初始化</button>
+</form></body></html>

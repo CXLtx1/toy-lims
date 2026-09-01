@@ -1,0 +1,490 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>toy-lims · 无机分析实验室</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/static/toy-lims.ico?v=20260830">
+<link rel="stylesheet" href="/static/style.css?v=20260901-xrf-single-link">
+</head>
+<body>
+<header>
+  <h1 class="site-brand"><img src="/static/toy-lims.svg?v=20260830" alt=""><span>toy-lims</span></h1>
+  <nav>
+    <button class="tab active" data-page="intake">来样</button>
+    <button class="tab" data-page="data">数据</button>
+    <button class="tab" data-page="instrument">仪器</button>
+    <button class="tab" data-page="results">结果</button>
+    <button class="tab" data-page="report">报告</button>
+    <button class="tab" data-page="audit">审计</button>
+    <button class="tab" data-page="users">用户</button>
+    <button class="tab" data-page="settings">设置</button>
+    <button class="tab" data-page="about">关于</button>
+  </nav>
+  <button id="current-sample" type="button" hidden title="返回当前样品资料"></button>
+  <time id="server-clock" datetime="" title="服务器时间">服务器时间 --:--:--</time>
+  <div class="session-identity">
+    <span id="current-terminal"></span>
+    <span id="current-user"></span>
+  </div>
+  <button id="clear-authorization" type="button" hidden>结束授权</button>
+  <form action="/logout" method="post" class="logout-form"><button type="submit">退出终端</button></form>
+</header>
+
+<main>
+<!-- ================= 来样 ================= -->
+<section id="page-intake" class="page active">
+  <div class="panel sample-workspace">
+    <div class="sample-toolbar">
+      <button id="s-new" type="button" class="primary">+ 新建样品</button>
+      <button id="s-excel-create" type="button">从 Excel 新建</button>
+      <input id="s-excel-create-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
+      <div class="segmented" id="s-type-filter">
+        <button type="button" class="active" data-type="solid">固体样</button>
+        <button type="button" data-type="liquid">液体样</button>
+        <button type="button" data-type="special">其他样</button>
+        <button type="button" data-type="all">全部</button>
+      </div>
+      <input id="s-list-search" class="table-search" type="search" placeholder="搜索名称、编号或元素">
+      <label class="inline"><input id="s-show-cancelled" type="checkbox"> 显示已作废</label>
+      <span class="excel-date-range"><label>从 <input id="s-excel-date-from" type="date"></label><label>至 <input id="s-excel-date-to" type="date"></label></span>
+      <button id="s-excel-overview" type="button">导出总览</button>
+      <span id="s-workspace-msg"></span>
+    </div>
+
+    <div id="sample-editor-panel" class="sample-editor" hidden>
+      <div class="section-head"><h2 id="s-form-title">新建样品</h2>
+        <button id="s-cancel-edit" type="button">收起</button></div>
+      <div class="row">
+        <label>来样序号 <input id="s-name" placeholder="如 RY2888"></label>
+        <label>样品名称 <input id="s-category" list="s-categories" placeholder="如 Zn(OH)2沉淀">
+          <datalist id="s-categories"></datalist></label>
+        <label>模板
+          <select id="s-template"><option value="">— 不使用 —</option></select>
+          <button id="s-apply-tpl" type="button">应用</button>
+          <button id="s-save-template" type="button">保存当前方案</button>
+        </label>
+        <label>类型
+          <label class="inline"><input type="radio" name="s-liquid" value="0" checked> 固体</label>
+          <label class="inline"><input type="radio" name="s-liquid" value="1"> 液体样</label>
+          <label class="inline"><input type="radio" name="s-liquid" value="special"> 其他样</label>
+        </label>
+        <label class="inline"><input type="checkbox" id="s-xrf"> 打荧光(XRF粗扫)</label>
+      </div>
+      <div id="s-special-config" class="special-config" hidden>
+        <h3>专项检测</h3>
+        <label>特殊方法 <select id="s-special-method"></select></label>
+        <p class="hint">专项样不建立溶样、定容和常规元素任务；原始数据与计算结果独立保存。</p>
+      </div>
+      <div id="s-regular-config">
+      <div class="analyte-entry">
+      <h3>溶样后待测元素 / 指标（不含 XRF）</h3>
+      <div class="row">
+        <input id="s-analyte-text" placeholder="输入需要分配到 ICP、AAS、滴定等仪器的项目，如 Cu, Ag, Ni">
+      </div>
+      <div id="s-chips" class="tagbox"></div>
+      </div>
+      <div id="s-xrf-config" class="xrf-config" hidden>
+        <h3>XRF 方法与报告默认项目</h3>
+        <div class="row"><input id="s-xrf-text" placeholder="报告默认项目，可空，如 Fe, Si, Ca" style="width:min(680px,100%)">
+          <label>XRF 方法 <select id="s-xrf-method"></select></label></div>
+        <div id="s-xrf-chips" class="tagbox"></div>
+        <p class="hint">仪器返回的全部定量项目都会保存；这里填写的项目默认参与最终结果计算，之后可在结果页调整。</p>
+      </div>
+      <h3>溶样（每一路 = 称样 → 定容 → 稀释 → 测定项目）</h3>
+      <p class="hint">每一路直接在横向看板中选择测定项目并分配仪器：点击标签可多选，再拖到或点击目标栏；拖到“不测”表示该溶样不建立这些项目的检测任务。</p>
+      <div class="grid-toolbar"><button type="button" class="prep-grid-copy" title="复制选区 (Ctrl+C)">⧉</button><button type="button" class="prep-grid-fill" title="向下填充 (Ctrl+D)">↓</button><span id="p-grid-status"></span></div>
+      <div class="table-shell prep-shell"><table id="p-table" class="data-grid spreadsheet" tabindex="0">
+        <thead><tr>
+          <th>溶样名称（可改）</th><th class="solid-only">称样(g)</th><th class="solid-only">定容(mL)</th>
+          <th>稀释（可多级）</th><th>测定项目与仪器分配（横向拖拽）</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="editor-footer"><button id="p-add" type="button">+ 加一路溶样</button>
+        <span class="footer-spacer"></span>
+        <label class="prep-combination-picker">溶样组合 <select id="p-combination"><option value="">— 选择组合 —</option></select></label>
+        <button id="p-combination-add" type="button">追加组合</button></div>
+      </div>
+      <div class="editor-footer"><button id="s-excel-plan-export" type="button" hidden>导出样品方案</button>
+        <button id="s-excel-plan-import" type="button" hidden>Excel 覆盖方案</button>
+        <input id="s-excel-plan-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
+        <span class="footer-spacer"></span><span id="s-msg"></span><button id="s-submit" class="primary">创建样品</button></div>
+    </div>
+
+    <div id="s-card-list" class="sample-card-list"></div>
+    <div class="pager"><span id="s-list-count"></span><span class="footer-spacer"></span><label>每页 <select id="s-page-size"><option value="20">20</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label><button id="s-page-prev" type="button" title="上一页">‹</button><span id="s-page-label"></span><button id="s-page-next" type="button" title="下一页">›</button></div>
+  </div>
+</section>
+
+<!-- ================= 仪器 ================= -->
+<section id="page-instrument" class="page">
+  <div class="panel instrument-monitor">
+    <div class="section-head"><h2>标准仪器客户端</h2><button id="instrument-refresh" type="button">刷新</button></div>
+    <div id="standard-client-status" class="standard-client-list"></div>
+    <div class="section-head instrument-subhead"><h2>XRF 仪器状态与扫描记录</h2></div>
+    <div id="instrument-status" class="instrument-status"></div>
+    <div class="xrf-monitor-controls">
+      <input id="xrf-scan-search" type="search" autocomplete="off" placeholder="搜索样品、LIMS 编号、方法、批次或扫描编号">
+      <select id="xrf-scan-kind" aria-label="扫描类型"><option value="all">全部类型</option><option value="quant">普通定量</option><option value="uq">UniQuant</option></select>
+      <select id="xrf-scan-match" aria-label="登记情况"><option value="all">全部样品</option><option value="matched">已登记 LIMS</option><option value="unmatched">未登记 LIMS</option></select>
+      <label class="xrf-page-size-label">每页
+        <select id="xrf-scan-page-size" aria-label="每页条数">
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </label>
+      <span id="xrf-scan-count"></span>
+    </div>
+    <div class="table-shell xrf-history-shell"><table id="xrf-scan-history" class="data-grid"><thead><tr><th>时间</th><th>类型</th><th>原始样品</th><th>LIMS 关联</th><th>方法 / 选项</th><th>最终结果</th><th></th></tr></thead><tbody></tbody></table></div>
+    <div class="pager xrf-pager"><span id="xrf-page-summary"></span><button id="xrf-page-prev" type="button" title="上一页">‹</button><span id="xrf-page-label"></span><button id="xrf-page-next" type="button" title="下一页">›</button></div>
+  </div>
+</section>
+
+<!-- ================= 数据 ================= -->
+<section id="page-data" class="page">
+  <div class="panel">
+    <h2>原始数据录入</h2>
+    <div class="row"><label>样品
+      <span class="sample-picker"><input id="d-sample-search" type="search" autocomplete="off" placeholder="搜索样品名称或编号"><input id="d-sample" type="hidden"><span class="sample-options"></span></span>
+    </label><button id="d-edit-sample" type="button" title="编辑当前样品">样品资料</button>
+      <button id="d-view-report" type="button">查看报告</button>
+      <button id="d-manual-result" type="button" disabled>手工补录结果</button>
+      <button id="d-excel-export" type="button" disabled>导出数据 Excel</button>
+      <button id="d-excel-import" type="button" disabled>Excel 覆盖数据</button>
+      <input id="d-excel-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
+      <span id="d-info"></span><span id="d-status-actions" class="status-actions"></span></div>
+    <section id="d-xrf-panel" class="xrf-compact-panel" hidden>
+      <div class="xrf-compact-head"><h3>XRF 分析结果</h3><span id="d-xrf-meta"></span><button id="d-xrf-unassign" type="button" hidden>解绑当前扫描</button></div>
+      <div id="d-xrf-values" class="xrf-value-grid"></div>
+      <div class="xrf-data-assign">
+        <input id="d-xrf-scan-search" type="search" autocomplete="off" placeholder="搜索未关联扫描的原始样品、方法、批次或扫描编号">
+        <div id="d-xrf-scan-options" class="xrf-link-options"></div>
+      </div>
+    </section>
+    <div id="d-stage-workspace" class="data-stage-workspace">
+      <div id="d-stage-overlay" class="data-stage-overlay" hidden></div>
+      <div id="d-stage-content" class="data-stage-content">
+        <div id="d-regular-panel">
+          <div class="grid-toolbar noprint"><button type="button" class="grid-copy" title="复制选区 (Ctrl+C)">⧉</button><button type="button" class="grid-fill" title="向下填充 (Ctrl+D)">↓</button><span id="d-grid-status"></span></div>
+          <div class="table-shell"><table id="d-table" class="data-grid spreadsheet" tabindex="0"><thead><tr><th>项目</th><th>溶样</th><th>仪器/方法</th><th>原始值</th><th>辅助数据</th><th>状态</th></tr></thead><tbody></tbody></table></div>
+          <p class="hint">同仪器自动归为一组；“+再测一遍”可增加平行读数。多遍读数只需勾选是否“参与”：勾选多遍自动取平均，只勾选一遍就直接采用该遍。辅助数据填标称/回读并勾“带标”即按 回读÷标称 校正；所有输入失焦即自动保存。</p>
+        </div>
+        <div id="d-special-panel" class="special-data-panel" hidden></div>
+      </div>
+    </div>
+    <div class="row"><span id="d-msg"></span></div>
+  </div>
+</section>
+
+<div id="xrf-assign-dialog" class="dialog-backdrop" hidden>
+  <section class="xrf-assign-dialog" role="dialog" aria-modal="true" aria-labelledby="xrf-assign-title">
+    <button id="xrf-assign-close" class="dialog-x" type="button" aria-label="关闭">×</button>
+    <h2 id="xrf-assign-title">关联 LIMS 样品</h2>
+    <p id="xrf-assign-scan" class="hint"></p>
+    <input id="xrf-assign-sample-search" type="search" autocomplete="off" placeholder="搜索来样序号、样品名称或 LIMS 编号">
+    <div id="xrf-assign-sample-options" class="xrf-assign-sample-options"></div>
+  </section>
+</div>
+
+<!-- ================= 结果 ================= -->
+<section id="page-results" class="page">
+  <div class="panel results-workspace">
+    <div class="results-toolbar">
+      <h2>检测结果</h2>
+      <input id="results-search" type="search" placeholder="搜索样品名称或编号">
+      <button id="results-collapse-all" type="button" disabled>全部收起</button>
+      <button id="results-clear-selection" type="button" disabled>全部取消</button>
+      <label>顺序 <select id="results-template"><option value="">全局默认</option></select></label>
+      <button id="results-excel" type="button" disabled>导出结果报告 Excel</button>
+      <span id="results-count"></span>
+      <label>每页 <select id="results-page-size"><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
+      <span class="results-pager"><button id="results-page-prev" type="button">上一页</button><span id="results-page-label"></span><button id="results-page-next" type="button">下一页</button></span>
+    </div>
+    <div class="table-shell results-list-shell"><table id="results-list" class="data-grid">
+      <thead><tr><th><input id="results-check-all" type="checkbox" aria-label="全选"></th><th>LIMS 编号</th><th>来样序号</th><th>样品名称</th><th>状态</th><th>结果摘要</th><th>审核</th><th></th></tr></thead><tbody></tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ================= 报告 ================= -->
+<section id="page-report" class="page">
+  <div class="panel report-print-workspace">
+    <div class="report-queue-toolbar noprint"><h2>报告编排</h2>
+      <input id="report-search" type="search" placeholder="搜索已审核样品">
+      <label>每页 <select id="report-page-size"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select></label>
+      <span class="results-pager"><button id="report-page-prev" type="button">上一页</button><span id="report-page-label"></span><button id="report-page-next" type="button">下一页</button></span>
+      <span id="report-count"></span>
+    </div>
+    <div class="report-print-layout noprint">
+      <div id="report-samples" class="report-sample-list"></div>
+      <p class="hint">这里只显示已审核样品。勾选后会在下方同时展开全部样品内容；使用卡片或样品标题中的上下按钮调整整组报告顺序。</p>
+    </div>
+    <input id="r-sample" type="hidden"><input id="r-sample-search" type="hidden">
+    <div class="report-compose noprint">
+      <div class="row report-compose-toolbar">
+        <button id="r-edit-sample" type="button">样品资料</button>
+        <button id="r-enter-data" type="button">录入数据</button>
+        <span id="r-status-info" class="page-status-info"></span>
+      </div>
+      <section id="r-regular-details" class="calculation-details">
+        <div class="calculation-title"><h3 id="r-calculation-title">系统计算明细</h3>
+          <button id="r-order-default" type="button" title="使用设置中的默认元素顺序">恢复默认元素顺序</button>
+        </div>
+        <div id="r-system-details"><div id="r-head"></div>
+          <div class="table-shell"><table id="r-table" class="data-grid"><thead><tr><th>项目</th><th>溶样</th><th>方法/仪器</th><th>原始值</th><th>结果</th><th>打印</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </section>
+      <section id="r-special-details" class="calculation-details" hidden></section>
+      <div class="report-meta">
+        <label>报告版式 <select id="r-report-profile"></select></label>
+        <label>来样单位 <input id="r-customer" placeholder="可留空"></label>
+        <label>报告编号 <input id="r-report-no" placeholder="如 0005547"></label>
+        <label>分析日期 <input id="r-analysis-date" type="date"></label>
+        <label>分析人员 <input id="r-analyst"></label>
+        <label>审核人员 <input id="r-reviewer" readonly title="由实际执行审核的用户自动填写，不能手工修改"></label>
+        <button id="r-save-meta" type="button">保存票面信息</button>
+        <span id="r-meta-msg"></span>
+      </div>
+      <div class="report-actions">
+        <button id="r-excel-export" type="button" disabled>导出 Excel 报告</button>
+        <button id="r-print-raw" type="button" disabled>打印合并原始分析记录（A4横向）</button>
+        <button id="r-print-final" type="button">打印分析报告票（A5纵向）</button>
+      </div>
+    </div>
+    <div class="ticket-preview-shell"><article id="raw-ticket" class="raw-ticket-batch"></article></div>
+    <div class="ticket-preview-shell final-preview"><article id="final-ticket" class="print-document final-ticket"></article></div>
+  </div>
+</section>
+
+<!-- ================= 审计 ================= -->
+<section id="page-audit" class="page">
+  <div class="panel audit-page-panel">
+    <div class="section-head"><h2>审计记录</h2><button id="audit-refresh" type="button">刷新</button></div>
+    <div class="audit-toolbar">
+      <input id="audit-search" type="search" placeholder="搜索操作者、终端、动作、对象、原因、IP 或变更内容">
+      <select id="audit-action-filter"><option value="">全部动作</option></select>
+      <select id="audit-entity-filter"><option value="">全部对象</option></select>
+      <button id="audit-clear" type="button">清除过滤</button>
+      <span id="audit-count"></span>
+    </div>
+    <div class="table-shell audit-table-shell"><table id="audit-table" class="data-grid">
+      <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>对象</th><th>原因</th><th>网络位置</th><th></th></tr></thead><tbody></tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ================= 用户 ================= -->
+<section id="page-users" class="page">
+  <div class="grid2">
+    <div class="panel admin-only">
+      <h2>用户与能力</h2>
+      <div class="row"><input id="u-username" placeholder="登录用户名"><input id="u-display-name" placeholder="姓名">
+        <input id="u-password" type="password" placeholder="初始密码">
+        <button id="u-add">添加用户</button></div>
+      <p class="hint">新用户只能继承当前操作者已有的能力，不能获得更高权限。</p>
+      <div id="u-new-permissions" class="permission-picker"></div>
+      <div class="table-shell"><table id="u-table" class="data-grid"><thead><tr><th>用户名</th><th>姓名</th><th>能力</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="panel admin-only">
+      <h2>终端管理</h2>
+      <div class="row"><input id="terminal-name" placeholder="终端名称">
+        <input id="terminal-password" type="password" placeholder="终端密码">
+        <select id="terminal-kind"><option value="standard">普通终端</option><option value="admin">管理终端</option></select>
+        <button id="terminal-add" type="button">添加终端</button></div>
+      <p class="hint">这里只维护需要终端密码的普通终端和管理终端。个人入口默认对所有启用用户开放，不需要添加终端。当前终端不能停用或切换类型；系统必须至少保留一个启用的管理终端。</p>
+      <div class="table-shell"><table id="terminal-table" class="data-grid"><thead><tr><th>终端名称</th><th>类型</th><th>登录页顺序</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 设置 ================= -->
+<section id="page-settings" class="page">
+  <div class="grid2">
+    <div class="panel report-profile-panel">
+      <h2>报告版式</h2>
+      <p class="hint">可建立多套公司抬头和文件编号；原始分析记录与分析报告票共用公司名称，分别使用各自编号。</p>
+      <div class="report-profile-form">
+        <input id="rp-name" placeholder="版式名称，如 润虹默认">
+        <input id="rp-company-cn" placeholder="公司中文名">
+        <input id="rp-company-en" placeholder="公司英文名（可留空）">
+        <input id="rp-raw-code" placeholder="原始记录右上角编号">
+        <input id="rp-final-code" placeholder="报告票右上角编号">
+        <button id="rp-add" type="button">添加版式</button>
+      </div>
+      <div class="table-shell"><table id="rp-table" class="data-grid"><thead><tr><th>版式名称</th><th>公司中文名</th><th>公司英文名</th><th>原始记录编号</th><th>报告票编号</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="panel result-order-template-panel">
+      <h2>结果元素顺序模板</h2>
+      <p class="hint">用于结果报告 Excel。先写模板名称，再按显示顺序输入元素或结果项目，使用逗号、空格分隔。</p>
+      <div class="row"><input id="rot-name" placeholder="模板名称"><input id="rot-items" placeholder="如 Fe, Al, Ca, Mg, Si" style="flex:1"><button id="rot-add" type="button">添加模板</button></div>
+      <div class="table-shell"><table id="rot-table" class="data-grid"><thead><tr><th>名称</th><th>元素顺序</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="panel">
+      <h2>分析项目(元素/指标)</h2>
+      <div class="row"><input id="a-name" placeholder="如 Co"><button id="a-add">添加</button></div>
+      <div id="a-list" class="tagbox"></div>
+    </div>
+    <div class="panel solution-options-panel">
+      <h2>定容容量与二次稀释</h2>
+      <div class="setting-subsection">
+        <h3>定容容量</h3>
+        <p class="hint">来样和样品模板从这些容量中选择；新建溶样默认使用 250 mL。</p>
+        <div class="row"><label>容量 <input id="vp-volume" type="number" min="0.0001" step="0.1" value="250" style="width:90px"> mL</label>
+          <button id="vp-add" type="button">添加容量</button></div>
+        <div id="vp-list" class="tagbox"></div>
+      </div>
+      <div class="setting-subsection">
+        <h3>二次稀释方式</h3>
+        <p class="hint">按实际操作填写“移取多少 mL，再定容到多少 mL”。例如 5/100 会自动按 20 倍计算。</p>
+        <div class="row"><label>移取 <input id="dl-aliquot" type="number" min="0.0001" step="0.1" placeholder="5" style="width:70px"> mL</label>
+          <span>→</span><label>定容至 <input id="dl-final-volume" type="number" min="0.0001" step="0.1" placeholder="100" style="width:78px"> mL</label>
+          <button id="dl-add">添加稀释方式</button></div>
+        <div id="dl-list" class="tagbox"></div>
+      </div>
+    </div>
+    <div class="panel prep-combination-panel">
+      <div class="section-head"><h2 id="pc-editor-title">溶样组合</h2><button id="pc-cancel" type="button" hidden>取消编辑</button></div>
+      <p class="hint">把常用的多路称样、定容和多级稀释保存为组合；在来样页选择后可一次追加全部配置。</p>
+      <div class="row"><input id="pc-name" placeholder="组合名称，如 双平行+复稀"><button id="pc-row-add" type="button">+ 加一行</button><button id="pc-save" class="primary" type="button">保存组合</button></div>
+      <div class="table-shell"><table id="pc-prep-table" class="data-grid compact-prep-table">
+        <thead><tr><th>溶样名称（可空）</th><th>称样(g)</th><th>定容(mL)</th><th>稀释（可多级）</th><th></th></tr></thead><tbody></tbody>
+      </table></div>
+      <h3>已有组合</h3>
+      <div class="table-shell"><table id="pc-table" class="data-grid"><thead><tr><th>名称</th><th>配置</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+    </div>
+    <div class="panel">
+      <h2>仪器与可测项目</h2>
+      <div class="row">
+        <input id="i-name" placeholder="仪器名称">
+        <select id="i-type">
+          <option value="xrf">XRF（独立仪器数据）</option>
+          <option value="ppm">ppm（mg/L 换算）</option>
+          <option value="ppb">ppb（μg/L 换算）</option>
+          <option value="percent">percent（% 直读）</option>
+          <option value="function">function（公式换算）</option>
+          <option value="ph">pH（直读）</option>
+        </select>
+        <button id="i-add">添加仪器</button>
+      </div>
+      <div id="i-list"></div>
+    </div>
+    <div class="panel method-panel">
+      <h2>分析方法</h2>
+      <p class="hint">公式中的英文标识符会自动识别为变量，例如 (A1/A2)*50。m 固定取称样量(g)，v 固定取定容体积(mL)；其他变量可录入，或在方法常数中固定。</p>
+      <div class="row"><select id="m-type"><option value="function">公式方法</option><option value="xrf">XRF 方法</option></select>
+        <input id="m-name" placeholder="方法名，如 WUNI0820"><input id="m-formula" placeholder="滴定公式（XRF 方法留空）" style="flex:1">
+        <button id="m-add">添加</button></div>
+      <div class="row"><input id="m-constants" placeholder="固定常数，如 A2=10 或 M=65.38">
+        <textarea id="m-note" rows="3" placeholder="滴定说明（可自定义，详情弹窗中显示）" style="flex:1"></textarea></div>
+      <table id="m-table"><thead><tr><th>类型</th><th>名称</th><th>公式</th><th>固定常数</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="panel template-panel">
+      <div class="section-head"><h2 id="t-editor-title">样品模板</h2><button id="t-cancel" type="button" hidden>取消编辑</button></div>
+      <div class="row"><input id="t-name" placeholder="模板名称">
+        <label class="inline"><input type="checkbox" id="t-liquid"> 液体样</label>
+        <label class="inline"><input type="checkbox" id="t-xrf"> 打荧光(XRF粗扫)</label>
+      </div>
+      <div id="t-xrf-config" class="xrf-config" hidden>
+        <h3>XRF 方法与报告默认项目</h3>
+        <div class="row"><input id="t-xrf-text" placeholder="报告默认项目，可空，如 Fe, Si, Ca" style="width:min(680px,100%)">
+          <label id="t-xrf-method-wrap">XRF 方法 <select id="t-xrf-method"></select></label></div>
+        <div id="t-xrf-chips" class="tagbox"></div>
+        <p class="hint">仪器返回的全部定量项目都会保存；这里填写的项目在应用模板后默认参与最终结果计算。</p>
+      </div>
+      <h3>测定项目与默认仪器</h3>
+      <div class="template-analyte-input">
+        <input id="t-analyte-text" placeholder="输入项目，如 Cu Ni Sn（空格或逗号分隔）">
+        <span class="hint">输入后可在下方调整顺序和默认仪器</span>
+      </div>
+      <div id="t-analyte-chips" class="tagbox"></div>
+      <div id="t-analytes" class="template-analytes"></div>
+      <h3>溶样设置</h3>
+      <div class="table-shell prep-shell"><table id="t-prep-table" class="data-grid">
+        <thead><tr><th class="t-solid-only">称样(g)</th><th class="t-solid-only">定容(mL)</th><th>稀释（可多级）</th><th>测定项目</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="editor-footer"><button id="t-prep-add" type="button">+ 加一路溶样</button><span class="footer-spacer"></span><button id="t-add" class="primary">保存模板</button></div>
+      <h3>已有模板</h3>
+      <div class="table-shell"><table id="t-table" class="data-grid"><thead><tr><th>名称</th><th>类型</th><th>项目</th><th>溶样</th><th>仪器预设</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 关于 ================= -->
+<section id="page-about" class="page">
+  <div class="panel about-panel">
+    <h2>快捷键说明</h2>
+    <p class="hint">在输入框中打字时单键快捷键自动失效；错误或授权对话框打开时不响应。</p>
+    <div class="shortcut-grid">
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>1</kbd>–<kbd>9</kbd></span><span>切换顶部页签</span></div>
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>/</kbd></span><span>聚焦当前页搜索框</span></div>
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>N</kbd></span><span>新建样品（仅来样页）</span></div>
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>E</kbd></span><span>导出当前页 Excel</span></div>
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>[</kbd> <kbd>]</kbd></span><span>列表上一页 / 下一页（来样、结果）</span></div>
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>Esc</kbd></span><span>输入框失焦；结果页再按一次收起最近展开的样品</span></div>
+      <div class="shortcut-item"><span class="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>D</kbd></span><span>表格复制选区 / 向下填充（数据页）</span></div>
+    </div>
+  </div>
+</section>
+</main>
+
+<div id="site-context-menu" class="site-context-menu" role="menu" hidden>
+  <button type="button" id="ctx-copy" role="menuitem"><span>复制</span><kbd>Ctrl+C</kbd></button>
+  <div class="context-separator"></div>
+  <div id="ctx-sample-status" class="context-sample-status" role="status"></div>
+  <div id="ctx-change-separator" class="context-separator" hidden></div>
+  <div id="ctx-last-change" class="context-last-change" role="status" hidden>
+    <b>上一次修改</b><small>正在读取……</small>
+  </div>
+  <div class="context-separator"></div>
+  <div class="context-page-title">快速切换</div>
+  <div class="context-page-buttons">
+    <button type="button" data-context-page="intake" role="menuitem">来样</button>
+    <button type="button" data-context-page="data" role="menuitem">数据</button>
+    <button type="button" data-context-page="instrument" role="menuitem">仪器</button>
+    <button type="button" data-context-page="results" role="menuitem">结果</button>
+    <button type="button" data-context-page="report" role="menuitem">报告</button>
+  </div>
+</div>
+
+<section id="authorization-dialog" class="authorization-dialog" role="dialog" aria-modal="true"
+         aria-labelledby="authorization-title" aria-describedby="authorization-explanation" hidden>
+  <div class="authorization-mark" aria-hidden="true">权限</div>
+  <h2 id="authorization-title">需要用户授权</h2>
+  <p id="authorization-explanation">此操作会修改实验室数据。请输入用户密码，系统将核验该用户是否具备对应能力。</p>
+  <form id="authorization-form">
+    <label for="authorization-password">用户密码</label>
+    <input id="authorization-password" type="password" autocomplete="current-password" required>
+    <div id="authorization-error" class="authorization-error" role="alert" aria-live="polite"></div>
+    <div class="authorization-actions">
+      <button id="authorization-cancel" type="button">取消</button>
+      <button id="authorization-confirm" type="submit" class="primary">确认授权</button>
+    </div>
+  </form>
+</section>
+
+<div id="method-detail-backdrop" class="dialog-backdrop" hidden>
+  <section class="method-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="method-detail-title">
+    <button id="method-detail-x" class="dialog-x" type="button" aria-label="关闭">×</button>
+    <h2 id="method-detail-title">滴定方法详情</h2>
+    <dl class="method-detail-meta"><dt>公式</dt><dd id="method-detail-formula"></dd><dt>固定参数</dt><dd id="method-detail-constants"></dd></dl>
+    <h3>滴定说明</h3><div id="method-detail-note"></div>
+    <div class="dialog-actions"><button id="method-detail-close" type="button" class="primary">关闭</button></div>
+  </section>
+</div>
+
+<div id="error-dialog-backdrop" class="dialog-backdrop" hidden>
+  <section class="error-dialog" role="alertdialog" aria-modal="true"
+           aria-labelledby="error-dialog-title" aria-describedby="error-dialog-message">
+    <button id="error-dialog-x" class="dialog-x" type="button" aria-label="关闭">×</button>
+    <h2 id="error-dialog-title">操作未完成</h2>
+    <div id="error-dialog-message"></div>
+    <div class="dialog-actions"><button id="error-dialog-close" type="button" class="primary">知道了</button></div>
+  </section>
+</div>
+
+<script src="/static/app.js?v=20260901-xrf-single-link"></script>
+</body>
+</html>
