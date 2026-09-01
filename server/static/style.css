@@ -807,6 +807,17 @@ tr.sub-row td:first-child { border-left: 6px solid #e8edf3; }
 .result-xrf-list input { flex: 0 0 auto; width: 14px; height: 14px; margin: 0 2px 0 0; }
 .result-xrf-list b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .result-xrf-list span { margin-left: auto; white-space: nowrap; }
+.result-xrf-composition h4 .xrf-target-edit { float: right; padding: 1px 10px; font-size: 11px; }
+.xrf-warning { margin: 0 0 5px; color: #8a5a1f; }
+.xrf-resolution { margin-left: auto; color: #39758e; font-size: 10px; white-space: nowrap; }
+.result-xrf-list > div:has(.xrf-resolution) span { margin-left: 4px; }
+.xrf-target-rows { display: grid; gap: 6px; margin: 10px 0; max-height: min(420px, calc(100vh - 260px)); overflow: auto; }
+.xrf-target-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border: 1px solid #dce5e9; border-radius: 5px; background: #fbfcfd; }
+.xrf-target-row b { min-width: 44px; color: #345a6d; }
+.xrf-target-row .hint { flex: 0 0 auto; }
+.xrf-target-row select, .xrf-target-row input.xrf-target-custom { flex: 1; min-width: 0; }
+.xrf-presets { align-items: center; gap: 6px; margin-top: 6px; }
+.xrf-presets button { padding: 2px 10px; font-size: 12px; }
 .danger-soft { border-color: #cf8f8f !important; color: #923f3f !important; background: #fff0f0 !important; }
 .about-panel { max-width: 860px; }
 .shortcut-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 8px; margin-top: 10px; }

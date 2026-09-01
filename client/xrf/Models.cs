@@ -39,6 +39,8 @@ public sealed class OxsasResult
 {
     public string Name { get; set; } = "";
     public double Value { get; set; }
+    public string ElementName { get; set; } = "";
+    public string OxideName { get; set; } = "";
 }
 
 public sealed class OxsasAnalysis

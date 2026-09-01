@@ -353,7 +353,16 @@ CREATE TABLE IF NOT EXISTS xrf_values(
     name TEXT NOT NULL,
     value REAL NOT NULL,
     use_report INTEGER DEFAULT 0,
+    alt_name TEXT DEFAULT '',   -- UniQuant 名称对的另一口径(元素↔氧化物)
     UNIQUE(analysis_id, name));
+CREATE TABLE IF NOT EXISTS xrf_report_targets(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    family TEXT NOT NULL,          -- 元素族, 如 fe
+    target TEXT NOT NULL,          -- 报告目标, 如 Fe 或 Fe2O3
+    include INTEGER DEFAULT 1,     -- 是否参与最终报告
+    allow_conversion INTEGER DEFAULT 1,  -- 直取缺失时是否允许化学计量换算
+    UNIQUE(sample_id, family));
 CREATE TABLE IF NOT EXISTS uq_analyses(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     external_id TEXT UNIQUE NOT NULL,
@@ -675,6 +684,7 @@ def initialize_database(database):
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_factor REAL NOT NULL DEFAULT 1")
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_label TEXT DEFAULT ''")
         db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS report_excludes TEXT DEFAULT '[]'")
+        db.execute("ALTER TABLE xrf_values ADD COLUMN IF NOT EXISTS alt_name TEXT DEFAULT ''")
         _backfill_preparation_dilutions(db)
         _upgrade_postgres_terminal_kinds(db)
         _upgrade_review_workflow(db)
@@ -859,6 +869,9 @@ def initialize_database(database):
         db.execute("ALTER TABLE samples ADD COLUMN xrf_method_id INTEGER REFERENCES methods(id)")
     if "xrf_report_items" not in sample_cols:
         db.execute("ALTER TABLE samples ADD COLUMN xrf_report_items TEXT DEFAULT ''")
+    value_cols = [r[1] for r in db.execute("PRAGMA table_info(xrf_values)")]
+    if "alt_name" not in value_cols:
+        db.execute("ALTER TABLE xrf_values ADD COLUMN alt_name TEXT DEFAULT ''")
     sample_migrations = {
         "workflow_type": "TEXT DEFAULT 'regular'",
         "special_method_id": "INTEGER REFERENCES special_methods(id)",

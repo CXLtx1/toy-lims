@@ -100,7 +100,11 @@ public sealed class LimsApiClient : IDisposable
             processed = analysis.Processed,
             options = analysis.Options,
             job = analysis.Job,
-            results = analysis.Results.Select(result => new { result.Name, result.Value }).ToArray(),
+            results = analysis.Results.Select(result => new
+            {
+                result.Name, result.Value,
+                result.ElementName, result.OxideName,
+            }).ToArray(),
         };
         using var response = await _http.PostAsJsonAsync(
             "api/instrument/xrf/uq/import", request, _json, cancellationToken);
@@ -127,7 +131,11 @@ public sealed class LimsApiClient : IDisposable
                 processed = analysis.Processed,
                 options = analysis.Options,
                 job = analysis.Job,
-                results = analysis.Results.Select(result => new { result.Name, result.Value }).ToArray(),
+                results = analysis.Results.Select(result => new
+                {
+                    result.Name, result.Value,
+                    result.ElementName, result.OxideName,
+                }).ToArray(),
             }).ToArray(),
         };
         return await PostBatchAsync("api/instrument/xrf/uq/import/batch", request, cancellationToken);

@@ -220,7 +220,14 @@ public sealed class OxsasReader
                     ? oxideName : elementName;
                 var value = Number(reader, 3);
                 if (name.Length > 0 && value is not null)
-                    analysis.Results.Add(new OxsasResult { Name = name, Value = value.Value });
+                {
+                    // 名称对与单一浓度一起上传，由服务端按口径决定显示名与换算方向。
+                    analysis.Results.Add(new OxsasResult
+                    {
+                        Name = name, Value = value.Value,
+                        ElementName = elementName, OxideName = oxideName,
+                    });
+                }
             }
         }
         return analyses

@@ -86,10 +86,16 @@
       </div>
       <div id="s-xrf-config" class="xrf-config" hidden>
         <h3>XRF 方法与报告默认项目</h3>
-        <div class="row"><input id="s-xrf-text" placeholder="报告默认项目，可空，如 Fe, Si, Ca" style="width:min(680px,100%)">
+        <div class="row"><input id="s-xrf-text" placeholder="报告默认项目，可空，如 Fe, SiO2, CaO" style="width:min(680px,100%)">
           <label>XRF 方法 <select id="s-xrf-method"></select></label></div>
+        <div class="row xrf-presets">
+          <span class="hint">快速口径：</span>
+          <button type="button" class="xrf-preset" data-target="s-xrf-text" data-preset="elements">元素口径</button>
+          <button type="button" class="xrf-preset" data-target="s-xrf-text" data-preset="oxides">氧化物口径</button>
+          <button type="button" class="xrf-preset" data-target="s-xrf-text" data-preset="clear">清空</button>
+        </div>
         <div id="s-xrf-chips" class="tagbox"></div>
-        <p class="hint">仪器返回的全部定量项目都会保存；这里填写的项目默认参与最终结果计算，之后可在结果页调整。</p>
+        <p class="hint">仪器返回的全部定量项目都会保存；这里填写的项目默认参与最终结果计算（同一元素族先填的口径优先），之后可在结果页调整。</p>
       </div>
       <h3>溶样（每一路 = 称样 → 定容 → 稀释 → 测定项目）</h3>
       <p class="hint">每一路直接在横向看板中选择测定项目并分配仪器：点击标签可多选，再拖到或点击目标栏；拖到“不测”表示该溶样不建立这些项目的检测任务。</p>
@@ -185,6 +191,20 @@
     <p id="xrf-assign-scan" class="hint"></p>
     <input id="xrf-assign-sample-search" type="search" autocomplete="off" placeholder="搜索来样序号、样品名称或 LIMS 编号">
     <div id="xrf-assign-sample-options" class="xrf-assign-sample-options"></div>
+  </section>
+</div>
+
+<div id="xrf-target-dialog" class="dialog-backdrop" hidden>
+  <section class="xrf-assign-dialog" role="dialog" aria-modal="true" aria-labelledby="xrf-target-title">
+    <button id="xrf-target-close" class="dialog-x" type="button" aria-label="关闭">×</button>
+    <h2 id="xrf-target-title">XRF 报告口径</h2>
+    <p class="hint">每个元素族只选一个报告口径；勾选后参与最终报告，缺项时按化学计量自动换算。</p>
+    <div id="xrf-target-rows" class="xrf-target-rows"></div>
+    <div class="row xrf-presets">
+      <button type="button" id="xrf-target-add">+ 添加口径</button>
+      <span class="footer-spacer"></span>
+      <button type="button" id="xrf-target-save" class="primary">保存口径</button>
+    </div>
   </section>
 </div>
 
@@ -388,10 +408,16 @@
       </div>
       <div id="t-xrf-config" class="xrf-config" hidden>
         <h3>XRF 方法与报告默认项目</h3>
-        <div class="row"><input id="t-xrf-text" placeholder="报告默认项目，可空，如 Fe, Si, Ca" style="width:min(680px,100%)">
+        <div class="row"><input id="t-xrf-text" placeholder="报告默认项目，可空，如 Fe, SiO2, CaO" style="width:min(680px,100%)">
           <label id="t-xrf-method-wrap">XRF 方法 <select id="t-xrf-method"></select></label></div>
+        <div class="row xrf-presets">
+          <span class="hint">快速口径：</span>
+          <button type="button" class="xrf-preset" data-target="t-xrf-text" data-preset="elements">元素口径</button>
+          <button type="button" class="xrf-preset" data-target="t-xrf-text" data-preset="oxides">氧化物口径</button>
+          <button type="button" class="xrf-preset" data-target="t-xrf-text" data-preset="clear">清空</button>
+        </div>
         <div id="t-xrf-chips" class="tagbox"></div>
-        <p class="hint">仪器返回的全部定量项目都会保存；这里填写的项目在应用模板后默认参与最终结果计算。</p>
+        <p class="hint">仪器返回的全部定量项目都会保存；这里填写的项目在应用模板后默认参与最终结果计算（同一元素族先填的口径优先）。</p>
       </div>
       <h3>测定项目与默认仪器</h3>
       <div class="template-analyte-input">

@@ -1710,6 +1710,8 @@ def add_sample():
          lims_no, json.dumps(d.get("report_order", []))))
     sid = cur.lastrowid
     mark_sample_status_actor(db, sid, "received")
+    if xrf_enabled:
+        _sync_sample_xrf_targets(db, sid, str(d.get("xrf_report_items", "")))
     for p, values in prepared_rows:
         prep_instrument_map = p.get("instrument_map", instrument_map)
         cur = db.execute(
@@ -1991,6 +1993,7 @@ def update_sample(sid):
                (name, d.get("category", "").strip(), int(d.get("is_liquid", 0)),
                 xrf_enabled, xrf_method_id, str(d.get("xrf_report_items", "")).strip(),
                 report_order_json, sid))
+    _sync_sample_xrf_targets(db, sid, str(d.get("xrf_report_items", "")))
     existing_pids = {r[0] for r in db.execute(
         "SELECT id FROM preparations WHERE sample_id=?", (sid,))}
     kept_pids = set()
@@ -2648,29 +2651,230 @@ def _uq_options_remark(options, job):
     return "；".join(part for part in (source_remark, generated) if part)
 
 
+def _xrf_reference(db):
+    """元素与氧化物参考数据：换算一律取自 common_oxides，不在业务代码写死系数。"""
+    elements = {row["symbol"].casefold(): row["symbol"]
+                for row in db.execute("SELECT symbol FROM chemical_elements")}
+    oxides = {}
+    for row in db.execute("""SELECT formula,element_symbol,element_to_oxide_factor
+        FROM common_oxides"""):
+        oxides[row["formula"].casefold()] = {
+            "formula": row["formula"], "element": row["element_symbol"],
+            "factor": float(row["element_to_oxide_factor"])}
+    return elements, oxides
+
+
+def _xrf_target_family(token, elements, oxides):
+    """把项目名解析为 (元素族, 目标口径)；未知项目按自定义原样保留。"""
+    key = str(token).strip().casefold()
+    if key in oxides:
+        return oxides[key]["element"].casefold(), oxides[key]["formula"]
+    if key in elements:
+        return key, elements[key]
+    return None, None
+
+
+def _derive_xrf_targets(text, elements, oxides):
+    """把逗号分隔的报告项目文本解析为按元素族单选的结构化口径。
+
+    同一族出现多个口径（如 Fe 与 Fe2O3）时，先出现的为准，
+    保证旧样品的既有语义不被静默改写。
+    """
+    targets, seen = [], set()
+    for part in re.split(r"[,，、;；\s]+", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        family, target = _xrf_target_family(part, elements, oxides)
+        allow = 1
+        if family is None:
+            family, target, allow = part.casefold(), part, 0
+        if family in seen:
+            continue
+        seen.add(family)
+        targets.append({"family": family, "target": target,
+                        "include": 1, "allow_conversion": allow})
+    return targets
+
+
+def _load_xrf_targets(db, sid):
+    return [dict(row) for row in db.execute(
+        """SELECT id,family,target,include,allow_conversion FROM xrf_report_targets
+        WHERE sample_id=? ORDER BY id""", (sid,))]
+
+
+def _sync_sample_xrf_targets(db, sid, text):
+    elements, oxides = _xrf_reference(db)
+    targets = _derive_xrf_targets(text, elements, oxides)
+    db.execute("DELETE FROM xrf_report_targets WHERE sample_id=?", (sid,))
+    for target in targets:
+        db.execute("""INSERT INTO xrf_report_targets(sample_id,family,target,include,allow_conversion)
+            VALUES(?,?,?,?,?)""", (sid, target["family"], target["target"],
+                                   target["include"], target["allow_conversion"]))
+    return targets
+
+
+def _element_to_target_factor(source, target, oxides):
+    """元素↔氧化物换算系数与说明；无关系时返回 (None, '')。"""
+    skey, tkey = str(source).casefold(), str(target).casefold()
+    if tkey in oxides and oxides[tkey]["element"].casefold() == skey:
+        return oxides[tkey]["factor"], f"{source} × {oxides[tkey]['factor']:.4g}"
+    if skey in oxides and oxides[skey]["element"].casefold() == tkey:
+        factor = 1.0 / oxides[skey]["factor"]
+        return factor, f"{source} ÷ {oxides[skey]['factor']:.4g}"
+    return None, ""
+
+
+def _resolve_xrf_report_rows(targets, xrf_rows, reference, warnings, analyte_index):
+    """按报告目标解析 XRF 最终组成：直取优先，缺项才按化学计量换算。
+
+    返回报告行列表；换算来源与系数写入 xrf_resolution，全程可追溯。
+    """
+    elements, oxides = reference
+    rows_out = []
+    for target in targets:
+        if not target["include"]:
+            continue
+        target_name = str(target["target"])
+        tkey = target_name.casefold()
+        famkey = str(target["family"]).casefold()
+        family_rows = []
+        for xr in xrf_rows:
+            names = {str(xr["analyte"]).casefold()}
+            if xr.get("alt_name"):
+                names.add(str(xr["alt_name"]).casefold())
+            oxide = oxides.get(str(xr["analyte"]).casefold())
+            member = oxide["element"].casefold() if oxide else (
+                str(xr["analyte"]).casefold() if str(xr["analyte"]).casefold() in elements else None)
+            if tkey in names or member == famkey:
+                family_rows.append(xr)
+        # 一致性核对：同族独立存在元素与氧化物直出值时只读比对，超差仅警告。
+        element_rows = [xr for xr in family_rows
+                        if str(xr["analyte"]).casefold() in elements]
+        oxide_rows = [xr for xr in family_rows
+                      if str(xr["analyte"]).casefold() in oxides]
+        for element_row in element_rows:
+            for oxide_row in oxide_rows:
+                factor, _ = _element_to_target_factor(
+                    element_row["analyte"], oxide_row["analyte"], oxides)
+                if factor is None:
+                    continue
+                expected = float(element_row["value"]) * factor
+                oxide_value = float(oxide_row["value"])
+                deviation = abs(oxide_value - expected) / max(abs(oxide_value), 1e-9)
+                if deviation > 0.01:
+                    warnings.append({
+                        "family": target["family"], "code": "composition_mismatch",
+                        "message": (f"{target['family']}: {oxide_row['analyte']} 直出 "
+                                    f"{oxide_value:.5g}% 与 {element_row['analyte']} 换算 "
+                                    f"{expected:.5g}% 相对偏差 {deviation:.1%}，请核对"),
+                    })
+        direct = next((xr for xr in family_rows
+                       if str(xr["analyte"]).casefold() == tkey), None)
+        chosen, factor, source_name, note = None, None, "", "直出"
+        if direct is not None:
+            chosen = direct
+        elif target["allow_conversion"]:
+            for xr in family_rows:
+                if not xr.get("alt_name") or str(xr["alt_name"]).casefold() != tkey:
+                    continue
+                pair_factor, pair_note = _element_to_target_factor(
+                    xr["analyte"], target_name, oxides)
+                if pair_factor is not None:
+                    chosen, factor, source_name, note = xr, pair_factor, xr["analyte"], pair_note
+                    break
+            if chosen is None and tkey in oxides:
+                oxide = oxides[tkey]
+                source = next((xr for xr in family_rows if str(xr["analyte"]).casefold()
+                               == oxide["element"].casefold()), None)
+                if source is not None:
+                    factor = oxide["factor"]
+                    chosen, source_name = source, source["analyte"]
+                    note = f"{source['analyte']} × {factor:.4g}"
+            if chosen is None and tkey in elements:
+                candidates = {}
+                for xr in oxide_rows:
+                    oxide = oxides[str(xr["analyte"]).casefold()]
+                    candidates.setdefault(oxide["formula"], xr)
+                if len(candidates) == 1:
+                    formula, source = next(iter(candidates.items()))
+                    factor = 1.0 / oxides[formula.casefold()]["factor"]
+                    chosen, source_name = source, source["analyte"]
+                    note = f"{source['analyte']} ÷ {oxides[formula.casefold()]['factor']:.4g}"
+                elif len(candidates) > 1:
+                    warnings.append({
+                        "family": target["family"], "code": "ambiguous_oxide",
+                        "message": (f"{target['family']} 存在多个氧化物口径"
+                                    f"（{'、'.join(sorted(candidates))}），请明确换算来源"),
+                    })
+        if chosen is None:
+            if family_rows and not any(
+                    warning.get("family") == target["family"]
+                    for warning in warnings):
+                warnings.append({
+                    "family": target["family"], "code": "missing_target",
+                    "message": f"缺少目标口径 {target_name}，该结果未列入报告",
+                })
+            continue
+        raw = float(chosen["value"]) * (factor if factor is not None else 1.0)
+        value = float(f"{raw:.5g}")
+        analyte_id, sort_order = analyte_index.get(tkey, (None, None))
+        rows_out.append({
+            "sample_analyte_id": None, "xrf_value_id": chosen["xrf_value_id"],
+            "analyte_id": analyte_id, "analyte": target_name,
+            "analyte_sort_order": sort_order if sort_order is not None else 999999,
+            "prep": "原样", "mass_g": None, "volume_ml": None, "dilution": "原样",
+            "instrument": "XRF", "instrument_sort_order": -1,
+            "method": chosen["method"] or "",
+            "readings": [{"raw": value, "extra": {}, "used": True,
+                          "value": value, "corrected_value": value}],
+            "aux": {}, "value": value, "unit": "%", "selection": None,
+            "analyzed_at": chosen["analyzed_at"], "external_id": chosen["external_id"],
+            "xrf_resolution": {
+                "via": "direct" if factor is None else "converted",
+                "source": source_name or target_name,
+                "factor": factor, "note": note,
+            },
+        })
+    return rows_out
+
+
 def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
     results_in = data.get("results") or []
     if not isinstance(results_in, list) or not results_in:
         return {"ok": False, "error": "没有可导入的定量结果"}, 400
-    clean_results, skipped = {}, []
+    options_in = data.get("options") if isinstance(data.get("options"), dict) else {}
+    oxide_mode = options_in.get("chemistry") in {1, "1", "oxide", "氧化物"}
+    clean_results, skipped = {}, {}
     for result in results_in:
         if not isinstance(result, dict):
             continue
         name = str(result.get("name") or "").strip()
+        element_name = str(result.get("element_name") or "").strip()
+        oxide_name = str(result.get("oxide_name") or "").strip()
+        if not name:
+            name = oxide_name if (kind == "uq" and oxide_mode and oxide_name) else element_name
         if not name or name.startswith("Bg"):
-            skipped.append({"name": name, "reason": "背景项不导入"})
+            skipped[name] = {"name": name, "reason": "背景项不导入"}
             continue
         try:
             value = float(result.get("value"))
         except (TypeError, ValueError):
-            skipped.append({"name": name, "reason": "非数字"})
+            skipped[name] = {"name": name, "reason": "非数字"}
             continue
         if not math.isfinite(value):
-            skipped.append({"name": name, "reason": "数值无效"})
+            skipped[name] = {"name": name, "reason": "数值无效"}
             continue
-        clean_results[name] = float(f"{value:.5g}")
+        # UniQuant 名称对：保留当前口径的另一侧，报告换算时不需要再读 OXSAS。
+        if element_name and element_name.casefold() == name.casefold():
+            alt_name = oxide_name if oxide_name.casefold() != name.casefold() else ""
+        elif oxide_name and oxide_name.casefold() == name.casefold():
+            alt_name = element_name
+        else:
+            alt_name = ""
+        clean_results[name] = (float(f"{value:.5g}"), alt_name)
     if not clean_results:
-        return {"ok": False, "error": "分析中没有有效的定量结果", "skipped": skipped}, 422
+        return {"ok": False, "error": "分析中没有有效的定量结果", "skipped": list(skipped.values())}, 422
 
     existing = db.execute("SELECT * FROM xrf_analyses WHERE source=? AND external_id=?",
                           (source, external_id)).fetchone()
@@ -2700,12 +2904,17 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
                           (source, external_id)).fetchone()
     defaults = {part.strip().casefold() for part in re.split(
         r"[,，、;；\s]+", linked_sample["xrf_report_items"] or "") if part.strip()} if linked_sample else set()
+    if linked_sample:
+        defaults |= {target["target"].casefold() for target in
+                     _load_xrf_targets(db, linked_sample["id"]) if target["include"]}
     db.execute("DELETE FROM xrf_values WHERE analysis_id=?", (analysis["id"],))
     imported = []
-    for name, value in clean_results.items():
-        cur = db.execute("""INSERT INTO xrf_values(analysis_id,name,value,use_report)
-            VALUES(?,?,?,?)""", (analysis["id"], name, value, int(name.casefold() in defaults)))
-        imported.append({"name": name, "value": value, "xrf_value_id": cur.lastrowid})
+    for name, (value, alt_name) in clean_results.items():
+        cur = db.execute("""INSERT INTO xrf_values(analysis_id,name,value,use_report,alt_name)
+            VALUES(?,?,?,?,?)""", (analysis["id"], name, value,
+                                   int(name.casefold() in defaults), alt_name))
+        imported.append({"name": name, "value": value, "alt_name": alt_name,
+                         "xrf_value_id": cur.lastrowid})
     for affected in {old_sample_id, linked_sample["id"] if linked_sample else None} - {None}:
         recompute_sample_progress(db, affected)
     audit_event(db, "instrument_import", "xrf_analysis", analysis["id"], after={
@@ -3090,25 +3299,35 @@ def build_report_payload(db, sid):
         })
     # XRF 是样品级整包结果：报告保留全部项目，是否列入最终报告由 use_report 控制。
     xrf_rows = [dict(row) for row in db.execute("""SELECT xv.id AS xrf_value_id, xv.name AS analyte, xv.value,
-            xv.use_report, xa.method, xa.analyzed_at, xa.external_id,
+            xv.alt_name, xv.use_report, xa.method, xa.kind, xa.analyzed_at, xa.external_id,
             a.id AS analyte_id, a.sort_order AS analyte_sort_order
         FROM xrf_values xv JOIN xrf_analyses xa ON xa.id=xv.analysis_id
         LEFT JOIN analytes a ON lower(a.name)=lower(xv.name)
         WHERE xa.sample_id=? ORDER BY xa.analyzed_at DESC, xv.id""", (sid,))]
-    for xr in xrf_rows:
-        value = float(f"{float(xr['value']):.5g}")
-        rows_out.append({
-            "sample_analyte_id": None, "xrf_value_id": xr["xrf_value_id"],
-            "analyte_id": xr["analyte_id"], "analyte": xr["analyte"],
-            "analyte_sort_order": xr["analyte_sort_order"] if xr["analyte_sort_order"] is not None else 999999,
-            "prep": "原样", "mass_g": None, "volume_ml": None, "dilution": "原样",
-            "instrument": "XRF", "instrument_sort_order": -1, "method": xr["method"] or "",
-            "readings": [{"raw": value, "extra": {}, "used": bool(xr["use_report"]),
-                          "value": value, "corrected_value": value}],
-            "aux": {}, "value": value, "unit": "%",
-            "selection": None if xr["use_report"] else "exclude",
-            "analyzed_at": xr["analyzed_at"], "external_id": xr["external_id"],
-        })
+    xrf_warnings = []
+    xrf_targets = _load_xrf_targets(db, sid)
+    if xrf_targets:
+        # 结构化口径配置生效：按元素族单选目标，直取优先、缺项换算、全程可追溯。
+        analyte_index = {}
+        for row in db.execute("SELECT name,id,sort_order FROM analytes"):
+            analyte_index[str(row["name"]).casefold()] = (row["id"], row["sort_order"])
+        rows_out.extend(_resolve_xrf_report_rows(
+            xrf_targets, xrf_rows, _xrf_reference(db), xrf_warnings, analyte_index))
+    else:
+        for xr in xrf_rows:
+            value = float(f"{float(xr['value']):.5g}")
+            rows_out.append({
+                "sample_analyte_id": None, "xrf_value_id": xr["xrf_value_id"],
+                "analyte_id": xr["analyte_id"], "analyte": xr["analyte"],
+                "analyte_sort_order": xr["analyte_sort_order"] if xr["analyte_sort_order"] is not None else 999999,
+                "prep": "原样", "mass_g": None, "volume_ml": None, "dilution": "原样",
+                "instrument": "XRF", "instrument_sort_order": -1, "method": xr["method"] or "",
+                "readings": [{"raw": value, "extra": {}, "used": bool(xr["use_report"]),
+                              "value": value, "corrected_value": value}],
+                "aux": {}, "value": value, "unit": "%",
+                "selection": None if xr["use_report"] else "exclude",
+                "analyzed_at": xr["analyzed_at"], "external_id": xr["external_id"],
+            })
     # 按元素分组并计算最终值
     groups = []
     by_analyte = {}
@@ -3151,6 +3370,7 @@ def build_report_payload(db, sid):
                        "final": final, "rows": rs})
     payload = _attach_report_override(db, sid, {
         "sample": sample, "preps": preps, "groups": groups, "special": None,
+        "xrf_warnings": xrf_warnings, "xrf_targets": xrf_targets,
     })
     return _attach_report_profile(db, payload)
 
@@ -3298,6 +3518,17 @@ def excel_results_report():
                      mimetype=EXCEL_MIME)
 
 
+@app.route("/api/xrf/reference")
+def xrf_reference():
+    """元素与常见氧化物参考数据，供报告口径选择界面使用。"""
+    db = get_db()
+    elements = rows("""SELECT atomic_number,symbol,name_zh,atomic_weight,is_mass_number
+        FROM chemical_elements ORDER BY atomic_number""")
+    oxides = rows("""SELECT formula,name_zh,element_symbol,element_count,oxygen_count,
+        element_to_oxide_factor,is_conventional FROM common_oxides ORDER BY formula""")
+    return jsonify(ok=True, elements=elements, oxides=oxides)
+
+
 @app.route("/api/xrf/samples/<int:sid>")
 def xrf_sample_results(sid):
     db = get_db()
@@ -3312,10 +3543,67 @@ def xrf_sample_results(sid):
             analysis["options"] = json.loads(analysis.get("options_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             analysis["options"] = {}
-        analysis["values"] = rows("""SELECT id,name,value,use_report FROM xrf_values
+        analysis["values"] = rows("""SELECT id,name,value,use_report,alt_name FROM xrf_values
             WHERE analysis_id=? AND lower(substr(name,1,2))<>'bg'
             ORDER BY value DESC,id""", (analysis["id"],))
-    return jsonify(ok=True, sample=dict(sample), analyses=analyses)
+    return jsonify(ok=True, sample=dict(sample), analyses=analyses,
+                   targets=_load_xrf_targets(db, sid))
+
+
+@app.route("/api/xrf/samples/<int:sid>/targets", methods=["PUT"])
+@capability_required("report_edit")
+def xrf_sample_targets(sid):
+    """保存样品级 XRF 报告口径：每个元素族只选一个目标。"""
+    db = get_db()
+    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    if not sample:
+        return jsonify(ok=False, error="样品不存在"), 404
+    if sample["status"] in {"reviewed", "reported", "cancelled"}:
+        return jsonify(ok=False, error="已审核、已出报告或已作废样品不能修改报告口径"), 409
+    submitted = (request.json or {}).get("targets")
+    if not isinstance(submitted, list):
+        return jsonify(ok=False, error="报告口径格式无效"), 400
+    elements, oxides = _xrf_reference(db)
+    cleaned, seen = [], set()
+    for item in submitted:
+        if not isinstance(item, dict):
+            continue
+        target = str(item.get("target") or "").strip()
+        if not target:
+            return jsonify(ok=False, error="报告目标不能为空"), 400
+        family, target_name = _xrf_target_family(target, elements, oxides)
+        if family is None:
+            family, target_name, allow = target.casefold(), target, 0
+        else:
+            allow = int(bool(item.get("allow_conversion", True)))
+        if family in seen:
+            return jsonify(ok=False, error=f"元素族 {family} 出现了多个报告口径"), 400
+        seen.add(family)
+        cleaned.append({"family": family, "target": target_name,
+                        "include": int(bool(item.get("include", True))),
+                        "allow_conversion": allow})
+    before = _load_xrf_targets(db, sid)
+    db.execute("DELETE FROM xrf_report_targets WHERE sample_id=?", (sid,))
+    for item in cleaned:
+        db.execute("""INSERT INTO xrf_report_targets(sample_id,family,target,include,allow_conversion)
+            VALUES(?,?,?,?,?)""", (sid, item["family"], item["target"],
+                                   item["include"], item["allow_conversion"]))
+    report_items = ", ".join(item["target"] for item in cleaned if item["include"])
+    db.execute("""UPDATE samples SET xrf_report_items=?,
+        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+               (report_items, sid))
+    included = {item["target"].casefold() for item in cleaned if item["include"]}
+    db.execute("""UPDATE xrf_values SET use_report=0 WHERE analysis_id IN
+        (SELECT id FROM xrf_analyses WHERE sample_id=?)""", (sid,))
+    for name in included:
+        db.execute("""UPDATE xrf_values SET use_report=1 WHERE lower(name)=? AND analysis_id IN
+            (SELECT id FROM xrf_analyses WHERE sample_id=?)""", (name, sid))
+    after = _load_xrf_targets(db, sid)
+    audit_event(db, "xrf_targets_update", "sample", sid,
+                before={"targets": before, "xrf_report_items": sample["xrf_report_items"]},
+                after={"targets": after, "xrf_report_items": report_items})
+    db.commit()
+    return jsonify(ok=True, targets=after, xrf_report_items=report_items)
 
 
 @app.route("/api/xrf/analyses/<int:analysis_id>/sample", methods=["PUT", "DELETE"])

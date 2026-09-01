@@ -125,27 +125,29 @@ Fe2O3 = Fe × (2 × Ar(Fe) + 3 × Ar(O)) ÷ (2 × Ar(Fe))
 
 Excel、A4 原始记录和 A5 报告票应使用同一份已解析报告结果，禁止各导出模块自行重复换算。
 
-## 10. 分阶段实施
+## 10. 分阶段实施（已全部完成）
 
-### 阶段一：参考数据（本次）
+### 阶段一：参考数据
 
 - 建立 `chemical_elements` 和 `common_oxides`。
 - 暂不改变当前 XRF 参与勾选、报告计算和打印行为。
 
-### 阶段二：结构化口径配置
+### 阶段二：结构化口径配置（已实现）
 
-- 新增样品级 XRF 报告目标配置。
-- 将现有 `xrf_report_items` 迁移为明确的元素或氧化物目标。
-- 结果页按元素族单选报告口径。
-- 扩展 UniQuant 上传载荷，同时保存 `Atom.Name`、`Atom.OxideName` 和 `GeneralData.Chemistry`，避免客户端提前丢弃另一种名称。
+- 新增 `xrf_report_targets` 表（样品级，每元素族唯一目标），`xrf_values` 新增 `alt_name` 保存 UniQuant 名称对的另一口径。
+- `POST/PUT /api/samples` 保存 `xrf_report_items` 时自动派生口径：同一元素族先出现的口径优先（如 `Fe, Fe2O3` 以 Fe 为准），保证旧语义不被静默改写。
+- `PUT /api/xrf/samples/<sid>/targets`（report_edit 权限）：按元素族单选目标并同步 `use_report`、回写 `xrf_report_items`，审计动作 `xrf_targets_update`；同一族重复目标返回 400。
+- 结果页 XRF 网格提供"口径"对话框，按元素族单选目标并勾选是否参与；数据来源 `GET /api/xrf/reference`。
+- UniQuant 客户端（OxsasReader）同时上传 `element_name`、`oxide_name` 和浓度，服务端按 `Chemistry` 决定显示名、另一侧存入 `alt_name`，不再丢弃名称对。
 
-### 阶段三：换算与一致性检查
+### 阶段三：换算与一致性检查（已实现）
 
-- 实现直取优先、缺项换算和来源追溯。
-- 增加元素/氧化物直出值一致性警告。
-- 报告和 Excel 统一读取已解析结果。
+- `build_report_payload` 统一解析：直取优先 → UniQuant 名称对换算 → 参考表化学计量换算；换算来源、系数写入行级 `xrf_resolution`，最终值 5 位有效数字。
+- 未配置口径的样品保持旧行为（`use_report` 勾选 + 5 位有效数字），旧样品不受影响。
+- 同族独立存在元素与氧化物直出值时做只读核对，相对偏差超过 1% 在 `xrf_warnings` 中给出 `composition_mismatch` 警告；同族多个氧化物无法确定换算来源时给出 `ambiguous_oxide` 警告；缺目标口径时给出 `missing_target` 警告，不用 0 代替。
+- 报告 JSON、报告 Excel 和结果矩阵共用同一 payload，不在导出模块重复换算。
 
-### 阶段四：模板化
+### 阶段四：模板化（已实现，简单好用）
 
-- 样品模板、XRF 方法和报告版式保存默认口径。
-- 根据不同客户或产品类型快速切换元素/氧化物报告方案。
+- 来样页与模板编辑器的"报告默认项目"提供三个快捷按钮：元素口径、氧化物口径、清空（整岩石常见 10 项预填）。
+- 模板保存 `xrf_report_items` 文本；应用模板创建样品时由服务端自动派生结构化口径；修改模板不追溯改变已有样品。

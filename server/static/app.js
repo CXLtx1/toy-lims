@@ -1,4 +1,4 @@
-/* toy-lims 前端逻辑 */
+﻿/* toy-lims 前端逻辑 */
 let META = null;   // analytes, instruments, dilutions, methods, templates
 let SAMPLES = [];
 let EDITING_SAMPLE_ID = null;
@@ -512,6 +512,7 @@ async function autoRefreshInstrumentPage() {
   if (INSTRUMENT_AUTO_REFRESHING || document.hidden || !$("#page-instrument").classList.contains("active")) return;
   if (document.activeElement?.closest?.(".xrf-monitor-controls")) return;
   if (!$("#xrf-assign-dialog").hidden) return;
+  if (!$("#xrf-target-dialog")?.hidden) return;
   INSTRUMENT_AUTO_REFRESHING = true;
   try { await loadInstrumentPage(); }
   finally { INSTRUMENT_AUTO_REFRESHING = false; }
@@ -1669,6 +1670,34 @@ $("#xrf-assign-close").onclick = closeXrfAssignDialog;
 $("#xrf-assign-dialog").onclick = (event) => {
   if (event.target === event.currentTarget) closeXrfAssignDialog();
 };
+$("#xrf-target-close").onclick = closeXrfTargetDialog;
+$("#xrf-target-dialog").onclick = (event) => {
+  if (event.target === event.currentTarget) closeXrfTargetDialog();
+};
+$("#xrf-target-save").onclick = saveXrfTargetDialog;
+$("#xrf-target-add").onclick = () => {
+  const text = prompt("输入报告项目，如 Fe2O3、CaO 或 Fe（同一元素族只保留一个口径）", "");
+  if (!text?.trim()) return;
+  for (const token of text.split(/[,，、;；\s]+/).filter(Boolean)) {
+    const row = document.createElement("div");
+    row.className = "xrf-target-row";
+    row.dataset.family = token.toLowerCase();
+    row.innerHTML = `<label class="inline"><input type="checkbox" class="xrf-target-include" checked>参与</label>
+      <b>${esc(token.toUpperCase())}</b><span class="hint">自定义</span>
+      <input class="xrf-target-custom" value="${esc(token)}" title="自定义项目">`;
+    $("#xrf-target-rows").appendChild(row);
+  }
+};
+const XRF_REPORT_PRESETS = {
+  elements: "Si, Al, Fe, Ca, Mg, Ti, Na, K, Mn, P",
+  oxides: "SiO2, Al2O3, Fe2O3, CaO, MgO, TiO2, Na2O, K2O, MnO, P2O5",
+};
+$$(".xrf-preset").forEach((button) => button.onclick = () => {
+  const input = document.getElementById(button.dataset.target);
+  if (!input) return;
+  input.value = button.dataset.preset === "clear" ? "" : XRF_REPORT_PRESETS[button.dataset.preset] || "";
+  input.dispatchEvent(new Event("input"));
+});
 $("#xrf-assign-sample-search").oninput = (event) => {
   clearTimeout(XRF_ASSIGN_SEARCH_TIMER);
   const query = event.currentTarget.value.trim();
@@ -2812,12 +2841,19 @@ function resultDetailGroupsHtml(data) {
     .filter((row) => row.xrf_value_id)
     .map((row) => ({ ...row, analyte: group.analyte })))
     .sort((left, right) => (+right.value || 0) - (+left.value || 0));
+  const targetMode = (data.xrf_targets || []).length > 0;
+  const warnings = data.xrf_warnings || [];
   const xrf = xrfRows.length ? `<section class="result-xrf-composition">
-    <h4>XRF 最终组成 <small>${xrfRows.length} 项 · Wt%</small></h4>
-    <div class="xrf-result-list result-xrf-list">${xrfRows.map((row) => `<div>
-      <input class="xrf-report-use" type="checkbox" data-xrf-value="${row.xrf_value_id}" aria-label="${esc(row.analyte)}参与最终结果" title="参与最终结果" ${row.selection === "exclude" ? "" : "checked"} ${reviewed ? "disabled" : ""}>
-      <b>${esc(row.analyte)}</b><span>${esc(xrfValueText(row.value))}%</span>
-    </div>`).join("")}</div>
+    <h4>XRF 最终组成 <small>${xrfRows.length} 项 · Wt%</small>
+      ${reviewed ? "" : `<button type="button" class="xrf-target-edit" data-sid="${sample.id}" title="设置每个元素族的报告口径">口径</button>`}
+    </h4>
+    ${warnings.map((warning) => `<p class="hint xrf-warning">注意：${esc(warning.message)}</p>`).join("")}
+    <div class="xrf-result-list result-xrf-list">${xrfRows.map((row) => {
+      const control = targetMode && row.xrf_resolution
+        ? `<span class="xrf-resolution" title="${esc(row.xrf_resolution.note)}">${row.xrf_resolution.via === "converted" ? esc(row.xrf_resolution.note) : "直出"}</span>`
+        : `<input class="xrf-report-use" type="checkbox" data-xrf-value="${row.xrf_value_id}" aria-label="${esc(row.analyte)}参与最终结果" title="参与最终结果" ${row.selection === "exclude" ? "" : "checked"} ${reviewed ? "disabled" : ""}>`;
+      return `<div>${control}<b>${esc(row.analyte)}</b><span>${esc(xrfValueText(row.value))}%</span></div>`;
+    }).join("")}</div>
   </section>` : "";
   const cards = items.map((group) => ({ ...group, rows: group.rows.filter((row) => !row.xrf_value_id) }))
     .filter((group) => group.rows.length)
@@ -2846,8 +2882,95 @@ function resultDetailGroupsHtml(data) {
   return xrf + regular || '<p class="xrf-empty">暂无结果</p>';
 }
 
-function resultDetailSpecialHtml(data) {
-  const { special } = data;
+function closeXrfTargetDialog() {
+  $("#xrf-target-dialog").hidden = true;
+}
+
+async function openXrfTargetDialog(sid) {
+  const [reference, scan] = await Promise.all([
+    api("/api/xrf/reference"),
+    api(`/api/xrf/samples/${sid}`),
+  ]);
+  if (!reference?.ok) { showError(reference?.error || "无法读取元素与氧化物参考数据"); return; }
+  if (!scan?.ok) { showError(scan?.error || "无法读取样品 XRF 结果"); return; }
+  const dialog = $("#xrf-target-dialog");
+  dialog.dataset.sid = sid;
+  dialog.hidden = false;
+  renderXrfTargetRows(reference, scan);
+}
+
+function xrfFamilyCandidates(reference, family) {
+  const element = reference.elements.find((item) => item.symbol.toLowerCase() === family);
+  const oxides = reference.oxides.filter((item) => item.element_symbol.toLowerCase() === family);
+  const candidates = [];
+  if (element) candidates.push({ value: element.symbol, label: `${element.symbol} ${element.name_zh}` });
+  for (const oxide of oxides) {
+    candidates.push({
+      value: oxide.formula,
+      label: `${oxide.formula}${oxide.is_conventional ? "（惯用）" : ""}`,
+    });
+  }
+  return candidates;
+}
+
+function renderXrfTargetRows(reference, scan) {
+  const rows = $("#xrf-target-rows");
+  const targets = (scan.targets || []).map((target) => ({ ...target }));
+  const knownFamilies = new Set(targets.map((target) => target.family));
+  const elementBySymbol = new Map(reference.elements.map((item) => [item.symbol.toLowerCase(), item]));
+  const oxideByFormula = new Map(reference.oxides.map((item) => [item.formula.toLowerCase(), item]));
+  for (const analysis of scan.analyses || []) {
+    for (const value of analysis.values || []) {
+      for (const name of [value.name, value.alt_name]) {
+        const key = String(name || "").toLowerCase();
+        if (!key || knownFamilies.has(key)) continue;
+        const oxide = oxideByFormula.get(key);
+        const family = oxide ? oxide.element_symbol.toLowerCase()
+          : elementBySymbol.has(key) ? key : null;
+        if (!family || knownFamilies.has(family)) continue;
+        knownFamilies.add(family);
+        targets.push({ family, target: oxide ? oxide.formula : elementBySymbol.get(key).symbol,
+                       include: 0, allow_conversion: 1 });
+      }
+    }
+  }
+  targets.sort((left, right) => {
+    const leftNumber = elementBySymbol.get(left.family)?.atomic_number ?? 999;
+    const rightNumber = elementBySymbol.get(right.family)?.atomic_number ?? 999;
+    return leftNumber - rightNumber;
+  });
+  rows.innerHTML = targets.map((target) => {
+    const candidates = xrfFamilyCandidates(reference, target.family);
+    const familyLabel = elementBySymbol.get(target.family)?.name_zh || target.family;
+    const options = candidates.some((candidate) => candidate.value.toLowerCase() === target.target.toLowerCase())
+      ? candidates : candidates.concat([{ value: target.target, label: target.target }]);
+    const select = candidates.length
+      ? `<select class="xrf-target-select">${options.map((candidate) =>
+          `<option value="${esc(candidate.value)}"${candidate.value.toLowerCase() === target.target.toLowerCase() ? " selected" : ""}>${esc(candidate.label)}</option>`).join("")}</select>`
+      : `<input class="xrf-target-custom" value="${esc(target.target)}" title="自定义项目">`;
+    return `<div class="xrf-target-row" data-family="${esc(target.family)}">
+      <label class="inline"><input type="checkbox" class="xrf-target-include" ${target.include ? "checked" : ""}>参与</label>
+      <b>${esc(target.family.toUpperCase())}</b><span class="hint">${esc(familyLabel)}</span>
+      ${select}
+    </div>`;
+  }).join("") || '<p class="hint">暂无候选项目；请先在数据页关联 XRF 扫描，或点击"添加口径"。</p>';
+}
+
+async function saveXrfTargetDialog() {
+  const dialog = $("#xrf-target-dialog");
+  const sid = +dialog.dataset.sid;
+  const targets = $$("#xrf-target-rows .xrf-target-row").map((row) => ({
+    family: row.dataset.family,
+    target: (row.querySelector(".xrf-target-select") || row.querySelector(".xrf-target-custom"))?.value.trim() || "",
+    include: row.querySelector(".xrf-target-include").checked,
+  })).filter((target) => target.target);
+  const result = await api(`/api/xrf/samples/${sid}/targets`, "PUT", { targets });
+  if (!result.ok) { showError(result.error || "保存报告口径失败"); return; }
+  closeXrfTargetDialog();
+  await loadResultDetail(sid);
+}
+
+function resultDetailSpecialHtml(data) {  const { special } = data;
   const values = { ...(special?.raw_data || {}), ...(special?.calculated_data || {}) };
   const rows = (special?.schema?.groups || []).map((group) =>
     `<tr class="analyte-group"><td colspan="3"><b>${esc(group.name)}</b></td></tr>` +
@@ -2910,6 +3033,7 @@ function bindResultDetail(scope, sid) {
     if (!result.ok) { checkbox.checked = !checkbox.checked; return; }
     await loadResultDetail(sid);
   });
+  scope.querySelectorAll(".xrf-target-edit").forEach((button) => button.onclick = () => openXrfTargetDialog(sid));
   const editButton = scope.querySelector(".r-manual-edit");
   editButton.onclick = () => {
     if (!RESULT_DETAILS.has(sid) || editButton.disabled) return;
@@ -4462,6 +4586,13 @@ window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       event.preventDefault();
       closeXrfAssignDialog();
+    }
+    return;
+  }
+  if (!$("#xrf-target-dialog")?.hidden) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeXrfTargetDialog();
     }
     return;
   }

@@ -24,6 +24,7 @@ IDENTITY_TABLES = {
     "samples", "special_methods",
     "preparations", "sample_analytes", "readings", "instrument_imports",
     "standard_client_submissions", "xrf_analyses", "xrf_values",
+    "xrf_report_targets",
     "uq_analyses", "uq_channels", "terminals", "users", "audit_logs",
 }
 
@@ -35,7 +36,7 @@ POSTGRES_TABLE_ORDER = (
     "preparations", "sample_analytes", "results", "readings",
     "instrument_imports", "standard_client_submissions",
     "standard_client_sessions", "standard_client_status", "xrf_analyses",
-    "xrf_values", "uq_analyses", "uq_channels", "xrf_client_status",
+    "xrf_values", "xrf_report_targets", "uq_analyses", "uq_channels", "xrf_client_status",
     "terminals", "audit_logs", "report_overrides", "number_sequences",
 )
 

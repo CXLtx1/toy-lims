@@ -69,6 +69,17 @@ class XrfMonitorTest(unittest.TestCase):
             ],
         }
 
+    def oxide_factor(self, formula):
+        reference = self.client.get("/api/xrf/reference").get_json()
+        return next(oxide["element_to_oxide_factor"] for oxide in reference["oxides"]
+                    if oxide["formula"] == formula)
+
+    def set_targets(self, sid, targets):
+        response = self.client.put(f"/api/xrf/samples/{sid}/targets",
+                                   json={"targets": targets})
+        self.assertEqual(200, response.status_code, response.get_data(as_text=True))
+        return response.get_json()
+
     def test_status_heartbeat_upserts_and_audits_changes_only(self):
         payload = {
             "machine_name": "XRF-PC", "version": "1.0.0", "state": "reading",
@@ -346,6 +357,88 @@ class XrfMonitorTest(unittest.TestCase):
         iron = next(group for group in report["groups"] if group["analyte"] == "Fe")
         self.assertEqual(35.201, iron["rows"][0]["value"])
         self.assertEqual(35.201, iron["final"]["value"])
+
+    def test_targets_derive_from_report_items_and_convert_missing_oxide(self):
+        method_id = next(m["id"] for m in self.meta["methods"] if m["name"] == "WUNI0820")
+        response = self.client.post("/api/samples", json={
+            "name": "氧化物口径", "xrf": 1, "xrf_method_id": method_id,
+            "xrf_report_items": "SiO2,CaO",
+        })
+        sid = response.get_json()["id"]
+        imported = self.import_analysis(sid).get_json()
+        self.assign_analysis(imported["analysis_id"], sid)
+        targets = self.client.get(f"/api/xrf/samples/{sid}").get_json()["targets"]
+        self.assertEqual([("si", "SiO2"), ("ca", "CaO")],
+                         [(target["family"], target["target"]) for target in targets])
+        report = self.client.get(f"/api/report/{sid}").get_json()
+        silica = next(group for group in report["groups"] if group["analyte"] == "SiO2")
+        self.assertEqual(6.8458, round(silica["final"]["value"], 4))
+        self.assertEqual("converted", silica["rows"][0]["xrf_resolution"]["via"])
+        self.assertEqual("Si", silica["rows"][0]["xrf_resolution"]["source"])
+        self.assertEqual(round(3.2 * self.oxide_factor("SiO2"), 4),
+                         round(silica["final"]["value"], 4))
+        self.assertFalse(any(group["analyte"] == "Al" for group in report["groups"]))
+
+    def test_uq_name_pair_keeps_alternate_name_for_conversion(self):
+        method_id = next(m["id"] for m in self.meta["methods"] if m["name"] == "WUNI0820")
+        response = self.client.post("/api/samples", json={
+            "name": "名称对", "xrf": 1, "xrf_method_id": method_id,
+            "xrf_report_items": "Fe2O3",
+        })
+        sid = response.get_json()["id"]
+        payload = self.uq_payload("UQ-PAIR")
+        payload["results"] = [{"name": "Fe2O3", "value": 55.5,
+                               "element_name": "Fe", "oxide_name": "Fe2O3"}]
+        imported = self.client.post("/api/instrument/xrf/uq/import", json=payload).get_json()
+        self.assign_analysis(imported["analysis_id"], sid)
+        analyses = self.client.get(f"/api/xrf/samples/{sid}").get_json()["analyses"]
+        self.assertEqual("Fe", analyses[0]["values"][0]["alt_name"])
+        self.set_targets(sid, [{"family": "fe", "target": "Fe", "include": True}])
+        report = self.client.get(f"/api/report/{sid}").get_json()
+        iron = next(group for group in report["groups"] if group["analyte"] == "Fe")
+        self.assertEqual(round(55.5 / self.oxide_factor("Fe2O3"), 3),
+                         round(iron["final"]["value"], 3))
+        self.assertEqual("Fe2O3", iron["rows"][0]["xrf_resolution"]["source"])
+
+    def test_targets_endpoint_validates_duplicates_and_audits(self):
+        sid = self.create_xrf_sample("TARGETS-1")
+        body = self.set_targets(sid, [
+            {"family": "fe", "target": "Fe2O3", "include": True},
+            {"family": "si", "target": "SiO2", "include": False},
+        ])
+        self.assertEqual([("fe", "Fe2O3", 1), ("si", "SiO2", 0)],
+                         [(target["family"], target["target"], target["include"])
+                          for target in body["targets"]])
+        sample = self.client.get(f"/api/xrf/samples/{sid}").get_json()["sample"]
+        self.assertEqual("Fe2O3", sample["xrf_report_items"])
+        duplicate = self.client.put(f"/api/xrf/samples/{sid}/targets", json={
+            "targets": [{"family": "fe", "target": "Fe2O3"},
+                        {"family": "fe", "target": "Fe"}]})
+        self.assertEqual(400, duplicate.status_code)
+        audits = self.client.get("/api/audit?limit=100").get_json()
+        self.assertTrue(any(item["action"] == "xrf_targets_update" for item in audits))
+
+    def test_consistency_warning_for_independent_oxide_and_element(self):
+        sid = self.create_xrf_sample("CONSIST-1")
+        connection = sqlite3.connect(lims.DB)
+        analysis_id = connection.execute(
+            "INSERT INTO xrf_analyses(sample_id,external_id,method) VALUES(?,?, 'WUNI0820')",
+            (sid, "CONSIST-SCAN")).lastrowid
+        for name, value in (("Fe", 40.0), ("Fe2O3", 50.0)):
+            connection.execute(
+                "INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(?,?,?,1)",
+                (analysis_id, name, value))
+        connection.commit()
+        connection.close()
+        self.set_targets(sid, [{"family": "fe", "target": "Fe2O3", "include": True}])
+        report = self.client.get(f"/api/report/{sid}").get_json()
+        iron = next(group for group in report["groups"] if group["analyte"] == "Fe2O3")
+        self.assertEqual(50.0, iron["final"]["value"])
+        self.assertEqual("direct", iron["rows"][0]["xrf_resolution"]["via"])
+        warnings = [warning for warning in report["xrf_warnings"]
+                    if warning["code"] == "composition_mismatch"]
+        self.assertEqual(1, len(warnings))
+        self.assertIn("相对偏差", warnings[0]["message"])
 
 
 if __name__ == "__main__":
