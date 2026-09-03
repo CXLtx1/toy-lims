@@ -32,6 +32,22 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 AUTHORIZATION_SECONDS = 120
 FORCED_AUTHORIZATION_SECONDS = 60
 TERMINAL_KINDS = {"standard", "admin"}
+PASSWORD_METHOD = "pbkdf2:sha256:20000"
+
+
+def hash_password(password):
+    return generate_password_hash(password, method=PASSWORD_METHOD)
+
+
+def _check_password(db, row, password, entity):
+    if not check_password_hash(row["password_hash"], password):
+        return False
+    if not row["password_hash"].startswith(PASSWORD_METHOD + "$"):
+        table = "users" if entity == "user" else "terminals"
+        db.execute(f"UPDATE {table} SET password_hash=? WHERE id=?",
+                   (hash_password(password), row["id"]))
+        db.commit()
+    return True
 
 
 def get_db():
@@ -73,7 +89,7 @@ def _clean_permissions(value):
 def _matching_users(db, password, *, active=True):
     where = " WHERE active=1" if active else ""
     return [row for row in db.execute("SELECT * FROM users" + where).fetchall()
-            if check_password_hash(row["password_hash"], password)]
+            if _check_password(db, row, password, "user")]
 
 
 def authenticate_capable_user(db, password, capability):
@@ -89,13 +105,13 @@ def authenticate_capable_user(db, password, capability):
 
 def _password_in_use(db, password, excluding_user_id=None):
     return any(row["id"] != excluding_user_id and
-               check_password_hash(row["password_hash"], password)
+               _check_password(db, row, password, "user")
                 for row in db.execute("SELECT id,password_hash FROM users WHERE active=1"))
 
 
 def _terminal_password_in_use(db, password, excluding_terminal_id=None):
     return any(row["id"] != excluding_terminal_id and
-                check_password_hash(row["password_hash"], password)
+                 _check_password(db, row, password, "terminal")
                 for row in db.execute(
                     "SELECT id,password_hash FROM terminals WHERE active=1 AND kind<>'personal'"))
 
@@ -272,15 +288,15 @@ def setup():
                 cur = db.execute("""INSERT INTO users(
                     username,password_hash,display_name,role,permissions)
                     VALUES('cxl',?,?,'custom',?)""",
-                    (generate_password_hash(user_password), display_name, permissions))
+                    (hash_password(user_password), display_name, permissions))
                 audit_event(db, "setup", "user", cur.lastrowid,
                             after={"username": "cxl", "permissions": sorted(CAPABILITIES)},
                             user={"id": cur.lastrowid, "username": "cxl"})
             if not has_terminals:
                 db.executemany("""INSERT INTO terminals(name,password_hash,kind,sort_order)
                     VALUES(?,?,?,?)""", [
-                    ("二组", generate_password_hash(standard_password), "standard", 1),
-                    ("管理终端", generate_password_hash(admin_password), "admin", 2),
+                    ("二组", hash_password(standard_password), "standard", 1),
+                    ("管理终端", hash_password(admin_password), "admin", 2),
                 ])
             db.commit()
             session.clear()
@@ -312,14 +328,14 @@ def login():
             username = request.form.get("username", "").strip()
             user = db.execute("SELECT * FROM users WHERE username=? AND active=1",
                               (username,)).fetchone()
-            if not user or not check_password_hash(user["password_hash"], password):
+            if not user or not _check_password(db, user, password, "user"):
                 error = "用户名或用户密码不正确"
         else:
             terminal = db.execute("""SELECT * FROM terminals
                 WHERE id=? AND active=1 AND kind IN ('standard','admin')""",
                 (terminal_id,)).fetchone() if terminal_id else None
             if (not terminal or login_kind not in {"", terminal["kind"]} or
-                    not check_password_hash(terminal["password_hash"], password)):
+                    not _check_password(db, terminal, password, "terminal")):
                 error = "终端或密码不正确"
         if not error:
             session.clear()
@@ -418,7 +434,7 @@ def add_user():
     if _password_in_use(db, password):
         return jsonify(ok=False, error="该密码已被其他启用用户使用，请设置唯一密码"), 409
     cur = db.execute("""INSERT INTO users(username,password_hash,display_name,role,permissions)
-        VALUES(?,?,?,'custom',?)""", (username, generate_password_hash(password),
+        VALUES(?,?,?,'custom',?)""", (username, hash_password(password),
                               str(data.get("display_name", "")).strip() or username,
                               json.dumps(sorted(permissions))))
     audit_event(db, "create", "user", cur.lastrowid,
@@ -471,7 +487,7 @@ def update_user(user_id):
         WHERE id=?""", (username, display_name, json.dumps(sorted(permissions)), active, user_id))
     if password:
         db.execute("UPDATE users SET password_hash=? WHERE id=?",
-                   (generate_password_hash(password), user_id))
+                   (hash_password(password), user_id))
     after = db.execute("SELECT id,username,display_name,role,permissions,active FROM users WHERE id=?",
                        (user_id,)).fetchone()
     audit_event(db, "update", "user", user_id, before=before, after=after)
@@ -505,7 +521,7 @@ def add_terminal():
         return jsonify(ok=False, error="该密码已被其他启用终端使用，请设置唯一密码"), 409
     sort_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM terminals").fetchone()[0]
     cur = db.execute("""INSERT INTO terminals(name,password_hash,kind,sort_order)
-        VALUES(?,?,?,?)""", (name, generate_password_hash(password), kind, sort_order))
+        VALUES(?,?,?,?)""", (name, hash_password(password), kind, sort_order))
     audit_event(db, "create", "terminal", cur.lastrowid,
                 after={"name": name, "kind": kind, "active": 1})
     db.commit()
@@ -548,7 +564,7 @@ def update_terminal(terminal_id):
     if password:
         db.execute("""UPDATE terminals SET password_hash=?,
             updated_at=datetime('now','localtime') WHERE id=?""",
-            (generate_password_hash(password), terminal_id))
+            (hash_password(password), terminal_id))
     after = db.execute("SELECT id,name,kind,active FROM terminals WHERE id=?",
                        (terminal_id,)).fetchone()
     audit_event(db, "update", "terminal", terminal_id, before=before, after=after)

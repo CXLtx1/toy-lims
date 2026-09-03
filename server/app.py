@@ -2,6 +2,7 @@
 """toy-lims —— 无机分析实验室轻量级 LIMS
 Flask + PostgreSQL（SQLite 测试兼容）+ 原生前端
 """
+import gzip
 import json
 import ast
 import hashlib
@@ -11,12 +12,13 @@ import os
 import operator
 import re
 import secrets
+import threading
 import time
 from functools import wraps
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from flask import Flask, g, jsonify, request, render_template, send_file
+from flask import Flask, Response, g, jsonify, request, render_template, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from business_excel import (BusinessExcelError, MIME as EXCEL_MIME, build_data,
@@ -77,6 +79,7 @@ if REQUEST_LOG_ENABLED and not REQUEST_LOGGER.handlers:
 METHOD_FIXED_VARS = {"m", "v"}
 METHOD_OUTPUT_UNITS = {"%", "ppm", "ppb", "mol/L", "g/L"}
 INSTRUMENT_TYPES = {"xrf", "ppm", "ppb", "mol", "percent", "function", "ph"}
+RESULT_DISPLAY_UNITS = ("%", "ppm", "ppb", "g/L", "mg/L", "ug/L")
 
 # Database schema and initialization live in db_schema.py.
 
@@ -151,6 +154,54 @@ def disable_api_cache(response):
 
 
 @app.after_request
+def invalidate_report_payload_cache(response):
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        _report_cache_note_write()
+    return response
+
+
+COMPRESSIBLE_TYPES = {"application/json", "text/html", "text/css",
+                      "application/javascript", "text/javascript",
+                      "application/manifest+json", "image/svg+xml",
+                      "text/csv", "text/plain"}
+COMPRESS_MIN_BYTES = 1024
+
+
+@app.after_request
+def compress_response(response):
+    ctype = (response.content_type or "").split(";")[0].strip().lower()
+    if ctype == "text/event-stream" or response.headers.get("Content-Encoding"):
+        return response
+    if response.status_code != 200 or ctype not in COMPRESSIBLE_TYPES:
+        return response
+    if "gzip" not in (request.headers.get("Accept-Encoding", "") or "").lower():
+        return response
+    if response.direct_passthrough:
+        try:
+            response.direct_passthrough = False
+        except Exception:
+            return response
+    data = response.get_data()
+    if len(data) < COMPRESS_MIN_BYTES:
+        return response
+    response.set_data(gzip.compress(data, compresslevel=6))
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(response.get_data()))
+    response.headers.add("Vary", "Accept-Encoding")
+    return response
+
+
+@app.after_request
+def static_cache_headers(response):
+    if response.status_code == 200 and request.path.startswith("/static/"):
+        if request.args.get("v"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
+
+
+@app.after_request
 def log_request(response):
     if not REQUEST_LOG_ENABLED:
         return response
@@ -188,6 +239,60 @@ def init_db():
 
 def rows(q, args=()):
     return [dict(r) for r in get_db().execute(q, args)]
+
+
+def optional_density(data):
+    value = data.get("density_g_ml")
+    if value in (None, ""):
+        return None
+    try:
+        density = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("液体密度必须是数字") from exc
+    if not math.isfinite(density) or density <= 0:
+        raise ValueError("液体密度必须大于 0")
+    return density
+
+
+def clean_sample_tags(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError("每个样品最多添加 20 个标签")
+    tags = []
+    seen = set()
+    for raw in value:
+        tag = str(raw or "").strip().lstrip("#").strip()
+        if not tag:
+            continue
+        if len(tag) > 30 or any(ord(char) < 32 for char in tag):
+            raise ValueError("标签不能为空且不能超过 30 个字符")
+        key = tag.casefold()
+        if key not in seen:
+            seen.add(key)
+            tags.append(tag)
+    return tags
+
+
+def replace_sample_tags(db, sample_id, value):
+    tags = clean_sample_tags(value)
+    db.execute("DELETE FROM sample_tags WHERE sample_id=?", (sample_id,))
+    db.executemany("INSERT INTO sample_tags(sample_id,tag) VALUES(?,?)",
+                   [(sample_id, tag) for tag in tags])
+    return tags
+
+
+def attach_sample_tags(db, samples):
+    if not samples:
+        return samples
+    ids = [sample["id"] for sample in samples]
+    grouped = {sample_id: [] for sample_id in ids}
+    for row in db.execute(f"""SELECT sample_id,tag FROM sample_tags
+            WHERE sample_id IN ({','.join('?' for _ in ids)}) ORDER BY tag""", ids):
+        grouped[row["sample_id"]].append(row["tag"])
+    for sample in samples:
+        sample["tags"] = grouped.get(sample["id"], [])
+    return samples
 
 
 def actor_name(actor=None):
@@ -292,13 +397,13 @@ def calculate_special(schema, raw):
 
 
 def aux_coefficient(aux):
-    """回标系数: 优先用旧格式 coefficient, 否则 measured/expected。"""
+    """回标系数: 优先用旧格式 coefficient, 否则 expected/measured。"""
     if not aux.get("use"):
         return 1.0
     if aux.get("coefficient"):
         return float(aux["coefficient"])
     if aux.get("expected") and aux.get("measured"):
-        return float(aux["measured"]) / float(aux["expected"])
+        return float(aux["expected"]) / float(aux["measured"])
     return 1.0
 
 
@@ -332,7 +437,12 @@ def reading_value(sa, is_liquid, raw, extra):
             val = special_formula_value(sa["formula"], env)
             if not math.isfinite(float(val)):
                 raise ValueError("计算结果不是有限数值")
-            return (float(val), sa.get("method_output_unit") or "%")
+            output_unit = sa.get("method_output_unit") or "%"
+            if is_liquid and output_unit == "ppm":
+                output_unit = "mg/L"
+            elif is_liquid and output_unit == "ppb":
+                output_unit = "ug/L"
+            return (float(val), output_unit)
         except Exception as e:
             return (None, f"公式错误: {e}")
     if raw is None:
@@ -341,7 +451,7 @@ def reading_value(sa, is_liquid, raw, extra):
         return (raw, "%")
     if it == "ppb":
         if is_liquid:
-            return (raw * factor, "ppb")
+            return (raw * factor, "ug/L")
         if not sa["prep_mass"] or not sa["prep_vol"]:
             return (None, "缺称样量/定容体积")
         # w% = C(μg/L) * V(mL) * D / (m(g) * 10^7)
@@ -354,6 +464,57 @@ def reading_value(sa, is_liquid, raw, extra):
         return (None, "缺称样量/定容体积")
     # w% = C(mg/L) * V(mL) * D / (m(g) * 10^4)
     return (raw * sa["prep_vol"] * factor / (sa["prep_mass"] * 10000), "%")
+
+
+def normalized_result_unit(unit):
+    value = str(unit or "").strip()
+    return "ug/L" if value in {"μg/L", "µg/L", "ug/L"} else value
+
+
+def convert_result_unit(value, source_unit, target_unit, density=None):
+    """Convert display units without changing the stored analytical value."""
+    source = normalized_result_unit(source_unit)
+    target = normalized_result_unit(target_unit)
+    if value is None or source == target:
+        return value
+    mass_to_percent = {"%": 1.0, "ppm": 1e-4, "ppb": 1e-7}
+    volume_to_g_l = {"g/L": 1.0, "mg/L": 1e-3, "ug/L": 1e-6}
+    if source in mass_to_percent:
+        percent = float(value) * mass_to_percent[source]
+        if target in mass_to_percent:
+            return percent / mass_to_percent[target]
+        if target in volume_to_g_l and density:
+            return percent * float(density) * 10 / volume_to_g_l[target]
+    if source in volume_to_g_l:
+        grams_litre = float(value) * volume_to_g_l[source]
+        if target in volume_to_g_l:
+            return grams_litre / volume_to_g_l[target]
+        if target in mass_to_percent and density:
+            percent = grams_litre / (float(density) * 10)
+            return percent / mass_to_percent[target]
+    raise ValueError("所选单位不能从当前结果口径换算")
+
+
+def result_unit_options(source_unit, density=None):
+    source = normalized_result_unit(source_unit)
+    mass_units = ["%", "ppm", "ppb"]
+    volume_units = ["g/L", "mg/L", "ug/L"]
+    if source in mass_units:
+        return mass_units + (volume_units if density else [])
+    if source in volume_units:
+        return volume_units + (mass_units if density else [])
+    return [source] if source else []
+
+
+def rounded_display_value(value, unit, xrf=False):
+    if value is None:
+        return None
+    if xrf:
+        return float(f"{float(value):.5g}")
+    magnitude = abs(float(value))
+    if magnitude >= 100000:
+        return float(f"{float(value):.7g}")
+    return round(float(value), 6 if unit in {"%", "g/L"} else 4)
 
 
 def calc_result(sa, is_liquid):
@@ -475,6 +636,8 @@ def sample_audit_snapshot(db, sample_id):
         (sample_id,)).fetchone()
     return {
         "sample": dict(sample),
+        "tags": [row["tag"] for row in db.execute(
+            "SELECT tag FROM sample_tags WHERE sample_id=? ORDER BY tag", (sample_id,))],
         "preparations": {str(row["id"]): {key: row[key] for key in row.keys() if key != "id"}
                          for row in preparations},
         "tasks": {str(row["id"]): {key: row[key] for key in row.keys() if key != "id"}
@@ -609,6 +772,46 @@ def site_status():
     })
 
 
+SSE_POLL_SECONDS = 1.0
+SSE_HEARTBEAT_TICKS = 15
+
+
+@app.route("/api/events")
+def sse_events():
+    """SSE 推送：audit_logs 最大 id 变化（即服务器 revision 变化）时通知浏览器刷新。"""
+    def generate():
+        connection = connect_database(DB)
+        last_revision = None
+        idle_ticks = 0
+        try:
+            while True:
+                try:
+                    row = connection.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM audit_logs").fetchone()
+                    revision = int(row[0] if row else 0)
+                except DATABASE_ERRORS:
+                    break
+                if last_revision is None or revision != last_revision:
+                    payload = json.dumps({
+                        "revision": revision,
+                        "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    })
+                    yield f"data: {payload}\n\n"
+                    idle_ticks = 0
+                else:
+                    idle_ticks += 1
+                    if idle_ticks % SSE_HEARTBEAT_TICKS == 0:
+                        yield ": ping\n\n"
+                last_revision = revision
+                time.sleep(SSE_POLL_SECONDS)
+        finally:
+            connection.close()
+    response = Response(generate(), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
 # ---------------------------------------------------------------- 元数据
 
 @app.route("/api/meta")
@@ -634,7 +837,8 @@ def meta():
     combinations = rows("SELECT * FROM preparation_combinations ORDER BY name,id")
     for combination in combinations:
         combination["rows"] = json.loads(combination.pop("config_json") or "[]")
-    result_order_templates = rows("SELECT * FROM result_order_templates ORDER BY name,id")
+    result_order_templates = rows(
+        "SELECT * FROM result_order_templates ORDER BY is_default DESC,name,id")
     for template in result_order_templates:
         template["items"] = json.loads(template.pop("items_json") or "[]")
     return jsonify({
@@ -649,8 +853,12 @@ def meta():
         "preparation_combinations": combinations,
         "report_profiles": rows("SELECT * FROM report_profiles ORDER BY id"),
         "result_order_templates": result_order_templates,
+        "default_order_template_id": next((item["id"] for item in result_order_templates
+                                             if item.get("is_default")), None),
         "categories": [r["category"] for r in rows(
             "SELECT DISTINCT category FROM samples WHERE category != '' ORDER BY category")],
+        "sample_tags": rows("""SELECT tag AS name,COUNT(*) AS count FROM sample_tags
+            GROUP BY tag ORDER BY tag"""),
         "current_user": current_user,
         "terminal": terminal,
         "authorized_user": actual_user if terminal and terminal["kind"] == "standard" else None,
@@ -703,6 +911,79 @@ def clean_result_order_template(data):
     return {"name": name, "items": clean}
 
 
+def _default_order_template_id(db):
+    row = db.execute(
+        "SELECT id FROM result_order_templates WHERE is_default=1 ORDER BY id LIMIT 1").fetchone()
+    return row["id"] if row else None
+
+
+def _validated_order_template_id(db, value, use_default=True):
+    if value in (None, ""):
+        return _default_order_template_id(db) if use_default else None
+    try:
+        template_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("通用顺序模板无效") from exc
+    if not db.execute("SELECT 1 FROM result_order_templates WHERE id=?", (template_id,)).fetchone():
+        raise ValueError("通用顺序模板不存在")
+    return template_id
+
+
+def _universal_order_key(db, template_id=None):
+    """Return a stable name sorter: selected template, system default, then chemistry."""
+    template_id = _validated_order_template_id(db, template_id)
+    default_id = _default_order_template_id(db)
+    ordered_names = []
+    for current_id in dict.fromkeys(item for item in (template_id, default_id) if item):
+        row = db.execute(
+            "SELECT items_json FROM result_order_templates WHERE id=?", (current_id,)).fetchone()
+        try:
+            items = json.loads(row["items_json"] or "[]") if row else []
+        except (TypeError, json.JSONDecodeError):
+            items = []
+        ordered_names.extend(str(item).strip() for item in items if str(item).strip())
+    positions = {}
+    for name in ordered_names:
+        positions.setdefault(name.casefold(), len(positions))
+    element_numbers = {str(row["symbol"]).casefold(): row["atomic_number"] for row in db.execute(
+        "SELECT atomic_number,symbol FROM chemical_elements")}
+    oxide_numbers = {str(row["formula"]).casefold(): element_numbers.get(
+        str(row["element_symbol"]).casefold(), 999999) for row in db.execute(
+            "SELECT formula,element_symbol FROM common_oxides")}
+    analyte_orders = {str(row["name"]).casefold(): row["sort_order"] for row in db.execute(
+        "SELECT name,sort_order FROM analytes")}
+
+    def key(name):
+        text = str(name or "").strip()
+        folded = text.casefold()
+        if folded in positions:
+            return (0, positions[folded], 0, "")
+        if folded in element_numbers:
+            return (1, element_numbers[folded], 0, folded)
+        if folded in oxide_numbers:
+            return (1, oxide_numbers[folded], 1, folded)
+        return (2, analyte_orders.get(folded, 999999), 0, folded)
+
+    return key
+
+
+def _sample_analyte_order_key(db, sample):
+    universal_key = _universal_order_key(db, sample.get("order_template_id"))
+    try:
+        manual = [int(item) for item in json.loads(sample.get("report_order") or "[]")]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        manual = []
+    manual_positions = {item: index for index, item in enumerate(manual)}
+
+    def key(item):
+        analyte_id = item.get("analyte_id")
+        if analyte_id in manual_positions:
+            return (0, manual_positions[analyte_id], (0, 0, 0, ""))
+        return (1, 0, universal_key(item.get("analyte") or item.get("name")))
+
+    return key
+
+
 @app.post("/api/result-order-templates")
 @capability_required("settings_manage")
 def add_result_order_template():
@@ -712,7 +993,7 @@ def add_result_order_template():
         return jsonify(ok=False, error=str(exc)), 400
     db = get_db()
     try:
-        cur = db.execute("INSERT INTO result_order_templates(name,items_json) VALUES(?,?)",
+        cur = db.execute("INSERT INTO result_order_templates(name,items_json,is_default) VALUES(?,?,0)",
                          (template["name"], json.dumps(template["items"], ensure_ascii=False)))
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="模板名称已存在"), 409
@@ -737,6 +1018,10 @@ def update_result_order_template(template_id):
                    (template["name"], json.dumps(template["items"], ensure_ascii=False), template_id))
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="模板名称已存在"), 409
+    if (request.json or {}).get("is_default"):
+        db.execute("UPDATE result_order_templates SET is_default=0 WHERE id!=?", (template_id,))
+        db.execute("UPDATE result_order_templates SET is_default=1 WHERE id=?", (template_id,))
+        template["is_default"] = True
     audit_event(db, "update", "result_order_template", template_id, before=before, after=template)
     db.commit()
     return jsonify(ok=True, id=template_id)
@@ -749,6 +1034,10 @@ def delete_result_order_template(template_id):
     before = db.execute("SELECT * FROM result_order_templates WHERE id=?", (template_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="模板不存在"), 404
+    if before["is_default"]:
+        return jsonify(ok=False, error="系统默认顺序模板不能删除，请先将其他模板设为默认"), 409
+    db.execute("UPDATE samples SET order_template_id=NULL WHERE order_template_id=?", (template_id,))
+    db.execute("UPDATE templates SET order_template_id=NULL WHERE order_template_id=?", (template_id,))
     db.execute("DELETE FROM result_order_templates WHERE id=?", (template_id,))
     audit_event(db, "delete", "result_order_template", template_id, before=before)
     db.commit()
@@ -883,10 +1172,12 @@ def apply_excel_plan(db, data, sid=None):
     workflow = data["workflow_type"]
     if creating:
         lims_no = next_lims_no(db)
-        cur = db.execute("""INSERT INTO samples(name,category,is_liquid,workflow_type,special_method_id,xrf,
+        is_water_quality = int(bool(data.get("is_water_quality", 0))) if workflow == "regular" else 0
+        is_liquid = int(bool(data["is_liquid"]) or is_water_quality) if workflow == "regular" else 0
+        cur = db.execute("""INSERT INTO samples(name,category,is_liquid,is_water_quality,workflow_type,special_method_id,xrf,
             xrf_method_id,xrf_report_items,customer,report_no,analysis_date,analyst,reviewer,report_order,lims_no,status)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'received')""",
-            (data["name"], str(data.get("category") or "").strip(), data["is_liquid"], workflow,
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'received')""",
+            (data["name"], str(data.get("category") or "").strip(), is_liquid, is_water_quality, workflow,
              data.get("special_method_id") if workflow == "special" else None, int(data.get("xrf", 0)) if workflow == "regular" else 0,
              _validate_xrf_method(db, data) if workflow == "regular" else None, str(data.get("xrf_report_items") or "").strip(),
              str(data.get("customer") or "").strip(), str(data.get("report_no") or "").strip(),
@@ -897,10 +1188,12 @@ def apply_excel_plan(db, data, sid=None):
     else:
         lims_no = existing["lims_no"]
         before = sample_audit_snapshot(db, sid)
-        db.execute("""UPDATE samples SET name=?,category=?,is_liquid=?,special_method_id=?,xrf=?,xrf_method_id=?,
+        is_water_quality = int(bool(data.get("is_water_quality", 0))) if workflow == "regular" else 0
+        is_liquid = int(bool(data["is_liquid"]) or is_water_quality) if workflow == "regular" else 0
+        db.execute("""UPDATE samples SET name=?,category=?,is_liquid=?,is_water_quality=?,special_method_id=?,xrf=?,xrf_method_id=?,
             xrf_report_items=?,customer=?,report_no=?,analysis_date=?,analyst=?,reviewer=?,report_order=?,
             updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
-            (data["name"], str(data.get("category") or "").strip(), data["is_liquid"],
+            (data["name"], str(data.get("category") or "").strip(), is_liquid, is_water_quality,
              data.get("special_method_id") if workflow == "special" else None,
              int(data.get("xrf", 0)) if workflow == "regular" else 0,
              _validate_xrf_method(db, data) if workflow == "regular" else None,
@@ -1162,21 +1455,37 @@ def excel_sample_data_overwrite(sid):
 @app.route("/api/analytes", methods=["POST"])
 @capability_required("settings_manage")
 def add_analyte():
-    name = request.json["name"].strip()
+    data = request.json or {}
+    name = data["name"].strip()
+    default_unit = normalized_result_unit(data.get("default_unit"))
+    if default_unit and default_unit not in RESULT_DISPLAY_UNITS:
+        return jsonify(ok=False, error="默认单位无效"), 400
     db = get_db()
-    cur = db.execute("""INSERT OR IGNORE INTO analytes(name,sort_order)
-        VALUES(?,COALESCE((SELECT MAX(sort_order)+1 FROM analytes),1))""", (name,))
+    cur = db.execute("""INSERT OR IGNORE INTO analytes(name,sort_order,default_unit)
+        VALUES(?,COALESCE((SELECT MAX(sort_order)+1 FROM analytes),1),?)""", (name, default_unit))
     if cur.rowcount:
-        audit_event(db, "create", "analyte", cur.lastrowid, after={"name": name})
+        audit_event(db, "create", "analyte", cur.lastrowid,
+                    after={"name": name, "default_unit": default_unit})
     db.commit()
     return jsonify(ok=True)
 
 
-@app.route("/api/analytes/<int:aid>", methods=["DELETE"])
+@app.route("/api/analytes/<int:aid>", methods=["PUT", "DELETE"])
 @capability_required("settings_manage")
 def del_analyte(aid):
     db = get_db()
     before = db.execute("SELECT * FROM analytes WHERE id=?", (aid,)).fetchone()
+    if request.method == "PUT":
+        if not before:
+            return jsonify(ok=False, error="分析项目不存在"), 404
+        default_unit = normalized_result_unit((request.json or {}).get("default_unit"))
+        if default_unit and default_unit not in RESULT_DISPLAY_UNITS:
+            return jsonify(ok=False, error="默认单位无效"), 400
+        db.execute("UPDATE analytes SET default_unit=? WHERE id=?", (default_unit, aid))
+        after = db.execute("SELECT * FROM analytes WHERE id=?", (aid,)).fetchone()
+        audit_event(db, "update", "analyte", aid, before=before, after=after)
+        db.commit()
+        return jsonify(ok=True, default_unit=default_unit)
     db.execute("DELETE FROM analytes WHERE id=?", (aid,))
     if before:
         audit_event(db, "delete", "analyte", aid, before=before)
@@ -1588,12 +1897,21 @@ def del_method(mid):
 def add_template():
     d = request.json
     db = get_db()
+    is_water_quality = int(bool(d.get("is_water_quality", 0)))
+    is_liquid = int(bool(d.get("is_liquid", 0)) or is_water_quality)
+    try:
+        order_template_id = _validated_order_template_id(db, d.get("order_template_id"))
+        template_tags = clean_sample_tags(d.get("tags", []))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     cur = db.execute("""INSERT INTO templates(
-        name,is_liquid,dilution_id,xrf,analyte_ids,prep_config,instrument_config)
-        VALUES(?,?,?,?,?,?,?)""",
-               (d["name"].strip(), int(d.get("is_liquid", 0)), d.get("dilution_id"),
-                int(d.get("xrf", 0)), json.dumps(d.get("analyte_ids", [])),
-                 json.dumps(d.get("preps", [])), json.dumps(d.get("instrument_map", {}))))
+        name,category,tags_json,is_liquid,is_water_quality,dilution_id,xrf,analyte_ids,prep_config,instrument_config,
+        order_template_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+               (d["name"].strip(), str(d.get("category", "")).strip(),
+                  json.dumps(template_tags, ensure_ascii=False), is_liquid, is_water_quality, d.get("dilution_id"),
+                  int(d.get("xrf", 0)), json.dumps(d.get("analyte_ids", [])),
+                  json.dumps(d.get("preps", [])), json.dumps(d.get("instrument_map", {})),
+                  order_template_id))
     audit_event(db, "create", "template", cur.lastrowid, after={"name": d["name"].strip()})
     db.commit()
     return jsonify(ok=True, id=cur.lastrowid)
@@ -1604,12 +1922,21 @@ def add_template():
 def update_template(tid):
     d = request.json
     db = get_db()
+    is_water_quality = int(bool(d.get("is_water_quality", 0)))
+    is_liquid = int(bool(d.get("is_liquid", 0)) or is_water_quality)
+    try:
+        order_template_id = _validated_order_template_id(db, d.get("order_template_id"))
+        template_tags = clean_sample_tags(d.get("tags", []))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     before = db.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
-    cur = db.execute("""UPDATE templates SET name=?,is_liquid=?,dilution_id=?,xrf=?,
-        analyte_ids=?,prep_config=?,instrument_config=? WHERE id=?""",
-        (d["name"].strip(), int(d.get("is_liquid", 0)), d.get("dilution_id"),
+    cur = db.execute("""UPDATE templates SET name=?,category=?,tags_json=?,is_liquid=?,is_water_quality=?,dilution_id=?,xrf=?,
+        analyte_ids=?,prep_config=?,instrument_config=?,order_template_id=? WHERE id=?""",
+        (d["name"].strip(), str(d.get("category", "")).strip(),
+         json.dumps(template_tags, ensure_ascii=False), is_liquid, is_water_quality, d.get("dilution_id"),
          int(d.get("xrf", 0)), json.dumps(d.get("analyte_ids", [])),
-         json.dumps(d.get("preps", [])), json.dumps(d.get("instrument_map", {})), tid))
+         json.dumps(d.get("preps", [])), json.dumps(d.get("instrument_map", {})),
+         order_template_id, tid))
     if not cur.rowcount:
         return jsonify(ok=False, error="模板不存在"), 404
     audit_event(db, "update", "template", tid, before=before,
@@ -1646,6 +1973,13 @@ def list_samples():
     except ValueError:
         limit, offset = 100, 0
     conditions, args = [], []
+    try:
+        requested_tags = clean_sample_tags(request.args.getlist("tag"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    for tag in requested_tags:
+        conditions.append("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag=?)")
+        args.append(tag)
     if query:
         conditions.append("""(s.name LIKE ? OR s.lims_no LIKE ? OR CAST(s.id AS TEXT)=? OR EXISTS(
             SELECT 1 FROM sample_analytes sx JOIN analytes ax ON ax.id=sx.analyte_id
@@ -1666,7 +2000,9 @@ def list_samples():
     if sample_type == "solid":
         conditions.append("s.is_liquid=0 AND COALESCE(s.workflow_type,'regular')='regular'")
     elif sample_type == "liquid":
-        conditions.append("s.is_liquid=1 AND COALESCE(s.workflow_type,'regular')='regular'")
+        conditions.append("s.is_liquid=1 AND COALESCE(s.is_water_quality,0)=0 AND COALESCE(s.workflow_type,'regular')='regular'")
+    elif sample_type == "water_quality":
+        conditions.append("COALESCE(s.is_water_quality,0)=1 AND COALESCE(s.workflow_type,'regular')='regular'")
     elif sample_type == "special":
         conditions.append("s.workflow_type='special'")
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
@@ -1683,7 +2019,18 @@ def list_samples():
                                WHERE sa.sample_id=s.id ORDER BY analyte_sort_id
                             )) AS analyte_names
                            FROM samples s LEFT JOIN special_methods sm ON sm.id=s.special_method_id
-                           {where} ORDER BY s.id DESC LIMIT ? OFFSET ?""", page_args)
+                            {where} ORDER BY s.id DESC LIMIT ? OFFSET ?""", page_args)
+    order_keys = {}
+    for sample in data:
+        names = [name.strip() for name in str(sample.get("analyte_names") or "").split(",")
+                 if name.strip()]
+        if not names:
+            continue
+        template_id = sample.get("order_template_id")
+        if template_id not in order_keys:
+            order_keys[template_id] = _universal_order_key(get_db(), template_id)
+        sample["analyte_names"] = ", ".join(sorted(names, key=order_keys[template_id]))
+    attach_sample_tags(get_db(), data)
     attach_sample_status_history(get_db(), data)
     if request.args.get("paged") == "1":
         return jsonify({"rows": data, "total": total, "limit": limit, "offset": offset})
@@ -1699,6 +2046,8 @@ def add_sample():
         return jsonify(ok=False, error="来样序号不能为空"), 400
     db = get_db()
     workflow_type = "special" if d.get("workflow_type") == "special" else "regular"
+    if workflow_type == "special" and d.get("is_water_quality"):
+        return jsonify(ok=False, error="水质样不能使用其他样流程"), 400
     if workflow_type == "special":
         special_method_id = d.get("special_method_id")
         if not db.execute("SELECT 1 FROM special_methods WHERE id=? AND active=1",
@@ -1710,6 +2059,11 @@ def add_sample():
             VALUES(?,?,0,'special',?,0,?,'received','[]')""",
             (name, str(d.get("category", "")).strip(), special_method_id, lims_no))
         sid = cur.lastrowid
+        try:
+            replace_sample_tags(db, sid, d.get("tags", []))
+        except ValueError as exc:
+            db.rollback()
+            return jsonify(ok=False, error=str(exc)), 400
         mark_sample_status_actor(db, sid, "received")
         db.execute("INSERT INTO special_results(sample_id,method_id) VALUES(?,?)",
                    (sid, special_method_id))
@@ -1717,6 +2071,16 @@ def add_sample():
         db.commit()
         return jsonify(ok=True, id=sid, lims_no=lims_no, status="received")
     instrument_map = d.get("instrument_map", {})
+    try:
+        order_template_id = _validated_order_template_id(db, d.get("order_template_id"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    is_water_quality = int(bool(d.get("is_water_quality", 0)))
+    is_liquid = int(bool(d.get("is_liquid", 0)) or is_water_quality)
+    try:
+        density_g_ml = optional_density(d) if is_liquid else None
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     xrf_enabled = int(bool(d.get("xrf", 0)))
     xrf_method_id = d.get("xrf_method_id") if xrf_enabled else None
     if xrf_enabled and not db.execute(
@@ -1728,13 +2092,18 @@ def add_sample():
         return jsonify(ok=False, error=str(exc) or "溶样名称不能为空"), 400
     lims_no = next_lims_no(db)
     cur = db.execute("""INSERT INTO samples(
-        name,category,is_liquid,xrf,xrf_method_id,xrf_report_items,
-        lims_no,status,report_order)
-        VALUES(?,?,?,?,?,?,?,'received',?)""",
-        (name, d.get("category", "").strip(), int(d.get("is_liquid", 0)),
+        name,category,is_liquid,density_g_ml,is_water_quality,xrf,xrf_method_id,xrf_report_items,
+        lims_no,status,report_order,order_template_id)
+        VALUES(?,?,?,?,?,?,?,?,?,'received',?,?)""",
+        (name, d.get("category", "").strip(), is_liquid, density_g_ml, is_water_quality,
          xrf_enabled, xrf_method_id, str(d.get("xrf_report_items", "")).strip(),
-         lims_no, json.dumps(d.get("report_order", []))))
+         lims_no, json.dumps(d.get("report_order", [])), order_template_id))
     sid = cur.lastrowid
+    try:
+        replace_sample_tags(db, sid, d.get("tags", []))
+    except ValueError as exc:
+        db.rollback()
+        return jsonify(ok=False, error=str(exc)), 400
     mark_sample_status_actor(db, sid, "received")
     if xrf_enabled:
         _sync_sample_xrf_targets(db, sid, str(d.get("xrf_report_items", "")))
@@ -1852,6 +2221,7 @@ def sample_detail(sid):
     if not sample_row:
         return jsonify(ok=False, error="样品不存在"), 404
     sample = dict(sample_row)
+    attach_sample_tags(db, [sample])
     attach_sample_status_history(db, [sample])
     if sample["workflow_type"] == "special":
         special = db.execute("""SELECT sr.*,sm.code,sm.name AS method_name,
@@ -1892,6 +2262,10 @@ def sample_detail(sid):
         by_task.setdefault(rd["sample_analyte_id"], []).append(rd)
     for it in items:
         it["readings"] = by_task.get(it["id"], [])
+    sample_order_key = _sample_analyte_order_key(db, sample)
+    items.sort(key=lambda item: (sample_order_key(item),
+                                 item.get("instrument_sort_order") or 0,
+                                 item.get("preparation_id") or 0, item["id"]))
     return jsonify({"sample": sample, "preps": preps, "items": items, "special": None})
 
 
@@ -1905,6 +2279,13 @@ def set_sample_report_order(sid):
     if sample["status"] in {"reported", "cancelled"}:
         return jsonify(ok=False, error="已作废的样品不能调整元素顺序"), 409
     requested = (request.json or {}).get("analyte_ids", [])
+    has_template = "order_template_id" in (request.json or {})
+    try:
+        order_template_id = (_validated_order_template_id(
+            db, (request.json or {}).get("order_template_id")) if has_template
+            else sample["order_template_id"])
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     available = {row[0] for row in db.execute(
         "SELECT DISTINCT analyte_id FROM sample_analytes WHERE sample_id=?", (sid,))}
     ordered = []
@@ -1915,13 +2296,16 @@ def set_sample_report_order(sid):
             continue
         if aid in available and aid not in ordered:
             ordered.append(aid)
-    before = sample["report_order"]
-    db.execute("UPDATE samples SET report_order=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?",
-               (json.dumps(ordered), sid))
+    before = {"report_order": sample["report_order"],
+              "order_template_id": sample["order_template_id"]}
+    db.execute("""UPDATE samples SET report_order=?,order_template_id=?,
+        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+               (json.dumps(ordered), order_template_id, sid))
     audit_event(db, "report_order", "sample", sid,
-                before={"report_order": before}, after={"report_order": ordered})
+                before=before, after={"report_order": ordered,
+                                      "order_template_id": order_template_id})
     db.commit()
-    return jsonify(ok=True, analyte_ids=ordered)
+    return jsonify(ok=True, analyte_ids=ordered, order_template_id=order_template_id)
 
 
 def _report_print_excludes(sample):
@@ -1961,6 +2345,44 @@ def set_report_print(sid):
     return jsonify(ok=True, excludes=excludes)
 
 
+@app.route("/api/samples/<int:sid>/result-unit", methods=["PUT"])
+@capability_required("report_edit")
+def set_result_unit(sid):
+    db = get_db()
+    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    if not sample:
+        return jsonify(ok=False, error="样品不存在"), 404
+    if sample["status"] in {"reported", "cancelled"}:
+        return jsonify(ok=False, error="已出报告或已作废的样品不能修改结果单位"), 409
+    data = request.json or {}
+    key = str(data.get("key", "")).strip()
+    unit = normalized_result_unit(data.get("unit"))
+    if not (re.fullmatch(r"a:\d+", key) or key.startswith("x:")) or len(key) > 122:
+        return jsonify(ok=False, error="结果项目无效"), 400
+    try:
+        payload = cached_report_payload(db, sid)
+    except BusinessExcelError as exc:
+        return jsonify(ok=False, error=str(exc)), 404
+    group = next((item for item in payload.get("groups", []) if item.get("key") == key), None)
+    if not group or unit not in group.get("available_units", []):
+        return jsonify(ok=False, error="该结果不能使用所选单位"), 400
+    try:
+        current = json.loads(sample["result_units"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        current = {}
+    if not isinstance(current, dict):
+        current = {}
+    before = dict(current)
+    current[key] = unit
+    db.execute("""UPDATE samples SET result_units=?,
+        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+               (json.dumps(current, ensure_ascii=False), sid))
+    audit_event(db, "result_unit", "sample", sid,
+                before={"result_units": before}, after={"result_units": current})
+    db.commit()
+    return jsonify(ok=True, key=key, unit=unit)
+
+
 @app.route("/api/samples/<int:sid>", methods=["PUT"])
 @capability_required("sample_manage")
 def update_sample(sid):
@@ -1977,6 +2399,8 @@ def update_sample(sid):
         return jsonify(ok=False, error="已审核、已出报告或已作废的样品不能直接修改"), 409
     before = sample_audit_snapshot(db, sid)
     requested_workflow = "special" if d.get("workflow_type") == "special" else "regular"
+    if requested_workflow == "special" and d.get("is_water_quality"):
+        return jsonify(ok=False, error="水质样不能使用其他样流程"), 400
     if before_row["workflow_type"] == "special" or requested_workflow == "special":
         if before_row["workflow_type"] != requested_workflow:
             return jsonify(ok=False, error="常规样和专项样不能相互转换，请新建样品"), 409
@@ -1988,6 +2412,11 @@ def update_sample(sid):
         result = db.execute("SELECT * FROM special_results WHERE sample_id=?", (sid,)).fetchone()
         if result and result["method_id"] != special_method_id and json.loads(result["raw_data"] or "{}"):
             return jsonify(ok=False, error="已有专项数据，不能直接更换方法；请新建样品"), 409
+        if "tags" in d:
+            try:
+                replace_sample_tags(db, sid, d.get("tags"))
+            except ValueError as exc:
+                return jsonify(ok=False, error=str(exc)), 400
         db.execute("""UPDATE samples SET name=?,category=?,special_method_id=?,
             updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
             (name, str(d.get("category", "")).strip(), special_method_id, sid))
@@ -1999,6 +2428,16 @@ def update_sample(sid):
         db.commit()
         return jsonify(ok=True, id=sid, lims_no=before_row["lims_no"], status=before_row["status"])
     instrument_map = d.get("instrument_map", {})
+    try:
+        requested_tags = clean_sample_tags(d.get("tags")) if "tags" in d else None
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    is_water_quality = int(bool(d.get("is_water_quality", 0)))
+    is_liquid = int(bool(d.get("is_liquid", 0)) or is_water_quality)
+    try:
+        density_g_ml = optional_density(d) if is_liquid else None
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     xrf_enabled = int(bool(d.get("xrf", 0)))
     xrf_method_id = d.get("xrf_method_id") if xrf_enabled else None
     if xrf_enabled and not db.execute(
@@ -2009,17 +2448,24 @@ def update_sample(sid):
     if report_order is not None and not isinstance(report_order, list):
         return jsonify(ok=False, error="报告元素顺序格式无效"), 400
     try:
+        order_template_id = _validated_order_template_id(
+            db, d.get("order_template_id", before_row["order_template_id"]))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    try:
         prepared_rows = [(p, preparation_values(db, p)) for p in d.get("preps", [])]
     except (KeyError, ValueError) as exc:
         return jsonify(ok=False, error=str(exc) or "溶样名称不能为空"), 400
     report_order_json = None if report_order is None else json.dumps(report_order)
-    db.execute("""UPDATE samples SET name=?,category=?,is_liquid=?,xrf=?,
+    db.execute("""UPDATE samples SET name=?,category=?,is_liquid=?,density_g_ml=?,is_water_quality=?,xrf=?,
                    xrf_method_id=?,xrf_report_items=?,
-                   report_order=COALESCE(?,report_order),
-            updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
-               (name, d.get("category", "").strip(), int(d.get("is_liquid", 0)),
-                xrf_enabled, xrf_method_id, str(d.get("xrf_report_items", "")).strip(),
-                report_order_json, sid))
+                   report_order=COALESCE(?,report_order),order_template_id=?,
+             updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+               (name, d.get("category", "").strip(), is_liquid, density_g_ml, is_water_quality,
+                  xrf_enabled, xrf_method_id, str(d.get("xrf_report_items", "")).strip(),
+                  report_order_json, order_template_id, sid))
+    if requested_tags is not None:
+        replace_sample_tags(db, sid, requested_tags)
     _sync_sample_xrf_targets(db, sid, str(d.get("xrf_report_items", "")))
     existing_pids = {r[0] for r in db.execute(
         "SELECT id FROM preparations WHERE sample_id=?", (sid,))}
@@ -2465,7 +2911,7 @@ def standard_client_start_sample(sid):
     if not before:
         return jsonify(ok=False, error="样品不存在"), 404
     if before["status"] != "queued":
-        return jsonify(ok=False, error="只有已制样 / 未测量样品可以开始测量"), 409
+        return jsonify(ok=False, error="只有未测量样品可以开始测量"), 409
     if not db.execute("""SELECT 1 FROM sample_analytes WHERE sample_id=?
             AND instrument_id=? AND status!='cancelled' LIMIT 1""", (sid, instrument_id)).fetchone():
         return jsonify(ok=False, error="该样品没有分配给当前仪器的任务"), 409
@@ -3286,7 +3732,7 @@ def build_report_payload(db, sid):
         FROM preparations p
         WHERE p.sample_id=? ORDER BY p.id""", (sid,))]
     items = [dict(row) for row in db.execute("""SELECT sa.*,a.name AS analyte,
-        a.sort_order AS analyte_sort_order,i.name AS instrument,i.itype,
+        a.sort_order AS analyte_sort_order,a.default_unit AS analyte_default_unit,i.name AS instrument,i.itype,
         i.sort_order AS instrument_sort_order,m.name AS method_name,m.formula,m.note AS method_note,
         m.constants AS method_constants,m.output_unit AS method_output_unit,r.raw,r.extra,r.aux,p.name AS prep_name,
         p.mass_g AS prep_mass,p.volume_ml AS prep_vol,p.dilution_factor AS prep_factor,
@@ -3313,6 +3759,7 @@ def build_report_payload(db, sid):
             "analyte_id": sa["analyte_id"],
             "analyte": sa["analyte"],
             "analyte_sort_order": sa["analyte_sort_order"],
+            "analyte_default_unit": sa.get("analyte_default_unit") or "",
             "prep": sa["prep_name"] or "原样",
             "mass_g": sa["prep_mass"],
             "volume_ml": sa["prep_vol"],
@@ -3356,23 +3803,25 @@ def build_report_payload(db, sid):
                 "selection": None if xr["use_report"] else "exclude",
                 "analyzed_at": xr["analyzed_at"], "external_id": xr["external_id"],
             })
-    # 按元素分组并计算最终值
+    analyte_defaults = {row["id"]: row["default_unit"] or "" for row in db.execute(
+        "SELECT id,default_unit FROM analytes")}
+    for row in rows_out:
+        row.setdefault("analyte_default_unit", analyte_defaults.get(row.get("analyte_id"), ""))
+    try:
+        selected_units = json.loads(sample.get("result_units") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        selected_units = {}
+    if not isinstance(selected_units, dict):
+        selected_units = {}
+    density = sample.get("density_g_ml") if sample.get("is_liquid") else None
+    # 按元素分组、统一显示单位后计算最终值。
     groups = []
     by_analyte = {}
     for r in rows_out:
         key = ("a", r["analyte_id"]) if r["analyte_id"] is not None else ("x", r["analyte"].casefold())
         by_analyte.setdefault(key, []).append(r)
-    try:
-        custom_order = [int(aid) for aid in json.loads(sample.get("report_order") or "[]")]
-    except (TypeError, ValueError, json.JSONDecodeError):
-        custom_order = []
-    custom_position = {aid: index for index, aid in enumerate(custom_order)}
-    ordered_analytes = sorted(by_analyte, key=lambda key: (
-        0 if key[0] == "a" and key[1] in custom_position else 1,
-        custom_position.get(key[1], 0) if key[0] == "a" else 999999,
-        by_analyte[key][0]["analyte_sort_order"] or 999999,
-        str(by_analyte[key][0]["analyte"]).casefold(),
-    ))
+    sample_order_key = _sample_analyte_order_key(db, sample)
+    ordered_analytes = sorted(by_analyte, key=lambda key: sample_order_key(by_analyte[key][0]))
     print_excludes = _report_print_excludes(sample)
     for analyte_id in ordered_analytes:
         group_key = f"{analyte_id[0]}:{analyte_id[1]}"
@@ -3385,6 +3834,33 @@ def build_report_payload(db, sid):
         analyte = rs[0]["analyte"]
         quant = [r for r in rs if r["value"] is not None and isinstance(r["value"], (int, float))]
         chosen = [r for r in quant if r["selection"] != "exclude"]
+        source_rows = chosen or quant
+        available_units = result_unit_options(source_rows[0]["unit"], density) if source_rows else []
+        for row in source_rows[1:]:
+            compatible = set(result_unit_options(row["unit"], density))
+            available_units = [unit for unit in available_units if unit in compatible]
+        preferred_unit = normalized_result_unit(
+            selected_units.get(group_key) or rs[0].get("analyte_default_unit"))
+        target_unit = (preferred_unit if preferred_unit in available_units else
+                       (normalized_result_unit(source_rows[0]["unit"]) if source_rows else ""))
+        for row in rs:
+            source_unit = normalized_result_unit(row.get("unit"))
+            row["source_value"], row["source_unit"] = row.get("value"), source_unit
+            if row.get("value") is not None and target_unit in result_unit_options(source_unit, density):
+                row["value"] = rounded_display_value(
+                    convert_result_unit(row["value"], source_unit, target_unit, density),
+                    target_unit, bool(row.get("xrf_value_id")))
+                row["unit"] = target_unit
+                for detail in row.get("readings", []):
+                    detail_source = normalized_result_unit(detail.get("unit") or source_unit)
+                    if target_unit not in result_unit_options(detail_source, density):
+                        continue
+                    for field in ("value", "corrected_value"):
+                        if detail.get(field) is not None:
+                            detail[field] = rounded_display_value(
+                                convert_result_unit(detail[field], detail_source, target_unit, density),
+                                target_unit, bool(row.get("xrf_value_id")))
+                    detail["unit"] = target_unit
         final = None
         if chosen:
             values = [r["value"] for r in chosen]
@@ -3394,8 +3870,8 @@ def build_report_payload(db, sid):
             final = {"value": avg, "unit": chosen[0]["unit"], "based_on": len(chosen),
                      "mode": "单值" if len(chosen) == 1 else "自动平均"}
         groups.append({"analyte_id": analyte_id[1] if analyte_id[0] == "a" else None, "analyte": analyte,
-                       "key": group_key, "print": group_key not in print_excludes,
-                       "final": final, "rows": rs})
+                        "key": group_key, "print": group_key not in print_excludes,
+                        "final": final, "available_units": available_units, "rows": rs})
     payload = _attach_report_override(db, sid, {
         "sample": sample, "preps": preps, "groups": groups, "special": None,
         "xrf_warnings": xrf_warnings, "xrf_targets": xrf_targets,
@@ -3403,10 +3879,115 @@ def build_report_payload(db, sid):
     return _attach_report_profile(db, payload)
 
 
+# 报告 payload 计算较重（多次查询 + 逐项目计算，实测数百毫秒），做进程内缓存：
+# 只要样品数据没变就一直复用（带 10 分钟兜底 TTL 防极端并发竞态）。
+# 所有数据变更都通过本进程的非 GET 接口写入，写入后立即清空缓存，
+# 并登记受影响样品交给后台线程：静默 30 秒后自动重算，让缓存始终保持"热"的。
+REPORT_PAYLOAD_CACHE = {}
+REPORT_PAYLOAD_CACHE_MAX = 512
+REPORT_PAYLOAD_CACHE_TTL = 600.0
+_REPORT_CACHE_STALE_SECONDS = 30.0
+_REPORT_CACHE_LOCK = threading.Lock()
+_REPORT_CACHE_GEN = 0
+_REPORT_CACHE_PENDING = None
+_REPORT_CACHE_WAKE = threading.Event()
+_REPORT_CACHE_REBUILDER_STARTED = False
+
+
+def cached_report_payload(db, sid):
+    cache_key = (str(DB), sid)
+    now = time.monotonic()
+    cached = REPORT_PAYLOAD_CACHE.get(cache_key)
+    if cached and now - cached[0] < REPORT_PAYLOAD_CACHE_TTL:
+        return cached[1]
+    with _REPORT_CACHE_LOCK:
+        generation = _REPORT_CACHE_GEN
+    payload = build_report_payload(db, sid)
+    with _REPORT_CACHE_LOCK:
+        if generation == _REPORT_CACHE_GEN:
+            if len(REPORT_PAYLOAD_CACHE) >= REPORT_PAYLOAD_CACHE_MAX:
+                REPORT_PAYLOAD_CACHE.pop(next(iter(REPORT_PAYLOAD_CACHE)))
+            REPORT_PAYLOAD_CACHE[cache_key] = (time.monotonic(), payload)
+    return payload
+
+
+def _report_cache_note_write():
+    """写入请求完成后调用：立即作废全部缓存，并把之前缓存过的样品登记为待重算。"""
+    global _REPORT_CACHE_PENDING, _REPORT_CACHE_GEN, _REPORT_CACHE_REBUILDER_STARTED
+    now = time.monotonic()
+    with _REPORT_CACHE_LOCK:
+        sids = {sid for (_db, sid) in REPORT_PAYLOAD_CACHE}
+        if _REPORT_CACHE_PENDING is None:
+            _REPORT_CACHE_PENDING = {"sids": sids, "at": now}
+        else:
+            _REPORT_CACHE_PENDING["sids"] |= sids
+            _REPORT_CACHE_PENDING["at"] = now
+        _REPORT_CACHE_GEN += 1
+        REPORT_PAYLOAD_CACHE.clear()
+        if not _REPORT_CACHE_REBUILDER_STARTED:
+            _REPORT_CACHE_REBUILDER_STARTED = True
+            threading.Thread(target=_report_cache_rebuild_loop,
+                             name="lims-report-rebuild", daemon=True).start()
+    _REPORT_CACHE_WAKE.set()
+
+
+def _report_cache_rebuild_loop():
+    """防抖后台重算：写入静默 30 秒后，把被作废的样品 payload 重新算好。"""
+    global _REPORT_CACHE_PENDING
+    while True:
+        _REPORT_CACHE_WAKE.wait()
+        _REPORT_CACHE_WAKE.clear()
+        pending = None
+        while True:
+            with _REPORT_CACHE_LOCK:
+                pending = _REPORT_CACHE_PENDING
+                wait_left = (_REPORT_CACHE_STALE_SECONDS -
+                             (time.monotonic() - pending["at"])) if pending else 0
+            if pending is None:
+                break
+            if wait_left > 0:
+                _REPORT_CACHE_WAKE.wait(min(wait_left, 2.0))
+                _REPORT_CACHE_WAKE.clear()
+                continue
+            with _REPORT_CACHE_LOCK:
+                pending = _REPORT_CACHE_PENDING
+                _REPORT_CACHE_PENDING = None
+            _rebuild_report_payloads(pending["sids"], pending["at"])
+
+
+def _rebuild_report_payloads(sids, cleared_at):
+    if not sids:
+        return
+    try:
+        connection = connect_database(DB)
+    except Exception:
+        return
+    try:
+        for sid in sids:
+            cache_key = (str(DB), sid)
+            cached = REPORT_PAYLOAD_CACHE.get(cache_key)
+            if cached and cached[0] >= cleared_at:
+                continue  # 等待期内已被请求同步重建过，数据更新，跳过
+            with _REPORT_CACHE_LOCK:
+                generation = _REPORT_CACHE_GEN
+            try:
+                payload = build_report_payload(connection, sid)
+            except Exception:
+                REPORT_PAYLOAD_CACHE.pop(cache_key, None)
+                continue
+            with _REPORT_CACHE_LOCK:
+                if generation == _REPORT_CACHE_GEN:
+                    if len(REPORT_PAYLOAD_CACHE) >= REPORT_PAYLOAD_CACHE_MAX:
+                        REPORT_PAYLOAD_CACHE.pop(next(iter(REPORT_PAYLOAD_CACHE)))
+                    REPORT_PAYLOAD_CACHE[cache_key] = (time.monotonic(), payload)
+    finally:
+        connection.close()
+
+
 @app.route("/api/report/<int:sid>")
 def report(sid):
     try:
-        return jsonify(build_report_payload(get_db(), sid))
+        return jsonify(cached_report_payload(get_db(), sid))
     except BusinessExcelError as exc:
         return excel_error(exc, 404)
 
@@ -3427,7 +4008,7 @@ def manual_report(sid):
     if not reason:
         return jsonify(ok=False, error="手工补录或恢复结果必须填写原因"), 400
     try:
-        payload = build_report_payload(db, sid)
+        payload = cached_report_payload(db, sid)
         submitted = [] if request.method == "DELETE" else _clean_report_rows(data.get("rows"))
     except BusinessExcelError as exc:
         return excel_error(exc, 400)
@@ -3464,7 +4045,7 @@ def manual_report(sid):
 @app.route("/api/excel/reports/<int:sid>")
 def excel_report(sid):
     try:
-        payload = build_report_payload(get_db(), sid)
+        payload = cached_report_payload(get_db(), sid)
         output = build_report(payload)
         sample = payload["sample"]
         return send_file(output, as_attachment=True,
@@ -3485,22 +4066,30 @@ def excel_results_report():
         return jsonify(ok=False, error="请选择 1 至 200 个样品"), 400
     db = get_db()
     template_items = []
-    template_name = "全局默认"
-    template_id = request.args.get("template_id", "").strip()
-    if template_id:
+    template_name = "系统默认"
+    requested_template_id = request.args.get("template_id", "").strip()
+    template_id = None
+    if requested_template_id:
         try:
             template = db.execute("SELECT name,items_json FROM result_order_templates WHERE id=?",
-                                  (int(template_id),)).fetchone()
+                                  (int(requested_template_id),)).fetchone()
         except ValueError:
             template = None
         if not template:
-            return jsonify(ok=False, error="元素顺序模板不存在"), 404
+            return jsonify(ok=False, error="通用顺序模板不存在"), 404
+        template_id = int(requested_template_id)
         template_items = json.loads(template["items_json"] or "[]")
-        template_name = template["name"] or "全局默认"
+        template_name = template["name"] or "系统默认"
+    else:
+        template_id = _default_order_template_id(db)
+        template = db.execute("SELECT name FROM result_order_templates WHERE id=?",
+                              (template_id,)).fetchone() if template_id else None
+        if template and template["name"]:
+            template_name = template["name"]
     payloads = []
     for sid in sample_ids:
         try:
-            payload = build_report_payload(db, sid)
+            payload = cached_report_payload(db, sid)
         except BusinessExcelError as exc:
             return excel_error(exc, 404)
         sample = payload["sample"]
@@ -3514,12 +4103,16 @@ def excel_results_report():
         if name and name.casefold() not in column_keys:
             columns.append(name)
             column_keys.add(name.casefold())
+    remaining = {}
     for payload in payloads:
         for row in payload.get("report_rows", []):
             name = str(row.get("item") or "").strip()
             if row.get("include", True) and name and name.casefold() not in column_keys:
-                columns.append(name)
-                column_keys.add(name.casefold())
+                remaining.setdefault(name.casefold(), name)
+    order_key = _universal_order_key(db, template_id)
+    for name in sorted(remaining.values(), key=order_key):
+        columns.append(name)
+        column_keys.add(name.casefold())
     canonical = {name.casefold(): name for name in columns}
     sample_rows = []
     for payload in payloads:

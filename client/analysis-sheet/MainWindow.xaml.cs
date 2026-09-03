@@ -41,6 +41,7 @@ public partial class MainWindow : Window
             DateBox.SelectedDate = DateTime.Today;
             TimeBox.Text = DateTime.Now.ToString("HH:mm");
             OutputPathBox.Text = DefaultOutputPath();
+            Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "分析单"));
             await LoadSamplesAsync(showErrors: false);
         }
         catch (Exception ex)
@@ -108,6 +109,13 @@ public partial class MainWindow : Window
         OutputPathBox.Text = DefaultOutputPath();
     }
 
+    private void Blank_Changed(object sender, RoutedEventArgs e)
+    {
+        SampleABox.IsEnabled = SampleABlankBox.IsChecked != true;
+        SampleBBox.IsEnabled = SampleBBlankBox.IsChecked != true;
+        OutputPathBox.Text = DefaultOutputPath();
+    }
+
     private void BrowseOutput_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new SaveFileDialog
@@ -168,10 +176,16 @@ public partial class MainWindow : Window
             throw new InvalidOperationException("找不到分析单模板。");
         if (template.Slots.Count < 2)
             throw new InvalidOperationException("当前模板没有配置两个样品位置。");
-        if (SampleABox.SelectedItem is not OxsasAnalysis sample4A)
-            throw new InvalidOperationException($"数据库列表中尚未选择 {template.Slots[0].Name} 样品。");
-        if (SampleBBox.SelectedItem is not OxsasAnalysis sample4B)
-            throw new InvalidOperationException($"数据库列表中尚未选择 {template.Slots[1].Name} 样品。");
+        var blankA = SampleABlankBox.IsChecked == true;
+        var blankB = SampleBBlankBox.IsChecked == true;
+        if (blankA && blankB)
+            throw new InvalidOperationException("两个样品位置不能同时留空。");
+        var sample4A = blankA ? null : SampleABox.SelectedItem as OxsasAnalysis;
+        var sample4B = blankB ? null : SampleBBox.SelectedItem as OxsasAnalysis;
+        if (sample4A is null && !blankA)
+            throw new InvalidOperationException($"数据库列表中尚未选择 {template.Slots[0].Name} 样品，或勾选“空白”。");
+        if (sample4B is null && !blankB)
+            throw new InvalidOperationException($"数据库列表中尚未选择 {template.Slots[1].Name} 样品，或勾选“空白”。");
         var output = Path.GetFullPath(OutputPathBox.Text.Trim());
         if (!output.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)) output += ".xlsx";
         var missing = WorkbookTemplateEngine.Generate(new GenerateRequest
@@ -181,10 +195,10 @@ public partial class MainWindow : Window
             OutputPath = output,
             Samples =
             [
-                new GenerateSample { Name = sample4A.SampleName, Results = sample4A.Results },
-                new GenerateSample { Name = sample4B.SampleName, Results = sample4B.Results },
+                sample4A is null ? null : new GenerateSample { Name = sample4A.SampleName, Results = sample4A.Results },
+                sample4B is null ? null : new GenerateSample { Name = sample4B.SampleName, Results = sample4B.Results },
             ],
-            Date = DateBox.SelectedDate ?? sample4A.AnalyzedAt.Date,
+            Date = DateBox.SelectedDate ?? sample4A?.AnalyzedAt.Date ?? sample4B?.AnalyzedAt.Date ?? DateTime.Today,
             SampleTime = TimeBox.Text,
         });
         OutputPathBox.Text = output;
@@ -198,7 +212,7 @@ public partial class MainWindow : Window
         var names = string.Join("-", new[] { a, b }.Where(value => !string.IsNullOrWhiteSpace(value)));
         if (string.IsNullOrWhiteSpace(names)) names = DateTime.Now.ToString("yyyyMMdd-HHmm");
         foreach (var invalid in Path.GetInvalidFileNameChars()) names = names.Replace(invalid, '_');
-        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), $"分析单-{names}.xlsx");
+        return Path.Combine(AppContext.BaseDirectory, "分析单", $"分析单-{names}.xlsx");
     }
 
     private static string MissingMessage(IReadOnlyList<string> missing) => missing.Count == 0

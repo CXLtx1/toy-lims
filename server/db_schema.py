@@ -187,7 +187,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS analytes(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
-    sort_order INTEGER DEFAULT 0);
+    sort_order INTEGER DEFAULT 0,
+    default_unit TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS chemical_elements(
     atomic_number INTEGER PRIMARY KEY,
     symbol TEXT UNIQUE NOT NULL,
@@ -239,12 +240,16 @@ CREATE TABLE IF NOT EXISTS method_catalog_migrations(
 CREATE TABLE IF NOT EXISTS templates(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    category TEXT DEFAULT '',
+    tags_json TEXT DEFAULT '[]',
     is_liquid INTEGER DEFAULT 0,
+    is_water_quality INTEGER DEFAULT 0,
     dilution_id INTEGER,
     xrf INTEGER DEFAULT 0,
     analyte_ids TEXT DEFAULT '[]',
     prep_config TEXT DEFAULT '[]',
-    instrument_config TEXT DEFAULT '{}');
+    instrument_config TEXT DEFAULT '{}',
+    order_template_id INTEGER);
 CREATE TABLE IF NOT EXISTS preparation_combinations(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
@@ -259,12 +264,15 @@ CREATE TABLE IF NOT EXISTS report_profiles(
 CREATE TABLE IF NOT EXISTS result_order_templates(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
-    items_json TEXT NOT NULL DEFAULT '[]');
+    items_json TEXT NOT NULL DEFAULT '[]',
+    is_default INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS samples(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     category TEXT DEFAULT '',   -- 样品名称/描述, 如 Zn(OH)2沉淀
     is_liquid INTEGER DEFAULT 0,
+    density_g_ml REAL,
+    is_water_quality INTEGER DEFAULT 0,
     workflow_type TEXT DEFAULT 'regular',
     special_method_id INTEGER REFERENCES special_methods(id),
     dilution_id INTEGER,
@@ -280,8 +288,10 @@ CREATE TABLE IF NOT EXISTS samples(
     analyst TEXT DEFAULT '',
     reviewer TEXT DEFAULT '',
     report_profile_id INTEGER REFERENCES report_profiles(id) ON DELETE SET NULL,
+    order_template_id INTEGER,
     report_order TEXT DEFAULT '[]',
     report_excludes TEXT DEFAULT '[]',
+    result_units TEXT DEFAULT '{}',
     lims_no TEXT,
     status TEXT DEFAULT 'received',
     status_operator TEXT DEFAULT '',
@@ -291,6 +301,10 @@ CREATE TABLE IF NOT EXISTS samples(
     cancelled_by INTEGER,
     cancel_reason TEXT DEFAULT '',
     updated_at TEXT DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS sample_tags(
+    sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    PRIMARY KEY(sample_id, tag));
 CREATE TABLE IF NOT EXISTS special_methods(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT UNIQUE NOT NULL,
@@ -703,6 +717,25 @@ def _enforce_single_xrf_analysis(db):
         ON xrf_analyses(sample_id) WHERE sample_id IS NOT NULL""")
 
 
+def _ensure_default_order_template(db):
+    """Install one editable universal fallback without disturbing existing templates."""
+    default = db.execute(
+        "SELECT id FROM result_order_templates WHERE is_default=1 ORDER BY id LIMIT 1").fetchone()
+    if default:
+        db.execute("UPDATE result_order_templates SET is_default=0 WHERE is_default=1 AND id!=?",
+                   (default["id"],))
+        return
+    named = db.execute(
+        "SELECT id FROM result_order_templates WHERE name='系统默认' ORDER BY id LIMIT 1").fetchone()
+    if named:
+        db.execute("UPDATE result_order_templates SET is_default=1 WHERE id=?", (named["id"],))
+        return
+    items = [row["name"] for row in db.execute(
+        "SELECT name FROM analytes ORDER BY sort_order,id").fetchall()]
+    db.execute("INSERT INTO result_order_templates(name,items_json,is_default) VALUES(?,?,1)",
+               ("系统默认", json.dumps(items, ensure_ascii=False)))
+
+
 def initialize_database(database):
     db = connect_database(database)
     if is_postgres_database(database):
@@ -715,6 +748,18 @@ def initialize_database(database):
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_factor REAL NOT NULL DEFAULT 1")
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_label TEXT DEFAULT ''")
         db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS report_excludes TEXT DEFAULT '[]'")
+        db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS density_g_ml REAL")
+        db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS result_units TEXT DEFAULT '{}'")
+        db.execute("ALTER TABLE analytes ADD COLUMN IF NOT EXISTS default_unit TEXT DEFAULT ''")
+        db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS is_water_quality INTEGER DEFAULT 0")
+        db.execute("ALTER TABLE templates ADD COLUMN IF NOT EXISTS is_water_quality INTEGER DEFAULT 0")
+        db.execute("ALTER TABLE templates ADD COLUMN IF NOT EXISTS category TEXT DEFAULT ''")
+        db.execute("ALTER TABLE templates ADD COLUMN IF NOT EXISTS tags_json TEXT DEFAULT '[]'")
+        db.execute("ALTER TABLE result_order_templates ADD COLUMN IF NOT EXISTS is_default INTEGER NOT NULL DEFAULT 0")
+        db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS order_template_id INTEGER")
+        db.execute("ALTER TABLE templates ADD COLUMN IF NOT EXISTS order_template_id INTEGER")
+        db.execute("UPDATE samples SET is_water_quality=0 WHERE is_water_quality IS NULL")
+        db.execute("UPDATE samples SET is_liquid=1 WHERE is_water_quality=1")
         db.execute("ALTER TABLE xrf_values ADD COLUMN IF NOT EXISTS alt_name TEXT DEFAULT ''")
         db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0")
         db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS output_unit TEXT DEFAULT '%'")
@@ -738,6 +783,7 @@ def initialize_database(database):
             WHERE preparation_id IS NULL""")
         _enforce_single_xrf_analysis(db)
         _seed_reference_data(db)
+        _ensure_default_order_template(db)
         db.commit()
         db.close()
         return
@@ -862,9 +908,19 @@ def initialize_database(database):
         db.execute("ALTER TABLE templates ADD COLUMN prep_config TEXT DEFAULT '[]'")
     if "instrument_config" not in template_cols:
         db.execute("ALTER TABLE templates ADD COLUMN instrument_config TEXT DEFAULT '{}'")
+    if "is_water_quality" not in template_cols:
+        db.execute("ALTER TABLE templates ADD COLUMN is_water_quality INTEGER DEFAULT 0")
+    if "category" not in template_cols:
+        db.execute("ALTER TABLE templates ADD COLUMN category TEXT DEFAULT ''")
+    if "tags_json" not in template_cols:
+        db.execute("ALTER TABLE templates ADD COLUMN tags_json TEXT DEFAULT '[]'")
+    if "order_template_id" not in template_cols:
+        db.execute("ALTER TABLE templates ADD COLUMN order_template_id INTEGER")
     analyte_cols = [r[1] for r in db.execute("PRAGMA table_info(analytes)")]
     if "sort_order" not in analyte_cols:
         db.execute("ALTER TABLE analytes ADD COLUMN sort_order INTEGER DEFAULT 0")
+    if "default_unit" not in analyte_cols:
+        db.execute("ALTER TABLE analytes ADD COLUMN default_unit TEXT DEFAULT ''")
     instrument_cols = [r[1] for r in db.execute("PRAGMA table_info(instruments)")]
     if "sort_order" not in instrument_cols:
         db.execute("ALTER TABLE instruments ADD COLUMN sort_order INTEGER DEFAULT 0")
@@ -911,6 +967,8 @@ def initialize_database(database):
         db.execute("ALTER TABLE samples ADD COLUMN report_profile_id INTEGER REFERENCES report_profiles(id)")
     if "report_order" not in sample_cols:
         db.execute("ALTER TABLE samples ADD COLUMN report_order TEXT DEFAULT '[]'")
+    if "order_template_id" not in sample_cols:
+        db.execute("ALTER TABLE samples ADD COLUMN order_template_id INTEGER")
     if "xrf_method_id" not in sample_cols:
         db.execute("ALTER TABLE samples ADD COLUMN xrf_method_id INTEGER REFERENCES methods(id)")
     if "xrf_report_items" not in sample_cols:
@@ -919,9 +977,12 @@ def initialize_database(database):
     if "alt_name" not in value_cols:
         db.execute("ALTER TABLE xrf_values ADD COLUMN alt_name TEXT DEFAULT ''")
     sample_migrations = {
+        "is_water_quality": "INTEGER DEFAULT 0",
         "workflow_type": "TEXT DEFAULT 'regular'",
         "special_method_id": "INTEGER REFERENCES special_methods(id)",
         "report_excludes": "TEXT DEFAULT '[]'",
+        "density_g_ml": "REAL",
+        "result_units": "TEXT DEFAULT '{}'",
         "lims_no": "TEXT",
         "status": "TEXT DEFAULT 'received'",
         "status_operator": "TEXT DEFAULT ''",
@@ -936,6 +997,8 @@ def initialize_database(database):
         if column not in sample_cols:
             db.execute(f"ALTER TABLE samples ADD COLUMN {column} {declaration}")
     db.execute("UPDATE samples SET workflow_type='regular' WHERE workflow_type IS NULL OR workflow_type=''")
+    db.execute("UPDATE samples SET is_water_quality=0 WHERE is_water_quality IS NULL")
+    db.execute("UPDATE samples SET is_liquid=1 WHERE is_water_quality=1")
     db.execute("UPDATE samples SET status='received' WHERE status='registered'")
     db.execute("""INSERT INTO report_profiles(name,company_name_cn,company_name_en,raw_code,final_code)
         SELECT '润虹默认','浙江润虹环境科技股份有限公司',
@@ -1018,6 +1081,10 @@ def initialize_database(database):
         ON sample_analytes(sample_id, analyte_id)
         WHERE preparation_id IS NULL""")
     _seed_reference_data(db)
+    order_template_cols = [r[1] for r in db.execute("PRAGMA table_info(result_order_templates)")]
+    if "is_default" not in order_template_cols:
+        db.execute("ALTER TABLE result_order_templates ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0")
+    _ensure_default_order_template(db)
     # 修复旧版本遗留的任务状态；滴定读数保存在 extra 而不是 raw。
     for task in db.execute("SELECT id FROM sample_analytes").fetchall():
         recompute_task_progress(db, task["id"])

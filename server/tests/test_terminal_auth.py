@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import app as lims
+from lims_auth import PASSWORD_METHOD
 from werkzeug.security import generate_password_hash
 
 
@@ -58,8 +59,36 @@ class TerminalAuthenticationTest(unittest.TestCase):
                 "SELECT username,display_name FROM users").fetchall())
             self.assertEqual([("二组", "standard"), ("管理终端", "admin")], db.execute(
                 "SELECT name,kind FROM terminals ORDER BY id").fetchall())
+            hashes = [row[0] for row in db.execute("SELECT password_hash FROM users")] + [
+                row[0] for row in db.execute("SELECT password_hash FROM terminals")]
+            self.assertTrue(all(value.startswith(PASSWORD_METHOD + "$") for value in hashes))
         finally:
             db.close()
+
+    def test_successful_login_and_authorization_upgrade_legacy_hashes(self):
+        self.initialize()
+        legacy_user_hash = generate_password_hash(self.USER_PASSWORD)
+        legacy_terminal_hash = generate_password_hash(self.STANDARD_PASSWORD)
+        db = sqlite3.connect(lims.DB)
+        try:
+            db.execute("UPDATE users SET password_hash=? WHERE username='cxl'", (legacy_user_hash,))
+            db.execute("UPDATE terminals SET password_hash=? WHERE kind='standard'", (legacy_terminal_hash,))
+            db.commit()
+        finally:
+            db.close()
+
+        self.assertEqual(302, self.login().status_code)
+        self.assertEqual(200, self.authorize().status_code)
+        db = sqlite3.connect(lims.DB)
+        try:
+            user_hash = db.execute(
+                "SELECT password_hash FROM users WHERE username='cxl'").fetchone()[0]
+            terminal_hash = db.execute(
+                "SELECT password_hash FROM terminals WHERE kind='standard'").fetchone()[0]
+        finally:
+            db.close()
+        self.assertTrue(user_hash.startswith(PASSWORD_METHOD + "$"))
+        self.assertTrue(terminal_hash.startswith(PASSWORD_METHOD + "$"))
 
     def test_setup_accepts_short_nonempty_passwords(self):
         response = self.client.post("/setup", data={

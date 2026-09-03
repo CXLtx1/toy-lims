@@ -26,7 +26,7 @@ FULL_TABLES = (
 )
 
 SAMPLE_TABLES = (
-    "samples", "preparations", "special_results", "sample_analytes",
+    "samples", "sample_tags", "preparations", "special_results", "sample_analytes",
     "results", "readings", "instrument_imports", "xrf_analyses",
     "xrf_values", "uq_analyses", "uq_channels", "report_overrides",
     "standard_client_submissions", "audit_logs",

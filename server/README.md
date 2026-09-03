@@ -53,7 +53,7 @@ XRF 客户端通过 `GET /api/instrument/xrf/tasks` 领取待测样品，通过 
 
 客户端通过 `POST /api/instrument/standard/status` 上报心跳。网页仪器页显示最近 60 秒在线的标准客户端、来源 IP、当前用户和该终端最近一次录入摘要。
 
-Web 页面每 600 毫秒通过 `/api/site-status` 检查审计修订号，仅在数据变化时刷新当前业务页；仪器监控页另以 2 秒周期更新客户端心跳和扫描记录。输入控件获得焦点时会暂缓自动重绘，避免覆盖正在填写的内容。
+Web 页面通过 SSE 接口 `GET /api/events` 实时接收审计修订号推送（数据变化毫秒级到达，修订号同时仍以 `/api/site-status` 提供，浏览器每 15 秒轮询兜底），仅在数据变化时刷新当前业务页；仪器监控页另以 2 秒周期更新客户端心跳和扫描记录。输入控件获得焦点时会暂缓自动重绘，避免覆盖正在填写的内容。SSE 连接基于 `audit_logs` 最大 id（即修订号）判断变化，含心跳保活，断开后浏览器自动重连；每个连接常驻一个 Waitress 线程，线程数由 `LIMS_THREADS` 控制（默认 32）。
 
 Web 顶部“审计”页集中显示最近 500 条审计记录，可按关键词、动作和对象类型过滤；终端登录、仪器心跳及标准客户端登录等动作使用中文名称展示。
 
@@ -61,13 +61,20 @@ Web 顶部“审计”页集中显示最近 500 条审计记录，可按关键�
 
 标准单值协议支持 `ppm`、`ppb`、`percent` 和 `ph` 仪器；需要变量表单的 `function` 滴定任务继续使用网页数据页。
 
+## 性能与缓存
+
+- **响应压缩**：超过 1KB 的可压缩响应（HTML/CSS/JS/JSON/CSV 等）自动 gzip；SSE 流不压缩。带 `?v=` 版本号的静态资源返回一年不可变缓存，其余静态资源缓存一天。
+- **报告 payload 缓存**：`cached_report_payload()`（`app.py`）对 `/api/report/<id>` 及 Excel 报告、结果矩阵、手工补录、单位切换校验等同源调用做进程内缓存，命中时零数据库查询（单次冷计算实测数百毫秒）。缓存最多 512 条、10 分钟兜底 TTL。
+- **失效与重算**：所有数据变更都通过本进程的非 GET 接口写入，请求提交完成后 `invalidate_report_payload_cache` 立即作废全部缓存，保证读取不返回旧数据；作废时登记此前缓存过的样品，后台线程（`_report_cache_rebuild_loop`）在写入静默 30 秒后自动重算这些样品，写入代数（generation）防护避免把并发写入前的旧计算结果存回缓存。
+- **启动预热**：`run.py` 在服务启动后以后台线程调用 `warm_report_cache()`，把全部已有样品的报告 payload 逐个算好，存量样品首次展开即秒开。
+
 ## 边界
 
 - `app.py`：HTTP API、数据库配置和报告计算。
 - `db_schema.py`：表结构、旧 SQLite 升级、种子数据和初始化。
 - `db_backend.py`：PostgreSQL/SQLite 连接与 SQL 兼容层。
 - `migrate_to_postgres.py`：旧 SQLite 的筛选迁移与核验。
-- `run.py`：Waitress 正式入口；仅 SQLite 模式启动旧在线备份。
+- `run.py`：Waitress 正式入口；仅 SQLite 模式启动旧在线备份，并以后台线程预热报告缓存。
 - `templates/`、`static/`：浏览器端 LIMS。
 - `tests/`：现有服务端测试。
 - 仪器客户端不得直接连接 PostgreSQL 或 `lims.db`，统一通过 HTTP API 通信。

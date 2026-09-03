@@ -159,7 +159,9 @@ def build_overview(db, date_from, date_to, sample_type="", query="", include_can
     if sample_type == "solid":
         conditions.append("s.is_liquid=0 AND COALESCE(s.workflow_type,'regular')='regular'")
     elif sample_type == "liquid":
-        conditions.append("s.is_liquid=1 AND COALESCE(s.workflow_type,'regular')='regular'")
+        conditions.append("s.is_liquid=1 AND COALESCE(s.is_water_quality,0)=0 AND COALESCE(s.workflow_type,'regular')='regular'")
+    elif sample_type == "water_quality":
+        conditions.append("COALESCE(s.is_water_quality,0)=1 AND COALESCE(s.workflow_type,'regular')='regular'")
     elif sample_type == "special":
         conditions.append("s.workflow_type='special'")
     elif sample_type not in ("", "all"):
@@ -186,7 +188,8 @@ def build_overview(db, date_from, date_to, sample_type="", query="", include_can
     for s in records:
         sid = s["id"]
         special = s["workflow_type"] == "special"
-        _append(ws, [s["lims_no"], s["name"], s["category"], "液体" if s["is_liquid"] else "固体",
+        sample_kind = "水质" if s["is_water_quality"] else ("液体" if s["is_liquid"] else "固体")
+        _append(ws, [s["lims_no"], s["name"], s["category"], sample_kind,
                      "专项" if special else "常规", s["status"], s["created_at"], s["updated_at"],
                      s["special_method_name"] or "", "是" if s["xrf"] else "否",
                      _count(db, "SELECT COUNT(*) FROM preparations WHERE sample_id=?", sid),
@@ -202,7 +205,8 @@ def build_overview(db, date_from, date_to, sample_type="", query="", include_can
 
 
 INFO_FIELDS = [("样品ID", "id"), ("LIMS编号", "lims_no"), ("更新标记", "updated_at"), ("样品名称", "name"),
-               ("类别", "category"), ("流程", "workflow_type"), ("液体样", "is_liquid"), ("启用XRF", "xrf"),
+               ("类别", "category"), ("流程", "workflow_type"), ("液体样", "is_liquid"),
+               ("水质样", "is_water_quality"), ("启用XRF", "xrf"),
                ("XRF方法ID", "xrf_method_id"), ("XRF报告项目", "xrf_report_items"), ("客户", "customer"),
                ("报告编号", "report_no"), ("分析日期", "analysis_date"), ("分析员", "analyst"),
                ("审核员", "reviewer"), ("报告项目顺序(JSON)", "report_order")]
@@ -382,6 +386,9 @@ def parse_plan(stream, db):
             raise BusinessExcelError("来样序号不能为空")
         data["workflow_type"] = "special" if str(data.get("workflow_type")) == "special" else "regular"
         data["is_liquid"] = int(str(data.get("is_liquid") or "0").lower() in {"1", "true", "是"})
+        data["is_water_quality"] = int(str(data.get("is_water_quality") or "0").lower() in {"1", "true", "是"})
+        if data["is_water_quality"]:
+            data["is_liquid"] = 1
         data["xrf"] = int(str(data.get("xrf") or "0").lower() in {"1", "true", "是"})
         try:
             data["report_order"] = json.loads(str(data.get("report_order") or "[]"))

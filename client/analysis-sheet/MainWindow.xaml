@@ -26,16 +26,22 @@
             </StackPanel>
           </DockPanel>
           <Grid>
-            <Grid.ColumnDefinitions><ColumnDefinition Width="42" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="42" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
             <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
             <TextBlock Grid.Row="0" Grid.Column="0" x:Name="SampleALabel" Text="样品1" FontWeight="Bold" VerticalAlignment="Center" />
             <ComboBox Grid.Row="0" Grid.Column="1" x:Name="SampleABox" IsEditable="False"
                       DisplayMemberPath="Label" Padding="5" Margin="0,2,0,5"
                       SelectionChanged="Sample_SelectionChanged" />
+            <CheckBox Grid.Row="0" Grid.Column="2" x:Name="SampleABlankBox" Content="空白" VerticalAlignment="Center"
+                      Margin="10,0,0,5" Checked="Blank_Changed" Unchecked="Blank_Changed" />
             <TextBlock Grid.Row="1" Grid.Column="0" x:Name="SampleBLabel" Text="样品2" FontWeight="Bold" VerticalAlignment="Center" />
             <ComboBox Grid.Row="1" Grid.Column="1" x:Name="SampleBBox" IsEditable="False"
                       DisplayMemberPath="Label" Padding="5" Margin="0,5,0,2"
                       SelectionChanged="Sample_SelectionChanged" />
+            <CheckBox Grid.Row="1" Grid.Column="2" x:Name="SampleBBlankBox" Content="空白" VerticalAlignment="Center"
+                      Margin="10,0,0,2" Checked="Blank_Changed" Unchecked="Blank_Changed" />
           </Grid>
           <TextBlock x:Name="SampleLoadText" Foreground="#61717C" Margin="42,8,0,0" />
         </StackPanel>

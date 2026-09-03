@@ -52,7 +52,7 @@ public sealed class GenerateRequest
     public required TemplateDefinition Template { get; init; }
     public required string TemplatePath { get; init; }
     public required string OutputPath { get; init; }
-    public required IReadOnlyList<GenerateSample> Samples { get; init; }
+    public required IReadOnlyList<GenerateSample?> Samples { get; init; }
     public required DateTime Date { get; init; }
     public required string SampleTime { get; init; }
 }

@@ -55,7 +55,7 @@ public static class WorkbookTemplateEngine
                 var elementIndex = row - slot.StartRow;
                 var element = elementIndex < slot.Elements.Count ? slot.Elements[elementIndex] : "";
                 SetInlineString(worksheet, $"{slot.ElementColumn}{row}",
-                    element);
+                    sample is null ? "" : element);
                 if (sample is not null && element.Length > 0 && sample.Results.TryGetValue(element, out var value))
                 {
                     if (request.Template.ResultFormats.TryGetValue(element, out var format))

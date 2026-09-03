@@ -32,7 +32,7 @@ POSTGRES_TABLE_ORDER = (
     "analytes", "chemical_elements", "common_oxides", "instruments", "instr_analytes", "dilutions",
     "volume_presets", "methods", "method_catalog_migrations", "templates", "preparation_combinations", "report_profiles",
     "result_order_templates",
-    "special_methods", "users", "samples", "special_results",
+    "special_methods", "users", "samples", "sample_tags", "special_results",
     "preparations", "sample_analytes", "results", "readings",
     "instrument_imports", "standard_client_submissions",
     "standard_client_sessions", "standard_client_status", "xrf_analyses",

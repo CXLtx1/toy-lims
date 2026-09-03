@@ -5,15 +5,17 @@ let EDITING_SAMPLE_ID = null;
 let SAMPLE_QUERY = "";
 let SAMPLE_PAGE = 0;
 let SAMPLE_TOTAL = 0;
-let SAMPLE_TYPE = "solid";
+let SAMPLE_TYPE = "all";
 let SHOW_CANCELLED = false;
 let SAMPLE_PAGE_SIZE = 50;
 let FORM_INSTRUMENT_MAP = {};
 let CAPTURED_INSTRUMENT_MAP = {};
 let FORM_REPORT_ORDER = [];
+let FORM_SAMPLE_TAGS = [];
 let TEMPLATE_EDIT_ID = null;
 let TEMPLATE_INSTRUMENT_MAP = {};
 let PREP_COMBINATION_EDIT_ID = null;
+let OPEN_CAP_IIDS = new Set();
 let CURRENT_SAMPLE = null;
 let SITE_STATUS = null;
 let CONTEXT_ENTITY = null;
@@ -28,6 +30,8 @@ let APPLIED_COLLAB_REVISION = null;
 let COLLAB_POLLING = false;
 let COLLAB_REFRESHING = false;
 let INSTRUMENT_AUTO_REFRESHING = false;
+let LAST_LOCAL_WRITE_AT = 0;
+let PENDING_LOCAL_WRITES = 0;
 let XRF_SCAN_PAGE = 1;
 let XRF_SCAN_QUERY = "";
 let XRF_SCAN_KIND = "all";
@@ -59,6 +63,8 @@ const REPORT_KNOWN = new Map();
 const REPORT_SELECTED = new Set();
 let REPORT_FOCUS_ID = null;
 let REPORT_QUEUE_SEQUENCE = 0;
+const SAMPLE_TAG_FILTER = new Set(new URLSearchParams(window.location.search).getAll("tag")
+  .map((tag) => String(tag || "").trim().replace(/^#+/, "")).filter(Boolean));
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -192,6 +198,21 @@ function requestAuthorization(explanation, purpose = null) {
 }
 
 async function api(url, method = "GET", body, canAuthorize = true) {
+  if (method !== "GET") {
+    PENDING_LOCAL_WRITES += 1;
+    LAST_LOCAL_WRITE_AT = Date.now();
+  }
+  try {
+    return await apiRequest(url, method, body, canAuthorize);
+  } finally {
+    if (method !== "GET") {
+      PENDING_LOCAL_WRITES -= 1;
+      LAST_LOCAL_WRITE_AT = Date.now();
+    }
+  }
+}
+
+async function apiRequest(url, method = "GET", body, canAuthorize = true) {
   let r;
   try {
     r = await fetch(url, {
@@ -224,6 +245,17 @@ async function api(url, method = "GET", body, canAuthorize = true) {
 }
 
 async function uploadApi(url, formData, canAuthorize = true) {
+  PENDING_LOCAL_WRITES += 1;
+  LAST_LOCAL_WRITE_AT = Date.now();
+  try {
+    return await uploadApiRequest(url, formData, canAuthorize);
+  } finally {
+    PENDING_LOCAL_WRITES -= 1;
+    LAST_LOCAL_WRITE_AT = Date.now();
+  }
+}
+
+async function uploadApiRequest(url, formData, canAuthorize = true) {
   let r;
   try {
     r = await fetch(url, { method: "POST", cache: "no-store", body: formData });
@@ -311,7 +343,7 @@ const STATUS_STAGE = {
   received: 0, queued: 1, measuring: 2, partially_done: 2,
   completed: 3, reviewed: 4,
 };
-const STATUS_STAGE_LABELS = ["未制样", "已制样 / 未测量", "测量中", "待审核", "已审核"];
+const STATUS_STAGE_LABELS = ["未制样", "未测量", "测量中", "待审核", "已审核"];
 
 function isStatusRollback(current, target) {
   return STATUS_ORDER.indexOf(target) < STATUS_ORDER.indexOf(current);
@@ -484,28 +516,49 @@ async function refreshActiveCollaborationPage() {
   }
 }
 
+async function applyCollaborationRevision(revision) {
+  if (APPLIED_COLLAB_REVISION === null || revision < APPLIED_COLLAB_REVISION) {
+    APPLIED_COLLAB_REVISION = revision;
+    return;
+  }
+  if (revision === APPLIED_COLLAB_REVISION || COLLAB_REFRESHING || !collaborationRefreshCanRun()) return;
+  if (PENDING_LOCAL_WRITES > 0 || Date.now() - LAST_LOCAL_WRITE_AT < 2000) return;
+  COLLAB_REFRESHING = true;
+  try {
+    await refreshActiveCollaborationPage();
+    APPLIED_COLLAB_REVISION = revision;
+  } finally {
+    COLLAB_REFRESHING = false;
+  }
+}
+
 async function pollCollaborationChanges() {
   if (COLLAB_POLLING || document.hidden) return;
   COLLAB_POLLING = true;
   try {
     const status = await refreshSiteStatus();
     if (!status) return;
-    const revision = +(status.revision || 0);
-    if (APPLIED_COLLAB_REVISION === null || revision < APPLIED_COLLAB_REVISION) {
-      APPLIED_COLLAB_REVISION = revision;
-      return;
-    }
-    if (revision === APPLIED_COLLAB_REVISION || COLLAB_REFRESHING || !collaborationRefreshCanRun()) return;
-    COLLAB_REFRESHING = true;
-    try {
-      await refreshActiveCollaborationPage();
-      APPLIED_COLLAB_REVISION = revision;
-    } finally {
-      COLLAB_REFRESHING = false;
-    }
+    await applyCollaborationRevision(+(status.revision || 0));
   } finally {
     COLLAB_POLLING = false;
   }
+}
+
+let COLLAB_SOURCE = null;
+function startCollaborationStream() {
+  if (COLLAB_SOURCE || typeof EventSource === "undefined") return;
+  const source = new EventSource("/api/events");
+  COLLAB_SOURCE = source;
+  source.onmessage = (event) => {
+    let data = null;
+    try { data = JSON.parse(event.data); } catch (_) { return; }
+    if (!data.server_time) return;
+    SITE_STATUS = { ...SITE_STATUS, server_time: data.server_time, revision: +(data.revision || 0) };
+    SERVER_TIME_AT_SYNC = new Date(data.server_time);
+    CLIENT_TIME_AT_SYNC = Date.now();
+    renderServerClock();
+    applyCollaborationRevision(+(data.revision || 0));
+  };
 }
 
 async function autoRefreshInstrumentPage() {
@@ -519,7 +572,8 @@ async function autoRefreshInstrumentPage() {
 }
 
 setInterval(renderServerClock, 1000);
-setInterval(pollCollaborationChanges, 600);
+setInterval(pollCollaborationChanges, 15000);
+startCollaborationStream();
 setInterval(autoRefreshInstrumentPage, 2000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
@@ -534,6 +588,7 @@ async function loadMeta() {
   if (!META || META.ok === false) return false;
   renderAccessIdentity();
   renderIntakeForm();
+  renderSampleTagControls();
   renderSettings();
   loadUsers(); loadTerminals();
   return true;
@@ -566,7 +621,7 @@ window.addEventListener("keydown", (event) => {
 async function loadSamples(query = SAMPLE_QUERY, page = SAMPLE_PAGE) {
   SAMPLE_QUERY = query;
   SAMPLE_PAGE = Math.max(0, page);
-  const result = await api(`/api/samples?paged=1&limit=${SAMPLE_PAGE_SIZE}&offset=${SAMPLE_PAGE * SAMPLE_PAGE_SIZE}&type=${SAMPLE_TYPE}&include_cancelled=${SHOW_CANCELLED ? 1 : 0}&q=${encodeURIComponent(query)}`);
+  const result = await api(`/api/samples?paged=1&limit=${SAMPLE_PAGE_SIZE}&offset=${SAMPLE_PAGE * SAMPLE_PAGE_SIZE}&type=${SAMPLE_TYPE}&include_cancelled=${SHOW_CANCELLED ? 1 : 0}&q=${encodeURIComponent(query)}${sampleTagQuery()}`);
   if (!result || result.ok === false) return;
   SAMPLES = result.rows;
   SAMPLE_TOTAL = result.total;
@@ -580,11 +635,63 @@ async function loadSamples(query = SAMPLE_QUERY, page = SAMPLE_PAGE) {
 /* ---------------- 页签 ---------------- */
 const URL_PAGES = ["intake", "data", "instrument", "results", "report", "audit", "users", "settings", "about"];
 
+function normalizeSampleTag(value) {
+  return String(value || "").trim().replace(/^#+/, "").trim();
+}
+
+function parseSampleTagText(value) {
+  return [...new Set(String(value || "").split(/[,，、;；\s]+/)
+    .map(normalizeSampleTag).filter(Boolean))];
+}
+
+function sampleTagQuery() {
+  return [...SAMPLE_TAG_FILTER].map((tag) => `&tag=${encodeURIComponent(tag)}`).join("");
+}
+
+async function refreshTagFilteredPage() {
+  SAMPLE_PAGE = 0;
+  RESULT_PAGE = 0;
+  REPORT_PAGE = 0;
+  syncPageUrl(activePageName());
+  renderSampleTagControls();
+  const page = activePageName();
+  if (page === "intake") await loadSamples(SAMPLE_QUERY, 0);
+  else if (page === "results") await loadResultsPage();
+  else if (page === "report") await loadReportPrintPage();
+}
+
+function renderSampleTagControls() {
+  if (!META) return;
+  const known = (META.sample_tags || []).map((tag) => tag.name);
+  $("#sample-tag-options").innerHTML = known.map((tag) => `<option value="${esc(tag)}"></option>`).join("");
+  $$('[data-tag-filter]').forEach((control) => {
+    const available = known.filter((tag) => !SAMPLE_TAG_FILTER.has(tag));
+    control.innerHTML = `<b>标签筛选</b><select aria-label="添加标签筛选"><option value="">+ 添加标签</option>${available.map((tag) =>
+        `<option value="${esc(tag)}">#${esc(tag)}</option>`).join("")}</select>
+      ${SAMPLE_TAG_FILTER.size ? '<button type="button" class="sample-tag-clear">清除</button>' : ""}
+      <div class="sample-tag-filter-selected">${[...SAMPLE_TAG_FILTER].map((tag) =>
+        `<button type="button" class="active" data-tag="${esc(tag)}" title="移除筛选">#${esc(tag)} ×</button>`).join("") || '<span class="hint">未选择</span>'}</div>`;
+    control.querySelectorAll("button[data-tag]").forEach((button) => button.onclick = () => {
+      SAMPLE_TAG_FILTER.delete(button.dataset.tag);
+      refreshTagFilteredPage();
+    });
+    control.querySelector("select").onchange = (event) => {
+      const tag = normalizeSampleTag(event.currentTarget.value);
+      if (tag) SAMPLE_TAG_FILTER.add(tag);
+      refreshTagFilteredPage();
+    };
+    const clear = control.querySelector(".sample-tag-clear");
+    if (clear) clear.onclick = () => { SAMPLE_TAG_FILTER.clear(); refreshTagFilteredPage(); };
+  });
+}
+
 function syncPageUrl(page, sampleId = null) {
   try {
     const url = new URL(window.location.href);
     if (page) url.searchParams.set("page", page);
     if (sampleId) url.searchParams.set("sample", sampleId);
+    url.searchParams.delete("tag");
+    SAMPLE_TAG_FILTER.forEach((tag) => url.searchParams.append("tag", tag));
     history.replaceState(null, "", url);
   } catch (_) { /* URL 同步失败不影响页面 */ }
 }
@@ -619,6 +726,7 @@ function setCurrentSample(sample) {
   CURRENT_SAMPLE = {
     id: +sample.id, name: sample.name,
     is_liquid: sample.is_liquid === undefined ? CURRENT_SAMPLE?.is_liquid : +sample.is_liquid,
+    is_water_quality: sample.is_water_quality === undefined ? CURRENT_SAMPLE?.is_water_quality : +sample.is_water_quality,
     workflow_type: sample.workflow_type ?? CURRENT_SAMPLE?.workflow_type ?? "regular",
     lims_no: sample.lims_no ?? CURRENT_SAMPLE?.lims_no,
     status: sample.status ?? CURRENT_SAMPLE?.status,
@@ -862,7 +970,11 @@ function prepRowHtml(prep = {}) {
 }
 
 function isLiquid() {
-  return $('input[name=s-liquid]:checked').value === "1";
+  return ["1", "water_quality"].includes($('input[name=s-liquid]:checked').value);
+}
+
+function isWaterQuality() {
+  return $('input[name=s-liquid]:checked').value === "water_quality";
 }
 
 function isSpecial() {
@@ -875,6 +987,8 @@ function syncSampleWorkflowForm() {
   $("#s-regular-config").hidden = special;
   $("#s-xrf").closest("label").hidden = special;
   $("#s-template").closest("label").hidden = special;
+  const density = $("#s-density-wrap");
+  if (density) density.hidden = special || !isLiquid() || isWaterQuality();
 }
 
 function prepAnalyteIds(tr) {
@@ -1082,9 +1196,20 @@ function addPrepRow(prep = {}, afterRow = null) {
   PREP_GRID.refresh();
 }
 
+function orderTemplateOptions(selectedId) {
+  return (META.result_order_templates || []).map((template) =>
+    `<option value="${template.id}" ${+selectedId === template.id ? "selected" : ""}>${esc(template.name)}${template.is_default ? "（系统默认）" : ""}</option>`).join("");
+}
+
+function defaultOrderTemplateId() {
+  return META.default_order_template_id || (META.result_order_templates || [])[0]?.id || "";
+}
+
 function renderIntakeForm() {
   $("#s-template").innerHTML = '<option value="">— 不使用 —</option>' +
     META.templates.map((t) => `<option value="${t.id}">${t.name}</option>`).join("");
+  const selectedOrderTemplate = +$("#s-order-template").value || null;
+  $("#s-order-template").innerHTML = orderTemplateOptions(selectedOrderTemplate ?? defaultOrderTemplateId());
   const selectedCombination = +$("#p-combination").value || null;
   $("#p-combination").innerHTML = '<option value="">— 选择组合 —</option>' +
     (META.preparation_combinations || []).map((item) =>
@@ -1164,7 +1289,10 @@ function currentTemplatePayload(name) {
   const preps = collectTemplatePreps();
   return {
     name,
+    category: $("#s-category").value.trim(),
+    tags: FORM_SAMPLE_TAGS,
     is_liquid: isLiquid() ? 1 : 0,
+    is_water_quality: isWaterQuality() ? 1 : 0,
     xrf: $("#s-xrf").checked ? 1 : 0,
     dilution_id: preps[0]?.dilution_id || null,
     analyte_ids,
@@ -1173,23 +1301,32 @@ function currentTemplatePayload(name) {
       __xrf_report_items: $("#s-xrf-text").value.trim(),
       __xrf_method_id: +$("#s-xrf-method").value || null,
       __report_order: FORM_REPORT_ORDER.length ? FORM_REPORT_ORDER : analyte_ids },
+    order_template_id: +$("#s-order-template").value || null,
   };
 }
 
 $("#s-apply-tpl").onclick = () => {
   const t = META.templates.find((x) => x.id === +$("#s-template").value);
   if (!t) return;
+  $("#s-category").value = t.category || "";
+  for (const tag of templateJson(t.tags_json, [])) {
+    if (!FORM_SAMPLE_TAGS.some((item) => item.toLowerCase() === String(tag).toLowerCase())) FORM_SAMPLE_TAGS.push(tag);
+  }
+  renderSampleTagEditor();
   const ids = JSON.parse(t.analyte_ids);
   $("#s-analyte-text").value = META.analytes
     .filter((a) => ids.includes(a.id)).map((a) => a.name).join(", ");
   renderChips();
-  $('input[name=s-liquid][value="' + (t.is_liquid ? 1 : 0) + '"]').click();
+  $('input[name=s-liquid][value="' + (t.is_water_quality ? "water_quality" : (t.is_liquid ? 1 : 0)) + '"]').click();
   $("#s-xrf").checked = !!t.xrf;
   $("#s-xrf-config").hidden = !t.xrf;
   const templateInstrumentMap = templateJson(t.instrument_config, {});
   const templateXrfIds = templateInstrumentMap.__xrf_analyte_ids || ids;
   const templateXrfMethodId = templateInstrumentMap.__xrf_method_id || null;
-  FORM_REPORT_ORDER = [...(templateInstrumentMap.__report_order || ids)];
+  FORM_REPORT_ORDER = t.order_template_id ? [] : [...(templateInstrumentMap.__report_order || ids)];
+  if (t.order_template_id || templateInstrumentMap.__report_order) {
+    $("#s-order-template").value = t.order_template_id || defaultOrderTemplateId();
+  }
   $("#s-xrf-text").value = t.xrf ? (templateInstrumentMap.__xrf_report_items ||
     META.analytes.filter((a) => templateXrfIds.includes(a.id)).map((a) => a.name).join(", ")) : "";
   renderXrfChips();
@@ -1217,6 +1354,34 @@ $("#s-save-template").onclick = async () => {
   $("#s-msg").textContent = "方案已保存为模板";
 };
 
+function renderSampleTagEditor() {
+  $("#s-sample-tags").innerHTML = FORM_SAMPLE_TAGS.map((tag) =>
+    `<button type="button" data-tag="${esc(tag)}" title="移除标签">#${esc(tag)} ×</button>`).join("") || '<span class="hint">暂无标签</span>';
+  $$("#s-sample-tags button").forEach((button) => button.onclick = () => {
+    FORM_SAMPLE_TAGS = FORM_SAMPLE_TAGS.filter((tag) => tag !== button.dataset.tag);
+    renderSampleTagEditor();
+  });
+}
+
+function addFormSampleTag() {
+  const input = $("#s-tag-input");
+  const tag = normalizeSampleTag(input.value);
+  if (!tag) return;
+  if (tag.length > 30) { showError("标签不能超过 30 个字符。"); return; }
+  if (FORM_SAMPLE_TAGS.length >= 20) { showError("每个样品最多添加 20 个标签。"); return; }
+  if (!FORM_SAMPLE_TAGS.some((item) => item.toLowerCase() === tag.toLowerCase())) FORM_SAMPLE_TAGS.push(tag);
+  input.value = "";
+  renderSampleTagEditor();
+  input.focus();
+}
+
+$("#s-tag-add").onclick = addFormSampleTag;
+$("#s-tag-input").onkeydown = (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  addFormSampleTag();
+};
+
 $("#s-submit").onclick = async () => {
   const name = $("#s-name").value.trim();
   if (!name) { showError("请填写来样序号。"); $("#s-name").focus(); return; }
@@ -1224,11 +1389,11 @@ $("#s-submit").onclick = async () => {
     const specialMethodId = +$("#s-special-method").value || null;
     if (!specialMethodId) { showError("请选择专项检测方法。"); $("#s-special-method").focus(); return; }
     const payload = { name, category: $("#s-category").value.trim(), workflow_type: "special",
-      special_method_id: specialMethodId };
+      special_method_id: specialMethodId, tags: FORM_SAMPLE_TAGS };
     const result = await api(EDITING_SAMPLE_ID ? `/api/samples/${EDITING_SAMPLE_ID}` : "/api/samples",
       EDITING_SAMPLE_ID ? "PUT" : "POST", payload);
     if (result.ok) {
-      setCurrentSample({ id: result.id, name, workflow_type: "special", is_liquid: 0,
+      setCurrentSample({ id: result.id, name, workflow_type: "special", is_liquid: 0, is_water_quality: 0,
         lims_no: result.lims_no, status: result.status });
       closeSampleEditor(); await loadSamples(); await loadMeta();
       await refreshSampleConsumers(result.id, name);
@@ -1266,16 +1431,20 @@ $("#s-submit").onclick = async () => {
   }
   const payload = {
     name, category: $("#s-category").value.trim(),
-    is_liquid: isLiquid() ? 1 : 0, xrf: xrf ? 1 : 0,
+    is_liquid: isLiquid() ? 1 : 0, is_water_quality: isWaterQuality() ? 1 : 0, xrf: xrf ? 1 : 0,
     preps, xrf_report_items: $("#s-xrf-text").value.trim(), xrf_method_id: xrfMethodId,
     instrument_map: FORM_INSTRUMENT_MAP,
     report_order: FORM_REPORT_ORDER,
+    order_template_id: +$("#s-order-template").value || null,
+    density_g_ml: isLiquid() && !isWaterQuality() ? ($("#s-density")?.value || null) : null,
+    tags: FORM_SAMPLE_TAGS,
   };
   const r = await api(EDITING_SAMPLE_ID ? `/api/samples/${EDITING_SAMPLE_ID}` : "/api/samples",
     EDITING_SAMPLE_ID ? "PUT" : "POST", payload);
   if (r.ok) {
     const message = EDITING_SAMPLE_ID ? `已保存 #${r.id}` : `已创建 #${r.id}`;
     setCurrentSample({ id: r.id, name, is_liquid: payload.is_liquid,
+      is_water_quality: payload.is_water_quality,
       lims_no: r.lims_no, status: r.status });
     closeSampleEditor();
     $("#s-workspace-msg").textContent = message;
@@ -1290,16 +1459,22 @@ function resetSampleForm() {
   FORM_INSTRUMENT_MAP = {};
   CAPTURED_INSTRUMENT_MAP = {};
   FORM_REPORT_ORDER = [];
+  FORM_SAMPLE_TAGS = [...SAMPLE_TAG_FILTER];
+  $("#s-order-template").value = defaultOrderTemplateId();
   $("#s-form-title").textContent = "新建样品";
   $("#s-submit").textContent = "创建样品";
   $("#s-name").value = "";
   $("#s-category").value = "";
+  if ($("#s-density")) $("#s-density").value = "";
+  $("#s-tag-input").value = "";
+  renderSampleTagEditor();
   $("#s-analyte-text").value = "";
   $("#s-xrf").checked = false;
   $("#s-xrf-config").hidden = true;
   $("#s-xrf-text").value = "";
   renderXrfMethodSelect($("#s-xrf-method"));
-  const defaultType = SAMPLE_TYPE === "liquid" ? "1" : (SAMPLE_TYPE === "special" ? "special" : "0");
+  const defaultType = SAMPLE_TYPE === "water_quality" ? "water_quality"
+    : (SAMPLE_TYPE === "liquid" ? "1" : (SAMPLE_TYPE === "special" ? "special" : "0"));
   $(`input[name=s-liquid][value="${defaultType}"]`).checked = true;
   $("#s-special-method").value = "";
   $("#p-table tbody").innerHTML = "";
@@ -1312,7 +1487,10 @@ function resetSampleForm() {
   $("#s-excel-plan-import").hidden = true;
 }
 
+let SAMPLE_EDITOR_RETURN_Y = 0;
+
 function showSampleEditor(card = null) {
+  SAMPLE_EDITOR_RETURN_Y = window.scrollY;
   const panel = $("#sample-editor-panel");
   $$(".sample-card.expanded").forEach((item) => item.classList.remove("expanded"));
   if (card) card.classList.add("expanded");
@@ -1340,6 +1518,10 @@ function populateSampleForm(sample, preps, items, copy = false) {
   $("#s-excel-plan-import").hidden = copy;
   $("#s-name").value = copy ? `${sample.name}-副本` : sample.name;
   $("#s-category").value = sample.category || "";
+  FORM_SAMPLE_TAGS = [...(sample.tags || [])];
+  $("#s-tag-input").value = "";
+  renderSampleTagEditor();
+  if ($("#s-density")) $("#s-density").value = sample.density_g_ml ?? "";
   if (sample.workflow_type === "special") {
     $('input[name=s-liquid][value="special"]').checked = true;
     $("#s-special-method").value = sample.special_method_id || "";
@@ -1351,7 +1533,7 @@ function populateSampleForm(sample, preps, items, copy = false) {
   }
   $("#s-xrf").checked = !!sample.xrf;
   $("#s-xrf-config").hidden = !sample.xrf;
-  $(`input[name=s-liquid][value="${sample.is_liquid ? 1 : 0}"]`).checked = true;
+  $(`input[name=s-liquid][value="${sample.is_water_quality ? "water_quality" : (sample.is_liquid ? 1 : 0)}"]`).checked = true;
   syncSampleWorkflowForm();
   const solutionIds = [...new Set(items.filter((item) => item.preparation_id).map((item) => item.analyte_id))];
   const xrfIds = [];
@@ -1368,6 +1550,7 @@ function populateSampleForm(sample, preps, items, copy = false) {
   });
   FORM_INSTRUMENT_MAP = copy ? structuredClone(CAPTURED_INSTRUMENT_MAP) : {};
   FORM_REPORT_ORDER = templateJson(sample.report_order, []);
+  $("#s-order-template").value = sample.order_template_id || defaultOrderTemplateId();
   $("#s-analyte-text").value = solutionIds.map((id) => META.analytes.find((a) => a.id === id)?.name)
     .filter(Boolean).join(", ");
   $("#s-xrf-text").value = sample.xrf_report_items || "";
@@ -1470,7 +1653,7 @@ document.addEventListener("keydown", (event) => {
   event.preventDefault();
   event.stopImmediatePropagation();
   closeSampleEditor();
-  $("#s-card-list").scrollIntoView({ behavior: "smooth", block: "start" });
+  window.scrollTo({ top: SAMPLE_EDITOR_RETURN_Y });
 }, true);
 
 function renderSampleList() {
@@ -1488,9 +1671,9 @@ function renderSampleList() {
       META.allowed_status_targets.includes("cancelled");
     return `<article class="sample-card status-${esc(s.status)} ${CURRENT_SAMPLE?.id === s.id ? "current" : ""} ${s.status === "cancelled" ? "cancelled" : ""}" data-sid="${s.id}">
       <div class="sample-card-summary" role="button" tabindex="0">
-        <div class="sample-identity"><span class="sample-lims-no">${esc(s.lims_no || "#" + s.id)}</span><b>${esc(s.name)}</b>
+        <div class="sample-identity"><span class="sample-lims-no">${esc(s.lims_no || "#" + s.id)}</span><span class="sample-name-block"><b>${esc(s.name)}</b>${(s.tags || []).length ? `<small>${s.tags.map((tag) => `<i>#${esc(tag)}</i>`).join("")}</small>` : ""}</span>
           <span class="sample-category ${s.category ? "" : "empty"}" ${s.category ? "" : 'aria-hidden="true"'}>${esc(s.category || "占位")}</span>
-          <span class="sample-kind ${special ? "special" : (s.is_liquid ? "liquid" : "solid")}">${special ? "其他" : (s.is_liquid ? "液体" : "固体")}</span>
+          <span class="sample-kind ${special ? "special" : (s.is_water_quality ? "water-quality" : (s.is_liquid ? "liquid" : "solid"))}">${special ? "其他" : (s.is_water_quality ? "水质" : (s.is_liquid ? "液体" : "固体"))}</span>
           ${sampleStageTrackHtml(s.status)}
           <span class="sample-status ${esc(s.status)}">${esc(statusLabel)}</span></div>
         <div class="sample-analytes">${analytes.length
@@ -1589,7 +1772,7 @@ function setupSamplePicker(prefix) {
     const q = showAll ? "" : input.value.replace(/^#\d+\s*/, "").trim();
     const found = await api(`/api/samples?limit=30&q=${encodeURIComponent(q)}`);
     options.innerHTML = found.length ? found.map((s) =>
-      `<button type="button" data-id="${s.id}"><b>#${s.id}</b><span>${esc(s.name)}</span><small>${s.is_liquid ? "液体" : "固体"} · ${esc(s.created_at)}</small></button>`
+      `<button type="button" data-id="${s.id}"><b>#${s.id}</b><span>${esc(s.name)}</span><small>${s.workflow_type === "special" ? "其他" : (s.is_water_quality ? "水质" : (s.is_liquid ? "液体" : "固体"))} · ${esc(s.created_at)}</small></button>`
     ).join("") : '<span class="empty">没有匹配的样品</span>';
     options.classList.add("open");
     options.querySelectorAll("button").forEach((button) => button.onmousedown = (event) => {
@@ -1650,7 +1833,9 @@ $$("#s-type-filter button").forEach((button) => button.onclick = () => {
   SAMPLE_TYPE = button.dataset.type;
   if (CURRENT_SAMPLE && SAMPLE_TYPE !== "all" &&
       ((SAMPLE_TYPE === "special") !== (CURRENT_SAMPLE.workflow_type === "special") ||
-       (SAMPLE_TYPE !== "special" && Boolean(CURRENT_SAMPLE.is_liquid) !== (SAMPLE_TYPE === "liquid")))) {
+       (SAMPLE_TYPE === "water_quality" && !CURRENT_SAMPLE.is_water_quality) ||
+       (SAMPLE_TYPE === "liquid" && (!CURRENT_SAMPLE.is_liquid || CURRENT_SAMPLE.is_water_quality)) ||
+       (SAMPLE_TYPE === "solid" && (CURRENT_SAMPLE.is_liquid || CURRENT_SAMPLE.workflow_type === "special")))) {
     clearCurrentSample();
   }
   loadSamples(SAMPLE_QUERY, 0);
@@ -1905,7 +2090,7 @@ function entryRowHtml(sa, analyteCount = 1) {
     <button class="rd-add" type="button">+ 再测一遍</button>`;
   let coeffText = "";
   if (aux.use) {
-    if (aux.expected && aux.measured) coeffText = "×" + (aux.measured / aux.expected).toFixed(4);
+    if (aux.expected && aux.measured) coeffText = "×" + (aux.expected / aux.measured).toFixed(4);
     else if (aux.coefficient) coeffText = "×" + aux.coefficient;
   }
   const hasStoredValue = sa.readings?.some(readingHasStoredValue) || readingHasStoredValue(sa);
@@ -2047,7 +2232,7 @@ async function loadDataEntry() {
   $("#d-manual-result").disabled = !["completed", "reviewed"].includes(sample.status);
   $("#d-manual-result").title = $("#d-manual-result").disabled ? "样品测量完成后才能手工补录结果" : "需要特权权限、操作原因和再次密码确认";
   const statusLabel = META.sample_statuses[sample.status] || sample.status;
-  $("#d-info").innerHTML = `${sample.workflow_type === "special" ? "其他样" : (sample.is_liquid ? "液体样" : "固体")} <span class="sample-status ${esc(sample.status)}">${esc(statusLabel)}</span>${statusActorHtml(sample)}`;
+  $("#d-info").innerHTML = `${sample.workflow_type === "special" ? "其他样" : (sample.is_water_quality ? "水质样" : (sample.is_liquid ? "液体样" : "固体"))} <span class="sample-status ${esc(sample.status)}">${esc(statusLabel)}</span>${statusActorHtml(sample)}`;
   const nextStatuses = (META.sample_transitions?.[sample.status] || []).filter((status) =>
     !["cancelled", "reviewed"].includes(status) && META.allowed_status_targets.includes(status));
   const statusActions = $("#d-status-actions");
@@ -2196,7 +2381,7 @@ async function loadDataEntry() {
       if (!result.ok) return;
       const show = tr.querySelector(".aux-show");
       show.textContent = auxUse.checked && aux.expected && aux.measured
-        ? "×" + (aux.measured / aux.expected).toFixed(4) : "";
+        ? "×" + (aux.expected / aux.measured).toFixed(4) : "";
       rowSaved(tr);
     };
     if (auxUse) auxUse.onchange = saveAux;
@@ -2762,8 +2947,43 @@ function combinedRawTicketHtml(payloads) {
     <div class="ticket-signatures"><span>分析：${esc(names("analyst"))}</span><span>审核：${esc(names("reviewer"))}</span></div></section>`;
 }
 
+function waterRawTicketHtml(payloads) {
+  if (!payloads.length) return '<div class="report-empty-preview">选择已审核水质样后生成原始记录预览</div>';
+  const analytes = [];
+  const seen = new Set();
+  payloads.forEach((payload) => (payload.groups || []).forEach((group) => {
+    if (!seen.has(group.analyte)) { seen.add(group.analyte); analytes.push(group.analyte); }
+  }));
+  const rows = payloads.map((payload) => {
+    const values = new Map();
+    (payload.groups || []).forEach((group) => {
+      const readings = (group.rows || []).flatMap((row) => (row.readings || [])
+        .map((reading) => rawReadingText(row, reading))).filter((value) => value !== "—");
+      values.set(group.analyte, [...new Set(readings)].join(" / ") || "—");
+    });
+    return `<tr><td>${esc(reportDate(payload.sample))}</td><td>${esc(payload.sample.category || "—")}</td>
+      <td>${esc(payload.sample.name || "—")}</td>${analytes.map((name) => `<td>${esc(values.get(name) || "—")}</td>`).join("")}
+      <td>${esc(payload.sample.analyst || "")}</td><td></td></tr>`;
+  }).join("");
+  const columnCount = analytes.length + 5;
+  const blanks = Array.from({ length: Math.max(0, 18 - payloads.length) }, () =>
+    `<tr class="blank-row">${"<td></td>".repeat(columnCount)}</tr>`).join("");
+  return `<section class="print-document raw-ticket raw-ticket-page water-raw-ticket">
+    <div class="water-ticket-code">TL-HYS-06-01</div><h2>污水处理分析原始记录</h2>
+    <div class="water-unit-note">除 pH 外，单位均为 mg/L</div>
+    <table class="water-raw-table"><thead><tr><th>日期</th><th>取样点</th><th>编号</th>
+      ${analytes.map((name) => `<th>${esc(name)}</th>`).join("")}<th>分析人</th><th>备注</th></tr></thead>
+      <tbody>${rows}${blanks}</tbody></table></section>`;
+}
+
+function rawTicketHtml(payloads) {
+  const water = payloads.filter((payload) => payload.sample.is_water_quality);
+  const regular = payloads.filter((payload) => !payload.sample.is_water_quality);
+  return (regular.length ? combinedRawTicketHtml(regular) : "") + (water.length ? waterRawTicketHtml(water) : "") || combinedRawTicketHtml([]);
+}
+
 function renderPrintTickets() {
-  $("#raw-ticket").innerHTML = combinedRawTicketHtml(REPORT_BATCH_DATA);
+  $("#raw-ticket").innerHTML = rawTicketHtml(REPORT_BATCH_DATA);
 }
 
 function manualReportEditRow(row = {}) {
@@ -2893,6 +3113,16 @@ async function expandResultSample(sample) {
   $(`#results-list .result-detail-row[data-sid="${sample.id}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+function updateCachedRowSelection(sid, match, use) {
+  const detail = RESULT_DETAILS.get(sid);
+  if (!detail) return;
+  for (const group of detail.groups || []) {
+    for (const row of group.rows || []) {
+      if (match(row)) row.selection = use ? "include" : "exclude";
+    }
+  }
+}
+
 async function loadResultDetail(sid, rerender = true) {
   if (!RESULT_EXPANDED.has(sid)) return;
   const sequence = ++resultDetailSequence;
@@ -2908,16 +3138,18 @@ async function loadResultDetail(sid, rerender = true) {
 function resultDetailGroupsHtml(data) {
   const { sample, groups } = data;
   const reviewed = sample.status === "reviewed";
+  const unitLocked = ["reported", "cancelled"].includes(sample.status);
   const items = groups || [];
   const columns = 5;
   const xrfRows = items.flatMap((group) => group.rows
     .filter((row) => row.xrf_value_id)
-    .map((row) => ({ ...row, analyte: group.analyte })))
+    .map((row) => ({ ...row, analyte: group.analyte, key: group.key,
+      available_units: group.available_units || [] })))
     .sort((left, right) => (+right.value || 0) - (+left.value || 0));
   const targetMode = (data.xrf_targets || []).length > 0;
   const warnings = data.xrf_warnings || [];
   const xrf = xrfRows.length ? `<section class="result-xrf-composition">
-    <h4>XRF 最终组成 <small>${xrfRows.length} 项 · Wt%</small>
+    <h4>XRF 最终组成 <small>${xrfRows.length} 项 · 点击单位可切换</small>
       ${reviewed ? "" : `<button type="button" class="xrf-target-edit" data-sid="${sample.id}" title="设置每个元素族的报告口径">口径</button>`}
     </h4>
     ${warnings.map((warning) => `<p class="hint xrf-warning">注意：${esc(warning.message)}</p>`).join("")}
@@ -2925,14 +3157,16 @@ function resultDetailGroupsHtml(data) {
       const control = targetMode && row.xrf_resolution
         ? `<span class="xrf-resolution" title="${esc(row.xrf_resolution.note)}">${row.xrf_resolution.via === "converted" ? esc(row.xrf_resolution.note) : "直出"}</span>`
         : `<input class="xrf-report-use" type="checkbox" data-xrf-value="${row.xrf_value_id}" aria-label="${esc(row.analyte)}参与最终结果" title="参与最终结果" ${row.selection === "exclude" ? "" : "checked"} ${reviewed ? "disabled" : ""}>`;
-      return `<div>${control}<b>${esc(row.analyte)}</b><span>${esc(xrfValueText(row.value))}%</span></div>`;
+      const unit = `<button type="button" class="result-unit-button xrf-unit-button" data-key="${esc(row.key)}" data-current="${esc(row.unit || "")}" data-units="${esc(row.available_units.join(","))}" ${unitLocked || row.available_units.length < 2 ? "disabled" : ""} title="点击切换显示单位">${esc(row.unit || "")}</button>`;
+      return `<div>${control}<b>${esc(row.analyte)}</b><span>${esc(xrfValueText(row.value))}${unit}</span></div>`;
     }).join("")}</div>
   </section>` : "";
   const cards = items.map((group) => ({ ...group, rows: group.rows.filter((row) => !row.xrf_value_id) }))
     .filter((group) => group.rows.length)
     .map((g) => {
+    const unit = g.final ? `<button type="button" class="result-unit-button" data-key="${esc(g.key)}" data-current="${esc(g.final.unit || "")}" data-units="${esc((g.available_units || []).join(","))}" ${unitLocked || (g.available_units || []).length < 2 ? "disabled" : ""} title="点击切换显示单位">${esc(g.final.unit || "")}</button>` : "";
     const final = g.final
-      ? `<strong>${esc(g.final.value)} <small>${esc(g.final.unit || "")}</small></strong><em>${esc(g.final.mode)}${g.final.based_on > 1 ? ` × ${g.final.based_on}` : ""}</em>`
+      ? `<strong>${esc(g.final.value)} ${unit}</strong><em>${esc(g.final.mode)}${g.final.based_on > 1 ? ` × ${g.final.based_on}` : ""}</em>`
       : "<strong>—</strong><em>暂无最终值</em>";
     const rows = g.rows.map((r) => {
       const canChoose = g.rows.length > 1;
@@ -3094,16 +3328,38 @@ function bindResultDetail(scope, sid) {
   if (!scope || !data) return;
   const reviewButton = scope.querySelector(".results-review");
   if (reviewButton) reviewButton.onclick = () => reviewResultSample(sid);
+  scope.querySelectorAll(".result-unit-button").forEach((button) => button.onclick = async (event) => {
+    event.stopPropagation();
+    const units = button.dataset.units.split(",").filter(Boolean);
+    const index = Math.max(0, units.indexOf(button.dataset.current));
+    const unit = units[(index + 1) % units.length];
+    if (!unit || unit === button.dataset.current) return;
+    button.disabled = true;
+    const result = await api(`/api/samples/${sid}/result-unit`, "PUT", { key: button.dataset.key, unit });
+    if (result.ok) await loadResultDetail(sid); else button.disabled = false;
+  });
   scope.querySelectorAll(".report-use").forEach((checkbox) => checkbox.onchange = async () => {
-    const result = await api(`/api/sample-analytes/${checkbox.dataset.said}/report-use`, "PUT", {
+    const said = +checkbox.dataset.said;
+    updateCachedRowSelection(sid, (row) => row.sample_analyte_id === said, checkbox.checked);
+    const result = await api(`/api/sample-analytes/${said}/report-use`, "PUT", {
       use: checkbox.checked,
     });
-    if (!result.ok) { checkbox.checked = !checkbox.checked; return; }
+    if (!result.ok) {
+      updateCachedRowSelection(sid, (row) => row.sample_analyte_id === said, !checkbox.checked);
+      checkbox.checked = !checkbox.checked;
+      return;
+    }
     await loadResultDetail(sid);
   });
   scope.querySelectorAll(".xrf-report-use").forEach((checkbox) => checkbox.onchange = async () => {
+    const valueId = +checkbox.dataset.xrfValue;
+    updateCachedRowSelection(sid, (row) => row.xrf_value_id === valueId, checkbox.checked);
     const result = await api(`/api/xrf/values/${checkbox.dataset.xrfValue}/report-use`, "PUT", { use: checkbox.checked });
-    if (!result.ok) { checkbox.checked = !checkbox.checked; return; }
+    if (!result.ok) {
+      updateCachedRowSelection(sid, (row) => row.xrf_value_id === valueId, !checkbox.checked);
+      checkbox.checked = !checkbox.checked;
+      return;
+    }
     await loadResultDetail(sid);
   });
   scope.querySelectorAll(".xrf-target-edit").forEach((button) => button.onclick = () => openXrfTargetDialog(sid));
@@ -3149,14 +3405,18 @@ function renderResultsList() {
     const summary = analytes.length
       ? analytes.slice(0, 8).map((name) => `<span>${esc(name)}</span>`).join("") + (analytes.length > 8 ? `<small>+${analytes.length - 8}</small>` : "")
       : "<i>展开查看结果</i>";
+    const tags = Array.isArray(sample.tags) ? sample.tags : [];
+    const tagsCell = tags.length
+      ? `<div class="result-summary result-tags">${tags.map((tag) => `<span>${esc(tag)}</span>`).join("")}</div>`
+      : "—";
     return `<tr class="result-row ${expanded ? "expanded" : ""}" data-sid="${sample.id}" aria-expanded="${expanded}">
       <td><input class="result-select" type="checkbox" ${RESULT_SELECTED.has(sample.id) ? "checked" : ""} aria-label="选择 ${esc(sample.name)}"></td>
-      <td><b>${esc(sample.lims_no || "#" + sample.id)}</b></td><td>${esc(sample.name)}</td><td>${esc(sample.category || "—")}</td>
+      <td><b>${esc(sample.lims_no || "#" + sample.id)}</b></td><td>${esc(sample.name)}</td><td>${tagsCell}</td><td>${esc(sample.category || "—")}</td>
       <td><span class="sample-status ${esc(sample.status)}">${esc(META.sample_statuses[sample.status] || sample.status)}</span></td>
       <td><div class="result-summary">${summary}</div></td><td>${esc(sample.reviewer || (sample.status === "completed" ? "待审核" : "—"))}</td>
       <td><button class="result-expand" type="button">${expanded ? "收起" : "展开"}</button></td></tr>
-      ${expanded ? `<tr class="result-detail-row" data-sid="${sample.id}"><td colspan="8">${resultDetailHtml(sample.id)}</td></tr>` : ""}`;
-  }).join("") || '<tr><td colspan="8" class="xrf-empty">没有已制样或后续阶段的样品</td></tr>';
+      ${expanded ? `<tr class="result-detail-row" data-sid="${sample.id}"><td colspan="9">${resultDetailHtml(sample.id)}</td></tr>` : ""}`;
+  }).join("") || '<tr><td colspan="9" class="xrf-empty">没有已制样或后续阶段的样品</td></tr>';
   body.querySelectorAll(".result-detail-row").forEach((detailRow) => {
     const sid = +detailRow.dataset.sid;
     renderManualReportSection(detailRow, sid);
@@ -3193,9 +3453,12 @@ function renderResultsPager() {
   $("#results-count").textContent = `共 ${RESULT_TOTAL} 个，当前 ${start}-${end} · 已选 ${RESULT_SELECTED.size} 个`;
 }
 
+let RESULTS_LOAD_GEN = 0;
 async function loadResultsPage() {
+  const gen = ++RESULTS_LOAD_GEN;
   const query = $("#results-search").value.trim();
-  const result = await api(`/api/samples?paged=1&limit=${RESULT_PAGE_SIZE}&offset=${RESULT_PAGE * RESULT_PAGE_SIZE}&type=all&status=queued,measuring,partially_done,completed,reviewed&q=${encodeURIComponent(query)}`);
+  const result = await api(`/api/samples?paged=1&limit=${RESULT_PAGE_SIZE}&offset=${RESULT_PAGE * RESULT_PAGE_SIZE}&type=all&status=queued,measuring,partially_done,completed,reviewed&q=${encodeURIComponent(query)}${sampleTagQuery()}`);
+  if (gen !== RESULTS_LOAD_GEN) return;
   if (!result || result.ok === false) return;
   RESULT_TOTAL = result.total || result.rows.length;
   const lastPage = Math.max(0, Math.ceil(RESULT_TOTAL / RESULT_PAGE_SIZE) - 1);
@@ -3212,6 +3475,7 @@ async function loadResultsPage() {
   }
   renderResultsList();
   await Promise.all([...RESULT_EXPANDED].map((sid) => loadResultDetail(sid, false)));
+  if (gen !== RESULTS_LOAD_GEN) return;
   renderResultsList();
 }
 
@@ -3265,6 +3529,36 @@ function combinedFinalTicketHtml(payloads) {
     <div class="report-notes"><b>说明：</b><ol><li>本结果只对来样负责。</li><li>若对本结果有异议，可在15个工作日内提出复查申请。</li><li>本检测报告需部门领导审核签字方能生效。</li></ol></div>`;
 }
 
+function waterResultUnit(row) {
+  if (/^p\s*h$/i.test(String(row.item || ""))) return "";
+  return String(row.unit || "mg/L").toLowerCase() === "ppm" ? "mg/L" : (row.unit || "mg/L");
+}
+
+function waterFinalTicketHtml(payloads) {
+  if (!payloads.length) return '<div class="report-empty-preview">选择已审核水质样后生成分析报告票预览</div>';
+  return `<div class="water-final-pages">${payloads.map((payload) => {
+    const selected = (payload.report_rows || []).filter((row) => row.include !== false);
+    const count = Math.max(15, selected.length || 1);
+    const rows = selected.concat(Array.from({ length: count - selected.length }, () => ({ item: "", result: "", unit: "" })));
+    const body = rows.map((row, index) => `<tr>${index === 0 ? `<th class="water-project-label" rowspan="${count}">检测项目</th>` : ""}
+      <th>${esc(row.item)}</th><td>${esc(displayNumber(row.result) === "—" && !row.item ? "" : displayNumber(row.result))}</td><td>${esc(row.item ? waterResultUnit(row) : "")}</td></tr>`).join("");
+    return `<section class="water-final-page"><div class="water-ticket-code">TL-HYS-20-01</div>
+      <h2>废水分析报告票</h2><div class="water-final-date">日期：${esc(reportDate(payload.sample))}</div>
+      <table class="water-final-table"><tbody><tr><th colspan="2">检测点</th><td>${esc(payload.sample.category || "")}</td><th>编号</th><td>${esc(payload.sample.name || "")}</td></tr>
+      ${body}<tr><th colspan="2">分析人员</th><td colspan="3">${esc(payload.sample.analyst || "")}</td></tr></tbody></table></section>`;
+  }).join("")}</div>`;
+}
+
+function finalTicketHtml(payloads) {
+  if (!payloads.length) return combinedFinalTicketHtml([]);
+  const hasWater = payloads.some((payload) => payload.sample.is_water_quality);
+  const hasRegular = payloads.some((payload) => !payload.sample.is_water_quality);
+  if (hasWater && hasRegular) {
+    return '<div class="report-empty-preview">水质样与其他样品使用不同报告票，请分开选择后打印</div>';
+  }
+  return hasWater ? waterFinalTicketHtml(payloads) : combinedFinalTicketHtml(payloads);
+}
+
 function renderReportBatch(payloads) {
   REPORT_BATCH_DATA = payloads;
   REPORT_DATA = payloads[0] || null;
@@ -3274,7 +3568,15 @@ function renderReportBatch(payloads) {
   $("#r-excel-export").title = payloads.length > 1 ? "单样品 Excel 请只保留一个勾选样品" : "";
   $("#r-edit-sample").hidden = true;
   $("#r-enter-data").hidden = true;
-  $("#r-order-default").hidden = true;
+  const prevOrderTemplate = $("#r-order-template").value;
+  $("#r-order-template").innerHTML = orderTemplateOptions(
+    prevOrderTemplate || META.result_order_templates?.find((item) => item.is_default)?.id || defaultOrderTemplateId());
+  $("#r-order-apply").hidden = false;
+  $("#r-order-apply").disabled = false;
+  $("#r-order-default").hidden = false;
+  $("#r-order-default").textContent = "清除手工调整";
+  $("#r-order-default").disabled = false;
+  $("#r-order-default").title = "清除所选样品的手工微调，恢复各自选择的通用顺序";
   $("#r-special-details").hidden = true;
   $("#r-regular-details").hidden = false;
   if (!first) {
@@ -3393,6 +3695,28 @@ function renderReportBatch(payloads) {
   });
 }
 
+$("#r-order-apply").onclick = async () => {
+  if (!REPORT_SELECTED.size) { $("#r-meta-msg").textContent = "请先勾选需要应用顺序模板的样品"; return; }
+  const order_template_id = $("#r-order-template").value || null;
+  for (const sid of REPORT_SELECTED) {
+    const result = await api(`/api/samples/${sid}/report-order`, "PUT",
+      { order_template_id, analyte_ids: [] });
+    if (!result.ok) { $("#r-meta-msg").textContent = result.error || "应用顺序模板失败"; return; }
+  }
+  $("#r-meta-msg").textContent = `已对 ${REPORT_SELECTED.size} 个样品应用通用顺序`;
+  await loadReport();
+};
+
+$("#r-order-default").onclick = async () => {
+  if (!REPORT_SELECTED.size) { $("#r-meta-msg").textContent = "请先勾选样品"; return; }
+  for (const sid of REPORT_SELECTED) {
+    const result = await api(`/api/samples/${sid}/report-order`, "PUT", { analyte_ids: [] });
+    if (!result.ok) { $("#r-meta-msg").textContent = result.error || "清除手工调整失败"; return; }
+  }
+  $("#r-meta-msg").textContent = "已清除所选样品的手工调整";
+  await loadReport();
+};
+
 async function updateFinalTicket() {
   const sequence = ++REPORT_QUEUE_SEQUENCE;
   const ids = [...REPORT_SELECTED];
@@ -3406,15 +3730,23 @@ async function updateFinalTicket() {
   if (!ids.length) {
     renderReportBatch([]);
     $("#raw-ticket").innerHTML = '<div class="report-empty-preview">选择已审核样品后生成原始分析记录预览</div>';
-    $("#final-ticket").innerHTML = combinedFinalTicketHtml([]);
+    $("#final-ticket").innerHTML = finalTicketHtml([]);
     return;
   }
   const payloads = await Promise.all(ids.map((id) => api(`/api/report/${id}`)));
   if (sequence !== REPORT_QUEUE_SEQUENCE) return;
   const valid = payloads.filter((payload) => payload?.sample?.status === "reviewed");
+  const mixedTypes = valid.some((payload) => payload.sample.is_water_quality) &&
+    valid.some((payload) => !payload.sample.is_water_quality);
+  $("#r-print-raw").disabled = mixedTypes;
+  $("#r-print-final").disabled = mixedTypes;
+  if (mixedTypes) {
+    $("#r-print-raw").title = "水质样与其他样品请分开选择后打印";
+    $("#r-print-final").title = "水质样与其他样品请分开选择后打印";
+  }
   renderReportBatch(valid);
-  $("#raw-ticket").innerHTML = combinedRawTicketHtml(valid);
-  $("#final-ticket").innerHTML = combinedFinalTicketHtml(valid);
+  $("#raw-ticket").innerHTML = rawTicketHtml(valid);
+  $("#final-ticket").innerHTML = finalTicketHtml(valid);
 }
 
 function syncReportFocus() {
@@ -3493,7 +3825,7 @@ function renderReportSamples() {
 
 async function loadReportPrintPage() {
   const query = $("#report-search").value.trim();
-  const result = await api(`/api/samples?paged=1&limit=${REPORT_PAGE_SIZE}&offset=${REPORT_PAGE * REPORT_PAGE_SIZE}&type=all&status=reviewed&q=${encodeURIComponent(query)}`);
+  const result = await api(`/api/samples?paged=1&limit=${REPORT_PAGE_SIZE}&offset=${REPORT_PAGE * REPORT_PAGE_SIZE}&type=all&status=reviewed&q=${encodeURIComponent(query)}${sampleTagQuery()}`);
   if (!result || result.ok === false) return;
   REPORT_TOTAL = result.total || result.rows.length;
   const lastPage = Math.max(0, Math.ceil(REPORT_TOTAL / REPORT_PAGE_SIZE) - 1);
@@ -3563,7 +3895,7 @@ async function loadReport() {
     `${p.name}(${sample.is_liquid ? "" : `${p.mass_g ?? "?"}g/${p.volume_ml ?? "?"}mL/`}${p.dilution_label || "—"})`
   ).join("　");
   $("#r-head").innerHTML = `<b>${esc(sample.name)}</b> (#${sample.id}) ·
-    ${sample.is_liquid ? "液体样" : "固体"}${sample.category ? ` · ${esc(sample.category)}` : ""}${sample.xrf ? " · 含XRF粗扫" : ""} ·
+    ${sample.is_water_quality ? "水质样" : (sample.is_liquid ? "液体样" : "固体")}${sample.category ? ` · ${esc(sample.category)}` : ""}${sample.xrf ? " · 含XRF粗扫" : ""} ·
     ${esc(sample.created_at)}<br>溶样: ${esc(prepStr) || "—"}`;
   let html = "";
   if (reportData.manual_report) {
@@ -3595,7 +3927,7 @@ async function loadReport() {
       } else raw = "—";
       const auxBadge = r.aux && r.aux.use
         ? (r.aux.expected && r.aux.measured
-            ? ` <span class="tag" title="回标 ${r.aux.expected}→${r.aux.measured}">×${(r.aux.measured / r.aux.expected).toFixed(4)}</span>`
+            ? ` <span class="tag" title="回标 ${r.aux.expected}→${r.aux.measured}">×${(r.aux.expected / r.aux.measured).toFixed(4)}</span>`
             : (r.aux.coefficient ? ` <span class="tag">×${r.aux.coefficient}</span>` : ""))
         : "";
       const res = r.value === null || r.value === undefined
@@ -3648,7 +3980,7 @@ $("#r-report-profile").onchange = () => {
   const profile = META.report_profiles.find((item) => item.id === +$("#r-report-profile").value);
   if (profile) REPORT_BATCH_DATA.forEach((reportData) => { reportData.report_profile = profile; });
   renderPrintTickets();
-  $("#final-ticket").innerHTML = combinedFinalTicketHtml(REPORT_BATCH_DATA);
+  $("#final-ticket").innerHTML = finalTicketHtml(REPORT_BATCH_DATA);
 };
 ["r-customer", "r-report-no", "r-analysis-date", "r-analyst"].forEach((id) => {
   $("#" + id).addEventListener("input", () => {
@@ -3656,7 +3988,7 @@ $("#r-report-profile").onchange = () => {
     const payload = reportMetaPayload();
     REPORT_BATCH_DATA.forEach((reportData) => Object.assign(reportData.sample, payload));
     renderPrintTickets();
-    $("#final-ticket").innerHTML = combinedFinalTicketHtml(REPORT_BATCH_DATA);
+    $("#final-ticket").innerHTML = finalTicketHtml(REPORT_BATCH_DATA);
   });
 });
 $("#r-excel-export").onclick = () => {
@@ -3983,7 +4315,7 @@ function addTemplatePrepRow(prep = {}, afterRow = null) {
   wireDilutionChain(row.querySelector(".dilution-chain"));
   row.querySelector(".copy-row").onclick = () => addTemplatePrepRow(templatePrepData(row), row);
   row.querySelector(".del").onclick = () => row.remove();
-  row.querySelectorAll(".t-solid-only").forEach((cell) => cell.style.display = $("#t-liquid").checked ? "none" : "");
+  row.querySelectorAll(".t-solid-only").forEach((cell) => cell.style.display = $("#t-sample-type").value === "solid" ? "" : "none");
 }
 
 function syncTemplateAnalyteRow(row) {
@@ -4070,9 +4402,13 @@ function renderTemplateEditor(template = null) {
   const reportOrder = (TEMPLATE_INSTRUMENT_MAP.__report_order || []).map(Number);
   const orderedIds = [...reportOrder.filter((id) => selectedIds.includes(id)),
     ...selectedIds.filter((id) => !reportOrder.includes(id))];
+  $("#t-order-template").innerHTML = orderTemplateOptions(
+    template?.order_template_id ?? defaultOrderTemplateId());
   $("#t-editor-title").textContent = template ? `编辑模板 #${template.id}` : "新建样品模板";
   $("#t-name").value = template?.name || "";
-  $("#t-liquid").checked = !!template?.is_liquid;
+  if ($("#t-category")) $("#t-category").value = template?.category || "";
+  if ($("#t-tags")) $("#t-tags").value = templateJson(template?.tags_json, []).map((tag) => `#${tag}`).join(", ");
+  $("#t-sample-type").value = template?.is_water_quality ? "water_quality" : (template?.is_liquid ? "liquid" : "solid");
   $("#t-xrf").checked = !!template?.xrf;
   $("#t-xrf-config").hidden = !template?.xrf;
   $("#t-xrf-text").value = template?.xrf ? xrfReportItems : "";
@@ -4085,8 +4421,8 @@ function renderTemplateEditor(template = null) {
   renderTemplateAnalyteRows();
   $("#t-prep-table tbody").innerHTML = "";
   const preps = template ? getTemplatePreps(template) : [{}];
-  preps.forEach(addTemplatePrepRow);
-  $$(".t-solid-only").forEach((cell) => cell.style.display = $("#t-liquid").checked ? "none" : "");
+  preps.forEach((prep) => addTemplatePrepRow(prep));
+  $$(".t-solid-only").forEach((cell) => cell.style.display = $("#t-sample-type").value === "solid" ? "" : "none");
 }
 
 function collectSettingsTemplate() {
@@ -4110,7 +4446,8 @@ function collectSettingsTemplate() {
   instrument_map.__xrf_analyte_ids = $("#t-xrf").checked
     ? parseAnalyteText(xrfReportItems).matched.map((item) => item.id) : [];
   instrument_map.__report_order = analyte_ids;
-  const isLiquidTemplate = $("#t-liquid").checked;
+  const sampleType = $("#t-sample-type").value;
+  const isLiquidTemplate = sampleType !== "solid";
   const preps = $$("#t-prep-table tbody tr").map((row) => {
     const text = row.querySelector(".tp-analytes").value.trim();
     return {
@@ -4123,8 +4460,12 @@ function collectSettingsTemplate() {
   });
   return {
     name: $("#t-name").value.trim(),
+    category: $("#t-category")?.value.trim() || "",
+    tags: parseSampleTagText($("#t-tags")?.value || ""),
     is_liquid: isLiquidTemplate ? 1 : 0,
+    is_water_quality: sampleType === "water_quality" ? 1 : 0,
     xrf: $("#t-xrf").checked ? 1 : 0,
+    order_template_id: +$("#t-order-template").value || null,
     dilution_id: preps[0]?.dilution_id || null,
     analyte_ids, preps, instrument_map,
   };
@@ -4189,6 +4530,22 @@ function preparationCombinationSummary(combination) {
   }).join("；");
 }
 
+function openCapEditor(iid) {
+  const ins = META.instruments.find((x) => x.id === iid);
+  const body = $("#cap-" + iid);
+  if (!ins || !body) return;
+  body.innerHTML = META.analytes.map((a) =>
+    `<label class="inline" style="margin-right:8px">
+      <input type="checkbox" value="${a.id}" ${ins.analytes.includes(a.id) ? "checked" : ""}> ${a.name}</label>`
+  ).join("") + `<button class="cap-save" data-iid="${iid}">保存</button>`;
+  body.style.display = "";
+  body.querySelector(".cap-save").onclick = async (e) => {
+    const ids = [...body.querySelectorAll("input:checked")].map((c) => +c.value);
+    await api(`/api/instruments/${e.target.dataset.iid}/capabilities`, "PUT", { analyte_ids: ids });
+    loadMeta();
+  };
+}
+
 function renderSettings() {
   $("#rp-table tbody").innerHTML = (META.report_profiles || []).map((profile) => `<tr data-rpid="${profile.id}">
     <td><input class="rp-row-name" value="${esc(profile.name)}"></td>
@@ -4216,7 +4573,18 @@ function renderSettings() {
   $("#rot-table tbody").innerHTML = (META.result_order_templates || []).map((template) =>
     `<tr data-rotid="${template.id}"><td><input class="rot-row-name" value="${esc(template.name)}"></td>` +
     `<td><input class="rot-row-items" value="${esc((template.items || []).join(", "))}"></td>` +
+    `<td><input class="rot-default" type="radio" name="rot-default" title="设为系统默认顺序" ${template.is_default ? "checked" : ""}></td>` +
     '<td class="actions"><button class="rot-save" type="button">保存</button><button class="del rot-delete" type="button">删除</button></td></tr>').join("");
+  $$("#rot-table .rot-default").forEach((radio) => radio.onchange = async () => {
+    if (!radio.checked) return;
+    const row = radio.closest("tr");
+    const result = await api(`/api/result-order-templates/${row.dataset.rotid}`, "PUT", {
+      name: row.querySelector(".rot-row-name").value.trim(),
+      items: resultOrderItems(row.querySelector(".rot-row-items").value),
+      is_default: true,
+    });
+    if (result.ok) await loadMeta(); else radio.checked = false;
+  });
   $$("#rot-table .rot-save").forEach((button) => button.onclick = async () => {
     const row = button.closest("tr");
     const result = await api(`/api/result-order-templates/${row.dataset.rotid}`, "PUT", {
@@ -4226,18 +4594,25 @@ function renderSettings() {
     if (result.ok) await loadMeta();
   });
   $$("#rot-table .rot-delete").forEach((button) => button.onclick = async () => {
-    if (!confirm("确定删除这个结果元素顺序模板？历史导出文件不受影响。")) return;
+    if (!confirm("确定删除这个通用顺序模板？使用它的样品和模板将改用系统默认顺序。")) return;
     const result = await api(`/api/result-order-templates/${button.closest("tr").dataset.rotid}`, "DELETE");
     if (result.ok) await loadMeta();
   });
-  // 项目
+  // 项目（顺序由系统默认通用顺序模板控制，不再逐项移动）
+  const unitOptions = (current) => [["", "自动"], ["%", "%"], ["ppm", "ppm"], ["ppb", "ppb"],
+    ["g/L", "g/L"], ["mg/L", "mg/L"], ["ug/L", "ug/L"]].map(([value, label]) =>
+      `<option value="${value}" ${value === (current || "") ? "selected" : ""}>${label}</option>`).join("");
   $("#a-list").innerHTML = META.analytes.map((a) =>
-    `<span class="tag order-tag"><button class="order-up" type="button" data-aid="${a.id}" title="上移">↑</button><button class="order-down" type="button" data-aid="${a.id}" title="下移">↓</button>${esc(a.name)}<button class="del" data-aid="${a.id}">×</button></span>`).join("");
-  $$("#a-list .order-up").forEach((b) => b.onclick = () => moveMetaOrder("analytes", b.dataset.aid, -1));
-  $$("#a-list .order-down").forEach((b) => b.onclick = () => moveMetaOrder("analytes", b.dataset.aid, 1));
+    `<span class="tag analyte-unit-tag"><b>${esc(a.name)}</b><select class="analyte-default-unit" data-aid="${a.id}" title="默认结果单位">${unitOptions(a.default_unit)}</select><button class="del" data-aid="${a.id}">×</button></span>`).join("");
+  $$("#a-list .analyte-default-unit").forEach((select) => select.onchange = async () => {
+    const result = await api("/api/analytes/" + select.dataset.aid, "PUT", { default_unit: select.value });
+    if (result.ok) await loadMeta();
+  });
   $$("#a-list .del").forEach((b) => b.onclick = async () => {
     await api("/api/analytes/" + b.dataset.aid, "DELETE"); loadMeta();
   });
+  $("#sample-tag-settings").innerHTML = (META.sample_tags || []).map((tag) =>
+    `<span class="tag sample-tag-summary">#${esc(tag.name)} <small>${tag.count} 个样品</small></span>`).join("") || '<span class="hint">当前没有样品标签</span>';
   // 定容容量
   $("#vp-list").innerHTML = (META.volume_presets || []).filter((item) => item.active).map((item) =>
     `<span class="tag">${+item.volume_ml} mL${+item.volume_ml === +(META.default_volume_ml || 250)
@@ -4289,20 +4664,19 @@ function renderSettings() {
   });
   $$("#i-list .cap-edit").forEach((b) => b.onclick = () => {
     const iid = +b.dataset.iid;
-    const ins = META.instruments.find((x) => x.id === iid);
     const body = $("#cap-" + iid);
-    if (body.style.display !== "none") { body.style.display = "none"; return; }
-    body.innerHTML = META.analytes.map((a) =>
-      `<label class="inline" style="margin-right:8px">
-        <input type="checkbox" value="${a.id}" ${ins.analytes.includes(a.id) ? "checked" : ""}> ${a.name}</label>`
-    ).join("") + `<button class="cap-save" data-iid="${iid}">保存</button>`;
-    body.style.display = "";
-    body.querySelector(".cap-save").onclick = async (e) => {
-      const ids = [...body.querySelectorAll("input:checked")].map((c) => +c.value);
-      await api(`/api/instruments/${e.target.dataset.iid}/capabilities`, "PUT", { analyte_ids: ids });
-      loadMeta();
-    };
+    if (body.style.display !== "none") {
+      OPEN_CAP_IIDS.delete(iid);
+      body.style.display = "none";
+      return;
+    }
+    OPEN_CAP_IIDS.add(iid);
+    openCapEditor(iid);
   });
+  for (const iid of [...OPEN_CAP_IIDS]) {
+    if (META.instruments.some((x) => x.id === iid)) openCapEditor(iid);
+    else OPEN_CAP_IIDS.delete(iid);
+  }
   // 分析方法
   $("#m-table tbody").innerHTML = META.methods.map((m) =>
     `<tr class="${m.active === 0 ? "method-inactive" : ""}"><td><label class="method-active-toggle"><input class="m-row-active" type="checkbox" ${m.active !== 0 ? "checked" : ""}><span>${m.active !== 0 ? "启用" : "停用"}</span></label></td><td>${m.itype === "xrf" ? "XRF" : "公式"}</td><td>${esc(m.name)}</td><td>${m.itype === "xrf" ? "—" : `<select class="m-row-unit"><option value="%" ${m.output_unit === "%" ? "selected" : ""}>%</option><option value="ppm" ${m.output_unit === "ppm" ? "selected" : ""}>ppm</option><option value="ppb" ${m.output_unit === "ppb" ? "selected" : ""}>ppb</option><option value="mol/L" ${m.output_unit === "mol/L" ? "selected" : ""}>mol/L</option><option value="g/L" ${m.output_unit === "g/L" ? "selected" : ""}>g/L</option></select>`}</td><td><code>${esc(m.formula || "—")}</code></td>
@@ -4332,7 +4706,10 @@ function renderSettings() {
     const regularCount = templateJson(t.analyte_ids, []).length;
     const xrfCount = String(instruments.__xrf_report_items || "")
       .split(/[,，、;；\s]+/).filter(Boolean).length;
-    return `<tr><td>${esc(t.name)}</td><td>${t.is_liquid ? "液体" : "固体"}${t.xrf ? ` / XRF${xrfMethod ? `：${esc(xrfMethod.name)}` : "（未选方法）"}` : ""}</td>
+    const orderTemplate = (META.result_order_templates || []).find((item) => item.id === t.order_template_id);
+    const templateTags = templateJson(t.tags_json, []);
+    return `<tr><td><b>${esc(t.name)}</b>${t.category || templateTags.length ? `<small class="template-sample-defaults">${t.category ? `样品：${esc(t.category)}` : ""}${templateTags.length ? ` ${templateTags.map((tag) => `#${esc(tag)}`).join(" ")}` : ""}</small>` : ""}</td><td>${t.is_water_quality ? "水质" : (t.is_liquid ? "液体" : "固体")}${t.xrf ? ` / XRF${xrfMethod ? `：${esc(xrfMethod.name)}` : "（未选方法）"}` : ""}</td>
+      <td>${esc(orderTemplate?.name || "系统默认")}</td>
       <td>${t.xrf ? `常规 ${regularCount} / XRF ${xrfCount}` : regularCount}</td><td>${preps.length} 路</td>
       <td>${Object.keys(instruments).filter((key) => !key.startsWith("__")).length}</td>
       <td class="actions"><button class="t-edit" data-tid="${t.id}">编辑</button><button class="del" data-tid="${t.id}">删除</button></td></tr>`;
@@ -4449,8 +4826,8 @@ $("#t-add").onclick = async () => {
 $("#t-prep-add").onclick = () => addTemplatePrepRow();
 $("#t-analyte-text").oninput = renderTemplateAnalyteRows;
 $("#t-xrf-text").oninput = renderTemplateXrfChips;
-$("#t-liquid").onchange = () => {
-  $$(".t-solid-only").forEach((cell) => cell.style.display = $("#t-liquid").checked ? "none" : "");
+$("#t-sample-type").onchange = () => {
+  $$(".t-solid-only").forEach((cell) => cell.style.display = $("#t-sample-type").value === "solid" ? "" : "none");
 };
 $("#t-xrf").onchange = () => {
   $("#t-xrf-config").hidden = !$("#t-xrf").checked;
@@ -4743,6 +5120,7 @@ window.addEventListener("keydown", (event) => {
   $("#s-excel-date-from").value = `${today.slice(0, 8)}01`;
   const initialStatus = await refreshSiteStatus();
   APPLIED_COLLAB_REVISION = +(initialStatus?.revision || 0);
+  startCollaborationStream();
   if (!await loadMeta()) return;
   await loadSamples();
   const params = new URLSearchParams(window.location.search);

@@ -8,7 +8,7 @@ from flask import g, request
 
 SAMPLE_STATUS_LABELS = {
     "received": "未制样",
-    "queued": "已制样 / 未测量",
+    "queued": "未测量",
     "measuring": "测量中",
     "partially_done": "测量中",
     "completed": "待审核",
@@ -45,9 +45,9 @@ _AUDIT_MISSING = object()
 _AUDIT_IGNORED_FIELDS = {"id", "created_at", "updated_at", "sample_status",
                          "status_operator", "status_action", "status_changed_at"}
 _AUDIT_FIELD_LABELS = {
-    "name": "来样序号", "sample_id": "LIMS 样品", "itype": "数据类型", "category": "样品名称", "is_liquid": "样品形态", "xrf": "XRF",
+    "name": "来样序号", "sample_id": "LIMS 样品", "itype": "数据类型", "category": "样品名称", "is_liquid": "样品形态", "density_g_ml": "液体密度", "xrf": "XRF",
     "xrf_method_id": "XRF 方法", "xrf_report_items": "XRF 报告项目",
-    "status": "状态",     "report_order": "报告元素顺序", "report_excludes": "打印排除元素", "customer": "来样单位",
+    "status": "状态", "tags": "样品标签", "report_order": "报告元素顺序", "report_excludes": "打印排除元素", "result_units": "结果显示单位", "customer": "来样单位",
     "report_no": "报告编号", "analysis_date": "分析日期", "analyst": "分析人",
     "reviewer": "审核人", "mass_g": "称样(g)", "volume_ml": "定容(mL)",
     "dilution_id": "稀释方式", "dilution_steps": "多级稀释", "dilution_factor": "稀释总倍数",
@@ -57,7 +57,7 @@ _AUDIT_FIELD_LABELS = {
     "aux": "辅助数据", "expected": "标称", "measured": "回读", "use": "带标",
     "use_avg": "参与计算", "is_final": "旧终值标记", "active": "启用状态",
     "role": "旧角色", "permissions": "能力", "display_name": "显示名称", "formula": "公式", "constants": "固定常数",
-    "output_unit": "输出单位",
+    "output_unit": "输出单位", "default_unit": "默认单位",
     "note": "备注", "factor": "倍数", "aliquot_ml": "移取体积(mL)",
     "final_volume_ml": "再次定容(mL)", "analyte_ids": "测定项目",
     "sort_order": "排序",

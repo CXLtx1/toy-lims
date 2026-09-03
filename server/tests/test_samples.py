@@ -39,6 +39,20 @@ class SampleApiTest(unittest.TestCase):
         self.assertEqual([sid], [s["id"] for s in self.client.get(
             f"/api/samples?q=%23{sid}&limit=20").get_json()])
 
+    def test_sample_tags_are_saved_suggested_and_filtered_with_and_semantics(self):
+        first = self.client.post("/api/samples", json={
+            "name": "标签样一", "tags": ["#实验样", "二组"], "preps": [],
+        }).get_json()["id"]
+        self.client.post("/api/samples", json={
+            "name": "标签样二", "tags": ["实验样"], "preps": [],
+        })
+        detail = self.client.get(f"/api/samples/{first}").get_json()
+        self.assertEqual(["二组", "实验样"], detail["sample"]["tags"])
+        filtered = self.client.get("/api/samples?tag=实验样&tag=二组").get_json()
+        self.assertEqual([first], [sample["id"] for sample in filtered])
+        tags = {item["name"]: item["count"] for item in self.client.get("/api/meta").get_json()["sample_tags"]}
+        self.assertEqual({"二组": 1, "实验样": 2}, tags)
+
     def test_update_preserves_unchanged_task_and_result(self):
         sid, aid, dilution_id = self.create_sample()
         detail = self.client.get(f"/api/samples/{sid}").get_json()
@@ -64,8 +78,9 @@ class SampleApiTest(unittest.TestCase):
         self.assertTrue(response.get_json()["ok"])
         updated = self.client.get(f"/api/samples/{sid}").get_json()
         self.assertEqual("Batch-001-revised", updated["sample"]["name"])
-        self.assertEqual(task["id"], updated["items"][0]["id"])
-        self.assertEqual(12.5, updated["items"][0]["raw"])
+        updated_task = next(item for item in updated["items"] if item["analyte_id"] == aid)
+        self.assertEqual(task["id"], updated_task["id"])
+        self.assertEqual(12.5, updated_task["raw"])
         self.assertEqual({aid, added_aid}, {item["analyte_id"] for item in updated["items"]})
 
     def test_ratio_dilution_and_report_metadata(self):
@@ -148,6 +163,14 @@ class SampleApiTest(unittest.TestCase):
             "constants": {}, "output_unit": "kg/L",
         })
         self.assertEqual(400, bad_unit.status_code)
+
+    def test_back_standard_uses_expected_over_measured(self):
+        self.assertAlmostEqual(10 / 9.8, lims.aux_coefficient({
+            "use": True, "expected": 10, "measured": 9.8,
+        }))
+        self.assertEqual(1, lims.aux_coefficient({
+            "use": False, "expected": 10, "measured": 9.8,
+        }))
 
     def test_methods_can_be_reordered_for_picker(self):
         methods = self.client.get("/api/meta").get_json()["methods"]
@@ -262,7 +285,7 @@ class SampleApiTest(unittest.TestCase):
         self.assertTrue(restored.get_json()["restored"])
         self.assertEqual(preset["id"], restored.get_json()["id"])
 
-    def test_sample_type_filter_keeps_solid_and_liquid_separate(self):
+    def test_sample_type_filter_keeps_solid_liquid_and_water_separate(self):
         self.create_sample()
         aid = next(a["id"] for a in self.meta["analytes"] if a["name"] == "Ag")
         dilution_id = self.meta["dilutions"][0]["id"]
@@ -273,12 +296,44 @@ class SampleApiTest(unittest.TestCase):
                 "analyte_ids": [aid],
             }],
         }).get_json()["id"]
+        water = self.client.post("/api/samples", json={
+            "name": "水质样", "category": "污水处理站", "is_water_quality": 1,
+            "preps": [{
+                "name": "水质样*1", "dilution_id": dilution_id,
+                "analyte_ids": [aid],
+            }],
+        })
+        self.assertEqual(200, water.status_code, water.get_data(as_text=True))
+        water_id = water.get_json()["id"]
+        water_detail = self.client.get(f"/api/samples/{water_id}").get_json()
+        self.assertEqual(1, water_detail["sample"]["is_water_quality"])
+        self.assertEqual(1, water_detail["sample"]["is_liquid"])
+        self.assertIsNone(water_detail["preps"][0]["mass_g"])
+        self.assertIsNone(water_detail["preps"][0]["volume_ml"])
         solids = self.client.get("/api/samples?type=solid").get_json()
         liquids = self.client.get("/api/samples?type=liquid").get_json()
+        waters = self.client.get("/api/samples?type=water_quality").get_json()
         self.assertTrue(solids)
         self.assertTrue(all(not sample["is_liquid"] for sample in solids))
         self.assertEqual([liquid], [sample["id"] for sample in liquids])
+        self.assertEqual([water_id], [sample["id"] for sample in waters])
 
+        template = self.client.post("/api/templates", json={
+            "name": "水质模板", "is_water_quality": 1, "analyte_ids": [aid],
+            "preps": [], "instrument_map": {},
+        })
+        self.assertEqual(200, template.status_code, template.get_data(as_text=True))
+        saved_template = next(item for item in self.client.get("/api/meta").get_json()["templates"]
+                              if item["id"] == template.get_json()["id"])
+        self.assertEqual(1, saved_template["is_water_quality"])
+        self.assertEqual(1, saved_template["is_liquid"])
+
+    def test_water_quality_cannot_use_special_workflow(self):
+        response = self.client.post("/api/samples", json={
+            "name": "错误水质样", "workflow_type": "special", "is_water_quality": 1,
+        })
+        self.assertEqual(400, response.status_code)
+        self.assertIn("水质样", response.get_json()["error"])
 
 if __name__ == "__main__":
     unittest.main()
