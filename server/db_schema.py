@@ -781,6 +781,8 @@ def initialize_database(database):
         db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_sample_analyte_direct
             ON sample_analytes(sample_id, analyte_id)
             WHERE preparation_id IS NULL""")
+        db.execute("""CREATE INDEX IF NOT EXISTS idx_audit_logs_entity
+            ON audit_logs(entity_type, entity_id, action)""")
         _enforce_single_xrf_analysis(db)
         _seed_reference_data(db)
         _ensure_default_order_template(db)
@@ -1080,6 +1082,8 @@ def initialize_database(database):
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_sample_analyte_direct
         ON sample_analytes(sample_id, analyte_id)
         WHERE preparation_id IS NULL""")
+    db.execute("""CREATE INDEX IF NOT EXISTS idx_audit_logs_entity
+        ON audit_logs(entity_type, entity_id, action)""")
     _seed_reference_data(db)
     order_template_cols = [r[1] for r in db.execute("PRAGMA table_info(result_order_templates)")]
     if "is_default" not in order_template_cols:

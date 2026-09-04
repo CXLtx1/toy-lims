@@ -155,7 +155,10 @@ def disable_api_cache(response):
 
 @app.after_request
 def invalidate_report_payload_cache(response):
-    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+    # XRF 客户端的每 5 秒心跳/同步也走 POST，但不会改已关联样品的报告数据；
+    # 导入端点在真正重写关联样品数据时会自行调用 _report_cache_note_write。
+    if request.method not in {"GET", "HEAD", "OPTIONS"} \
+            and not request.path.startswith("/api/instrument/xrf/"):
         _report_cache_note_write()
     return response
 
@@ -781,6 +784,9 @@ def sse_events():
     """SSE 推送：audit_logs 最大 id 变化（即服务器 revision 变化）时通知浏览器刷新。"""
     def generate():
         connection = connect_database(DB)
+        # 只读单语句轮询，必须 autocommit：否则连接终身 idle in transaction，
+        # 长期持有旧快照，阻止 VACUUM 回收 audit_logs 死元组。
+        connection.autocommit = True
         last_revision = None
         idle_ticks = 0
         try:
@@ -3365,6 +3371,29 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
     job = data.get("job") if isinstance(data.get("job"), dict) else {}
     remark = _uq_options_remark(options, job) if kind == "uq" else str(data.get("remark") or "").strip()
     old_sample_id = existing["sample_id"] if existing else None
+    defaults = {part.strip().casefold() for part in re.split(
+        r"[,，、;；\s]+", linked_sample["xrf_report_items"] or "") if part.strip()} if linked_sample else set()
+    if linked_sample:
+        defaults |= {target["target"].casefold() for target in
+                     _load_xrf_targets(db, linked_sample["id"]) if target["include"]}
+    # 幂等去重：OXSAS 客户端会反复上传同一份扫描，内容完全一致时直接确认返回，
+    # 不重写 xrf_values、不写审计、不打掉报告缓存。否则重导会清空网页端 use_report 勾选。
+    if existing and str(existing["kind"] or "") == str(kind or ""):
+        current_values = {
+            row["name"]: (row["value"], row["alt_name"] or "", int(bool(row["use_report"])))
+            for row in db.execute("SELECT name,value,alt_name,use_report FROM xrf_values WHERE analysis_id=?",
+                                  (existing["id"],))
+        }
+        incoming_values = {
+            name: (value, alt_name, int(name.casefold() in defaults))
+            for name, (value, alt_name) in clean_results.items()
+        }
+        if current_values == incoming_values:
+            return {"ok": True, "duplicate": True, "analysis_id": existing["id"],
+                    "matched": linked_sample is not None,
+                    "sample_id": linked_sample["id"] if linked_sample else None,
+                    "sample_locked": False, "manual_assignment_required": linked_sample is None,
+                    "imported": [], "skipped": list(skipped.values())}, 200
     db.execute("""INSERT INTO xrf_analyses(
         sample_id,sample_name,external_id,method,batch,analyzed_at,source,kind,remark,options_json)
         VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,external_id) DO UPDATE SET
@@ -3376,11 +3405,6 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
         data.get("analyzed_at"), source, kind, remark, json.dumps(options, ensure_ascii=False)))
     analysis = db.execute("SELECT * FROM xrf_analyses WHERE source=? AND external_id=?",
                           (source, external_id)).fetchone()
-    defaults = {part.strip().casefold() for part in re.split(
-        r"[,，、;；\s]+", linked_sample["xrf_report_items"] or "") if part.strip()} if linked_sample else set()
-    if linked_sample:
-        defaults |= {target["target"].casefold() for target in
-                     _load_xrf_targets(db, linked_sample["id"]) if target["include"]}
     db.execute("DELETE FROM xrf_values WHERE analysis_id=?", (analysis["id"],))
     imported = []
     for name, (value, alt_name) in clean_results.items():
@@ -3391,6 +3415,7 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
                          "xrf_value_id": cur.lastrowid})
     for affected in {old_sample_id, linked_sample["id"] if linked_sample else None} - {None}:
         recompute_sample_progress(db, affected)
+        _report_cache_note_write()
     audit_event(db, "instrument_import", "xrf_analysis", analysis["id"], after={
         "source": source, "external_id": external_id,
         "sample_id": linked_sample["id"] if linked_sample else None,
