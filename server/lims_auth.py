@@ -1,6 +1,7 @@
 """首次初始化、终端登录、用户授权、能力权限和审计查询。"""
 
 import json
+import secrets
 import time
 from functools import wraps
 
@@ -174,20 +175,34 @@ def load_user():
     db = get_db()
     personal_user_id = session.get("personal_user_id")
     if personal_user_id:
-        g.terminal = {"id": None, "name": "个人终端", "kind": "personal", "active": 1}
-        g.user = db.execute(
-            "SELECT id,username,display_name,role,permissions,active FROM users WHERE id=? AND active=1",
+        user = db.execute(
+            "SELECT id,username,display_name,role,permissions,active,session_token FROM users WHERE id=? AND active=1",
             (personal_user_id,)).fetchone()
-        if not g.user:
+        if not user:
             session.clear()
             g.terminal = None
+            return
+        if (session.get("session_token") or "") != (user["session_token"] or ""):
+            # 该账号已在其他设备登录，本会话被顶下线。
+            session.clear()
+            g.terminal = None
+            g.session_kicked = True
+            return
+        g.terminal = {"id": None, "name": "个人终端", "kind": "personal", "active": 1}
+        g.user = user
         return
     terminal_id = session.get("terminal_id")
     g.terminal = db.execute(
-        "SELECT id,name,kind,active FROM terminals WHERE id=? AND active=1",
+        "SELECT id,name,kind,active,session_token FROM terminals WHERE id=? AND active=1",
         (terminal_id,)).fetchone() if terminal_id else None
     g.user = None
     if not g.terminal:
+        return
+    if (session.get("session_token") or "") != (g.terminal["session_token"] or ""):
+        # 该终端已在其他设备登录，本会话被顶下线。
+        session.clear()
+        g.terminal = None
+        g.session_kicked = True
         return
     if g.terminal["kind"] == "admin":
         g.user = {"id": None, "username": f"terminal:{g.terminal['name']}",
@@ -230,6 +245,10 @@ def login_required_before_request():
     if endpoint in {"auth.login", "auth.setup"}:
         return None
     if not g.terminal:
+        if getattr(g, "session_kicked", False):
+            if request.path.startswith("/api/"):
+                return jsonify(ok=False, error="该登录已在其他设备使用，本机已下线"), 401
+            return redirect(url_for("auth.login", kicked=1))
         if request.path.startswith("/api/"):
             return jsonify(ok=False, error="终端登录已失效，请重新登录"), 401
         return redirect(url_for("auth.login", next=request.full_path))
@@ -338,21 +357,36 @@ def login():
                     not _check_password(db, terminal, password, "terminal")):
                 error = "终端或密码不正确"
         if not error:
+            session_token = secrets.token_hex(16)
+            actor = user or {"id": None, "username": f"terminal:{terminal['name']}"}
             session.clear()
             if login_kind == "personal":
+                previous_token = user["session_token"] or ""
                 session["personal_user_id"] = user["id"]
+                session["session_token"] = session_token
+                db.execute("UPDATE users SET session_token=? WHERE id=?",
+                           (session_token, user["id"]))
+                entity_id = user["id"]
             else:
+                previous_token = terminal["session_token"] or ""
                 session["terminal_id"] = terminal["id"]
+                session["session_token"] = session_token
+                db.execute("UPDATE terminals SET session_token=? WHERE id=?",
+                           (session_token, terminal["id"]))
+                entity_id = terminal["id"]
+            if previous_token and previous_token != session_token:
+                audit_event(db, "session_replaced", "session", entity_id, user=actor,
+                            reason="该登录在其他设备使用，原会话下线")
             g.terminal = terminal
             g.user = user if login_kind == "personal" else None
-            actor = user or {"id": None, "username": f"terminal:{terminal['name']}"}
-            audit_event(db, "login", "session", terminal["id"] or user["id"], user=actor)
+            audit_event(db, "login", "session", entity_id, user=actor)
             db.commit()
             return redirect(url_for("index"))
     return render_template("login.html", error=error, terminals=terminals,
                            selected_terminal_id=request.form.get("terminal_id", type=int),
                            selected_terminal_kind=request.form.get("terminal_kind", ""),
-                           username=request.form.get("username", "").strip())
+                           username=request.form.get("username", "").strip(),
+                           kicked=request.args.get("kicked"))
 
 
 @bp.route("/logout", methods=["GET", "POST"])
@@ -360,6 +394,14 @@ def logout():
     if getattr(g, "terminal", None):
         db = get_db()
         audit_event(db, "logout", "session", g.terminal["id"])
+        token = session.get("session_token") or ""
+        if token:
+            if g.terminal["id"]:
+                db.execute("UPDATE terminals SET session_token='' WHERE id=? AND session_token=?",
+                           (g.terminal["id"], token))
+            elif g.user and g.user["id"]:
+                db.execute("UPDATE users SET session_token='' WHERE id=? AND session_token=?",
+                           (g.user["id"], token))
         db.commit()
     session.clear()
     return redirect(url_for("auth.login"))
@@ -486,7 +528,7 @@ def update_user(user_id):
     db.execute("""UPDATE users SET username=?,display_name=?,role='custom',permissions=?,active=?
         WHERE id=?""", (username, display_name, json.dumps(sorted(permissions)), active, user_id))
     if password:
-        db.execute("UPDATE users SET password_hash=? WHERE id=?",
+        db.execute("UPDATE users SET password_hash=?,session_token='' WHERE id=?",
                    (hash_password(password), user_id))
     after = db.execute("SELECT id,username,display_name,role,permissions,active FROM users WHERE id=?",
                        (user_id,)).fetchone()
@@ -562,7 +604,7 @@ def update_terminal(terminal_id):
         updated_at=datetime('now','localtime') WHERE id=?""",
         (name, kind, active, terminal_id))
     if password:
-        db.execute("""UPDATE terminals SET password_hash=?,
+        db.execute("""UPDATE terminals SET password_hash=?,session_token='',
             updated_at=datetime('now','localtime') WHERE id=?""",
             (hash_password(password), terminal_id))
     after = db.execute("SELECT id,name,kind,active FROM terminals WHERE id=?",

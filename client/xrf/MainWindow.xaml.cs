@@ -10,6 +10,7 @@ namespace ToyLims.XrfClient;
 public sealed class ClientConfig
 {
     public string LimsUrl { get; set; } = "http://127.0.0.1:5000";
+    public string InstrumentToken { get; set; } = "";
     public string OxsasServer { get; set; } = ".";
     public int AutoReadDays { get; set; } = 2;
     public int MaxRecentScans { get; set; } = 50;
@@ -90,7 +91,7 @@ public partial class MainWindow : Window
     private LimsApiClient CreateLimsClient()
     {
         _limsClient?.Dispose();
-        _limsClient = new LimsApiClient(_config.LimsUrl, "");
+        _limsClient = new LimsApiClient(_config.LimsUrl, _config.InstrumentToken);
         return _limsClient;
     }
 

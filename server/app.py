@@ -40,6 +40,12 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 BASE_DIR = Path(__file__).resolve().parent
 
+# 反向代理部署时设 LIMS_TRUST_PROXY=1：request.remote_addr 改读 X-Forwarded-For，
+# 审计、请求日志和仪器页才能显示真实来源 IP；直连部署不要开启（头可被伪造）。
+if os.environ.get("LIMS_TRUST_PROXY", "").strip() in {"1", "true", "yes"}:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+
 # 请求日志开关：设为 False 后不创建日志目录，也不写请求日志。
 REQUEST_LOG_ENABLED = False
 
@@ -62,6 +68,9 @@ POSTGRES_CONFIG = {
 SQLITE_DB = os.environ.get("LIMS_DB", str(BASE_DIR / "lims.db"))
 DB = os.environ.get("LIMS_DATABASE_URL") or (
     postgres_dsn(POSTGRES_CONFIG) if DATABASE_BACKEND == "postgresql" else SQLITE_DB)
+# 仪器客户端设备令牌：可直接写在这里（内网部署），环境变量优先。
+XRF_CLIENT_TOKEN = os.environ.get("LIMS_XRF_CLIENT_TOKEN", "").strip() or ""
+STANDARD_CLIENT_TOKEN = os.environ.get("LIMS_STANDARD_CLIENT_TOKEN", "").strip() or ""
 LOG_DIR = Path(os.environ.get("LIMS_LOG_DIR", str(BASE_DIR / "logs")))
 REQUEST_LOGGER = logging.getLogger("toy_lims.requests")
 if REQUEST_LOG_ENABLED and not REQUEST_LOGGER.handlers:
@@ -96,7 +105,7 @@ def xrf_client_required(view):
         remote = request.remote_addr or ""
         if remote in {"127.0.0.1", "::1"}:
             return view(*args, **kwargs)
-        expected = os.environ.get("LIMS_XRF_CLIENT_TOKEN", "").strip()
+        expected = XRF_CLIENT_TOKEN
         supplied = request.headers.get("X-Instrument-Token", "").strip()
         if not expected:
             return jsonify(ok=False, error="服务端尚未配置 LIMS_XRF_CLIENT_TOKEN"), 503
@@ -115,7 +124,7 @@ def standard_client_required(view):
         remote = request.remote_addr or ""
         if remote in {"127.0.0.1", "::1"}:
             return view(*args, **kwargs)
-        expected = os.environ.get("LIMS_STANDARD_CLIENT_TOKEN", "").strip()
+        expected = STANDARD_CLIENT_TOKEN
         supplied = request.headers.get("X-Instrument-Token", "").strip()
         if not expected:
             return jsonify(ok=False, error="服务端尚未配置 LIMS_STANDARD_CLIENT_TOKEN"), 503
@@ -1840,18 +1849,22 @@ def add_method():
     note = str(d.get("note", "")).strip()
     if len(note) > 2000:
         return jsonify(ok=False, error="方法说明不能超过 2000 个字符"), 400
+    target = str(d.get("target", "")).strip()
+    if len(target) > 40:
+        return jsonify(ok=False, error="检测对象不能超过 40 个字符"), 400
     output_unit = str(d.get("output_unit") or "%").strip()
     if output_unit not in METHOD_OUTPUT_UNITS:
         return jsonify(ok=False, error="公式输出单位无效"), 400
     db = get_db()
     if itype == "xrf":
         f, constants, output_unit = "", {}, "%"
-    cur = db.execute("""INSERT INTO methods(name,itype,formula,constants,note,output_unit,sort_order)
-                      VALUES(?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM methods),1))""",
-                     (d["name"].strip(), itype, f, json.dumps(constants), note, output_unit))
+    cur = db.execute("""INSERT INTO methods(name,itype,formula,constants,note,output_unit,target,sort_order)
+                      VALUES(?,?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM methods),1))""",
+                     (d["name"].strip(), itype, f, json.dumps(constants), note, output_unit, target))
     audit_event(db, "create", "method", cur.lastrowid,
                 after={"name": d["name"].strip(), "itype": itype,
-                        "formula": f, "constants": constants, "output_unit": output_unit})
+                        "formula": f, "constants": constants, "output_unit": output_unit,
+                        "target": target})
     db.commit()
     return jsonify(ok=True)
 
@@ -1872,12 +1885,17 @@ def update_method_note(mid):
         return jsonify(ok=False, error="公式输出单位无效"), 400
     if before["itype"] == "xrf":
         output_unit = "%"
+        target = str(before["target"] or "")
+    else:
+        target = str(data.get("target", before["target"]) or "").strip()
+        if len(target) > 40:
+            return jsonify(ok=False, error="检测对象不能超过 40 个字符"), 400
     try:
         active = 1 if int(data.get("active", before["active"])) else 0
     except (TypeError, ValueError):
         return jsonify(ok=False, error="启用状态无效"), 400
-    db.execute("UPDATE methods SET note=?,output_unit=?,active=? WHERE id=?",
-               (note, output_unit, active, mid))
+    db.execute("UPDATE methods SET note=?,output_unit=?,active=?,target=? WHERE id=?",
+               (note, output_unit, active, target, mid))
     audit_event(db, "update", "method", mid, before=before,
                 after=db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone())
     db.commit()

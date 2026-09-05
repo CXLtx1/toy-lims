@@ -64,7 +64,17 @@ def main():
     threads = max(int(os.environ.get("LIMS_THREADS", "32")), 8)
     print(f"toy-lims 正式服务启动：http://{host}:{port}", flush=True)
     threading.Thread(target=warm_report_cache, name="lims-report-warmup", daemon=True).start()
-    serve(lims.app, host=host, port=port, threads=threads)
+    trust_proxy = os.environ.get("LIMS_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes"}
+    if trust_proxy:
+        # waitress 3.x 默认剥离“不可信来源”的 X-Forwarded-* 头（clear_untrusted_proxy_headers），
+        # 且 trusted_proxy_headers 默认只放行 x-forwarded-proto；反代部署时必须显式信任本机
+        # nginx 转发来的 X-Forwarded-For/Proto，否则 app.py 里的 ProxyFix 拿不到 XFF，
+        # 审计记录的 IP 永远是 127.0.0.1。
+        serve(lims.app, host=host, port=port, threads=threads,
+              trusted_proxy="127.0.0.1,::1",
+              trusted_proxy_headers={"x-forwarded-for", "x-forwarded-proto"})
+    else:
+        serve(lims.app, host=host, port=port, threads=threads)
 
 
 if __name__ == "__main__":

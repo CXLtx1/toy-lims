@@ -477,8 +477,15 @@ class TerminalAuthenticationTest(unittest.TestCase):
         admin_id = self.terminal_id("admin")
         standard_id = self.terminal_id("standard")
         self.client.put(f"/api/terminals/{standard_id}", json={"kind": "standard"})
+        conn = sqlite3.connect(lims.DB)
+        try:
+            token = conn.execute(
+                "SELECT session_token FROM terminals WHERE id=?", (standard_id,)).fetchone()[0]
+        finally:
+            conn.close()
         with self.client.session_transaction() as session:
             session["terminal_id"] = standard_id
+            session["session_token"] = token
             session["authorized_user_id"] = 1
             session["last_write"] = __import__("time").time()
         response = self.client.put(f"/api/terminals/{admin_id}", json={"active": False})

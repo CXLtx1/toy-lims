@@ -5,7 +5,7 @@
 <title>LabFlow · 实验室执行系统</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" href="/static/mes.png?v=20260902">
-<link rel="stylesheet" href="/static/style.css?v=20260903-results-tags-col">
+<link rel="stylesheet" href="/static/style.css?v=20260904-parallel-narrow2">
 </head>
 <body>
 <header>
@@ -119,7 +119,7 @@
       <div class="table-shell prep-shell"><table id="p-table" class="data-grid spreadsheet" tabindex="0">
         <thead><tr>
           <th>溶样名称（可改）</th><th class="solid-only">称样(g)</th><th class="solid-only">定容(mL)</th>
-          <th>稀释（可多级）</th><th>测定项目与仪器分配（横向拖拽）</th><th></th>
+          <th>稀释（可多级）</th><th title="平行份数，大于 1 时自动生成 -1、-2 后缀">平行</th><th>测定项目与仪器分配（横向拖拽）</th><th></th>
         </tr></thead>
         <tbody></tbody>
       </table></div>
@@ -372,7 +372,7 @@
       <div id="t-analytes" class="template-analytes"></div>
       <h3>溶样设置</h3>
       <div class="table-shell prep-shell"><table id="t-prep-table" class="data-grid">
-        <thead><tr><th class="t-solid-only">称样(g)</th><th class="t-solid-only">定容(mL)</th><th>稀释（可多级）</th><th>测定项目</th><th></th></tr></thead>
+        <thead><tr><th class="t-solid-only">称样(g)</th><th class="t-solid-only">定容(mL)</th><th>稀释（可多级）</th><th title="平行份数，大于 1 时自动生成 -1、-2 后缀">平行</th><th>测定项目与仪器分配（点击标签多选，拖到或点击仪器栏）</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div>
       <div class="editor-footer"><button id="t-prep-add" type="button">+ 加一路溶样</button><span class="footer-spacer"></span><button id="t-add" class="primary">保存模板</button></div>
@@ -452,10 +452,11 @@
         <select id="m-output-unit" title="公式计算结果的单位"><option value="%">输出 %</option><option value="ppm">输出 ppm</option><option value="ppb">输出 ppb</option><option value="mol/L">输出 mol/L</option><option value="g/L">输出 g/L</option></select>
         <input id="m-name" placeholder="方法名，如 WUNI0820"><input id="m-formula" placeholder="滴定公式（XRF 方法留空）" style="flex:1">
         <button id="m-add">添加</button></div>
-      <div class="row"><input id="m-constants" placeholder="固定常数，如 A2=10 或 M=65.38">
+      <div class="row"><input id="m-target" placeholder="检测对象，如 Cu（可留空）" style="max-width:200px">
+        <input id="m-constants" placeholder="固定常数，如 A2=10 或 M=65.38">
         <textarea id="m-note" rows="3" placeholder="滴定说明（可自定义，详情弹窗中显示）" style="flex:1"></textarea></div>
       <p class="hint">方法在下表中的顺序，也是来样和模板中方法选择弹窗的显示顺序。</p>
-      <table id="m-table"><thead><tr><th>启用</th><th>类型</th><th>名称</th><th>输出</th><th>公式</th><th>固定常数</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
+      <table id="m-table"><thead><tr><th>启用</th><th>类型</th><th>名称</th><th>检测对象</th><th>输出</th><th>公式</th><th>固定常数</th><th>备注</th><th></th></tr></thead><tbody></tbody></table>
     </div>
     <div class="panel report-profile-panel">
       <h2>报告版式</h2>
@@ -563,7 +564,7 @@
   <section class="method-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="method-picker-title">
     <button id="method-picker-x" class="dialog-x" type="button" aria-label="关闭">×</button>
     <div class="method-picker-heading"><div><span>公式方法</span><h2 id="method-picker-title">选择滴定方法</h2></div><b id="method-picker-count"></b></div>
-    <label class="method-picker-search"><span aria-hidden="true">⌕</span><input id="method-picker-search" type="search" autocomplete="off" placeholder="搜索方法名称、公式或说明"></label>
+    <label class="method-picker-search"><span aria-hidden="true">⌕</span><input id="method-picker-search" type="search" autocomplete="off" placeholder="搜索方法名称或检测对象"></label>
     <div id="method-picker-list" class="method-picker-list"></div>
     <div class="method-picker-footer"><button id="method-picker-clear" type="button">不选择方法</button><span>可在设置页调整显示顺序</span></div>
   </section>
@@ -589,6 +590,6 @@
   </section>
 </div>
 
-<script src="/static/app.js?v=20260903-tags-col-fix"></script>
+<script src="/static/app.js?v=20260904-routing-emit-fix"></script>
 </body>
 </html>

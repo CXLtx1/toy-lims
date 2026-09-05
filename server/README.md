@@ -28,7 +28,75 @@ python server/app.py
 python -m pip install -r server/requirements.txt
 ```
 
-PostgreSQL 连接集中配置在 `app.py` 的 `POSTGRES_CONFIG`，也可用 `LIMS_DATABASE_URL` 覆盖；表结构、旧库升级和种子数据位于 `db_schema.py`，数据库兼容层位于 `db_backend.py`。旧 `lims.db` 仅作迁移源/回退档案，`migrate_to_postgres.py` 默认只迁移 `RY28888` 及其关联业务记录，同时保留全部配置。PostgreSQL 请使用 `pg_dump` 或数据库服务器快照备份。在 `app.py` 中启用 `REQUEST_LOG_ENABLED` 后，请求日志写入 `server/logs/requests.log` 并按日永久保留。
+PostgreSQL 连接集中配置在 `app.py` 的 `POSTGRES_CONFIG`，也可用 `LIMS_DATABASE_URL` 覆盖；表结构、旧库升级和种子数据位于 `db_schema.py`，数据库兼容层位于 `db_backend.py`。旧 `lims.db` 仅作迁移源/回退档案，`migrate_to_postgres.py` 默认只迁移 `RY28888` 及其关联业务记录，同时保留全部配置。PostgreSQL 请使用 `pg_dump` 或数据库服务器快照备份。在 `app.py` 中启用 `REQUEST_LOG_ENABLED` 后，请求日志写入 `server/logs/requests.log` 并按日永久保留。反向代理部署时设 `LIMS_TRUST_PROXY=1` 读取 `X-Forwarded-For` 真实来源 IP（直连部署不要开启）；该开关同时让 Waitress 放行本机反代转发的 `X-Forwarded-For/Proto`（Waitress 3.x 默认会剥掉它们，这是“配置都对但审计 IP 仍是 127.0.0.1”的常见病根）。仪器客户端的"本机放行"判定同样基于来源 IP，代理模式下跨机器客户端必须正确配置设备令牌。
+
+## Linux 部署（systemd）
+
+假设代码部署在 `/home/lims/labflow`（本目录平铺，`run.py` 在根），Python 环境在 `/home/lims/labflow/venv`。系统级与用户级两种方式任选其一，不要同时启用。
+
+### 系统级服务（推荐，需要 sudo）
+
+`/etc/systemd/system/labflow.service`：
+
+```ini
+[Unit]
+Description=LabFlow LIMS
+After=network.target
+
+[Service]
+Type=simple
+User=lims
+WorkingDirectory=/home/lims/labflow
+Environment=LIMS_DATABASE_URL=postgresql://用户:密码@主机/toy_lims
+Environment=LIMS_TRUST_PROXY=1
+Environment=LIMS_XRF_CLIENT_TOKEN=XRF客户端令牌
+Environment=LIMS_STANDARD_CLIENT_TOKEN=标准客户端令牌
+ExecStart=/home/lims/labflow/venv/bin/python run.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now labflow
+sudo systemctl restart labflow   # 改代码或环境变量后
+journalctl -u labflow -f         # 查看日志
+```
+
+注意：修改 unit 文件（包括 Environment）后必须先 `daemon-reload` 再 `restart`，否则新配置不生效。
+
+### 用户级服务（不需要 sudo）
+
+`~/.config/systemd/user/labflow.service`（`%h` 自动代表当前用户家目录）：
+
+```ini
+[Unit]
+Description=LabFlow LIMS
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/labflow
+Environment=LIMS_DATABASE_URL=postgresql://用户:密码@主机/toy_lims
+Environment=LIMS_TRUST_PROXY=1
+Environment=LIMS_XRF_CLIENT_TOKEN=XRF客户端令牌
+Environment=LIMS_STANDARD_CLIENT_TOKEN=标准客户端令牌
+ExecStart=%h/labflow/venv/bin/python run.py
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now labflow
+loginctl enable-linger $USER     # 关键：否则用户登出后服务会被停止
+systemctl --user restart labflow
+journalctl --user -u labflow -f
+```
 
 迁移命令：
 

@@ -14,6 +14,7 @@ let FORM_REPORT_ORDER = [];
 let FORM_SAMPLE_TAGS = [];
 let TEMPLATE_EDIT_ID = null;
 let TEMPLATE_INSTRUMENT_MAP = {};
+let TEMPLATE_ANALYTE_SET = new Set();
 let PREP_COMBINATION_EDIT_ID = null;
 let OPEN_CAP_IIDS = new Set();
 let CURRENT_SAMPLE = null;
@@ -391,6 +392,7 @@ function sampleStageTrackHtml(status) {
 
 const AUDIT_ACTION_LABELS = {
   setup: "初始化系统", login: "终端登录", logout: "终端退出",
+  session_replaced: "会话被其他设备顶下线",
   heartbeat: "仪器状态心跳", instrument_login: "标准客户端用户登录",
   create: "新建", update: "修改", delete: "删除", disable: "停用", restore: "恢复",
   reorder: "调整顺序", capabilities: "修改仪器能力", status_change: "修改状态",
@@ -897,8 +899,8 @@ function methodPickerButton(currentId, className, attributes = "") {
 function renderMethodPicker() {
   const query = $("#method-picker-search").value.trim().toLowerCase();
   const methods = methodsFor("function", true).filter((method) =>
-    [method.name, method.formula, method.note, method.constants].some((value) =>
-      String(value || "").toLowerCase().includes(query)));
+    !query || String(method.name || "").toLowerCase().includes(query) ||
+    String(method.target || "").toLowerCase().includes(query));
   $("#method-picker-count").textContent = `${methods.length} 个方法`;
   $("#method-picker-list").innerHTML = methods.length ? methods.map((method, index) => {
     const constants = Object.entries(templateJson(method.constants, {}))
@@ -906,9 +908,9 @@ function renderMethodPicker() {
     const selected = method.id === +METHOD_PICKER_SELECTED_ID;
     return `<button type="button" class="method-picker-item${selected ? " selected" : ""}" data-method-id="${method.id}">
       <span class="method-picker-index">${String(index + 1).padStart(2, "0")}</span>
-      <span class="method-picker-copy"><b>${esc(method.name)}</b><code>${esc(method.formula || "未设置公式")}</code>${method.note ? `<small>${esc(method.note)}</small>` : ""}</span>
+      <span class="method-picker-copy"><b>${method.target ? `<span class="method-picker-target">${esc(method.target)}</span>` : ""}${esc(method.name)}</b><code>${esc(method.formula || "未设置公式")}</code>${method.note ? `<small>${esc(method.note)}</small>` : ""}</span>
       <span class="method-picker-constants"><b>${esc(method.output_unit || "%")}</b>${constants ? `<small>${esc(constants)}</small>` : ""}</span><span class="method-picker-check">${selected ? "✓" : ""}</span></button>`;
-  }).join("") : '<div class="method-picker-empty"><b>没有匹配的方法</b><span>换一个名称、变量或公式试试</span></div>';
+  }).join("") : '<div class="method-picker-empty"><b>没有匹配的方法</b><span>换一个方法名称试试</span></div>';
   $$("#method-picker-list .method-picker-item").forEach((button) => button.onclick = () => {
     const callback = METHOD_PICKER_CALLBACK;
     closeMethodPicker();
@@ -916,14 +918,15 @@ function renderMethodPicker() {
   });
 }
 
-function openMethodPicker(currentId, callback, trigger) {
+function openMethodPicker(currentId, callback, trigger, analyteName) {
   METHOD_PICKER_SELECTED_ID = +currentId || null;
   METHOD_PICKER_CALLBACK = callback;
   METHOD_PICKER_RETURN_FOCUS = trigger || document.activeElement;
-  $("#method-picker-search").value = "";
+  $("#method-picker-search").value = analyteName ? String(analyteName) : "";
   renderMethodPicker();
   $("#method-picker-backdrop").hidden = false;
-  requestAnimationFrame(() => $("#method-picker-search").focus());
+  const search = $("#method-picker-search");
+  requestAnimationFrame(() => { search.focus(); search.select(); });
 }
 
 function closeMethodPicker() {
@@ -964,6 +967,7 @@ function prepRowHtml(prep = {}) {
     <td class="solid-only grid-cell"><input class="p-mass" type="number" step="0.0001" value="${prep.mass_g ?? ""}"></td>
     <td class="solid-only grid-cell"><select class="p-vol">${volumePresetOptions(prep.volume_ml)}</select></td>
     <td class="grid-cell">${dilutionChainHtml(prep, "p-dil")}</td>
+    <td class="grid-cell"><input class="p-count" type="number" min="1" max="10" step="1" value="${prep.count ?? 1}" title="平行份数，大于 1 时自动生成 -1、-2 后缀"></td>
     <td class="grid-cell p-routing-cell"><input class="p-analytes" type="hidden"><div class="p-routing"></div></td>
     <td class="grid-cell readonly prep-row-actions"><button class="copy-row" type="button" title="复制整行">⧉</button><button class="del" type="button" title="删除">×</button></td>
   </tr>`;
@@ -1005,73 +1009,73 @@ function syncPrepAnalytes(tr) {
     META.analytes.find((item) => item.id === id)?.name).filter(Boolean).join(", ");
 }
 
-function routingChipHtml(tr, aid) {
-  const analyte = META.analytes.find((item) => item.id === aid);
-  const setting = tr._instrumentMap?.[String(aid)] || {};
-  const instrument = META.instruments.find((item) => item.id === +setting.instrument_id);
-  const selected = tr._selectedAnalytes?.has(aid) ? " selected" : "";
-  const method = instrument?.itype === "function"
-    ? methodPickerButton(setting.method_id, "route-method", `data-aid="${aid}" title="选择公式方法"`) : "";
-  return `<span class="route-chip-wrap"><span class="route-chip${selected}" role="button" tabindex="0" draggable="true" data-aid="${aid}">${esc(analyte?.name || aid)}</span>${method}</span>`;
-}
-
-function renderPrepRouting(tr) {
-  const overallIds = parseAnalyteText($("#s-analyte-text").value).matched.map((a) => a.id);
-  const ids = prepAnalyteIds(tr);
-  tr._instrumentMap ||= {};
-  tr._selectedAnalytes ||= new Set();
+function renderRoutingBoard(container, { analyteIds, map, onChange }) {
+  const selected = container._boardSelected ||= new Set();
+  [...selected].forEach((aid) => { if (!analyteIds.includes(aid)) selected.delete(aid); });
   const instruments = META.instruments.filter((item) => item.itype !== "xrf" &&
-    overallIds.some((aid) => item.analytes.includes(aid)));
+    analyteIds.some((aid) => item.analytes.includes(aid)));
   const validInstrumentIds = new Set(instruments.map((item) => item.id));
   const grouped = new Map(instruments.map((item) => [item.id, []]));
-  const assigned = new Set();
-  ids.forEach((aid) => {
-    const iid = +tr._instrumentMap[String(aid)]?.instrument_id || 0;
+  const assigned = [];
+  analyteIds.forEach((aid) => {
+    const iid = +map[String(aid)]?.instrument_id || 0;
     const instrument = META.instruments.find((item) => item.id === iid);
     if (validInstrumentIds.has(iid) && instrument?.analytes.includes(aid)) {
       grouped.get(iid).push(aid);
-      assigned.add(aid);
+      assigned.push(aid);
     } else {
-      delete tr._instrumentMap[String(aid)];
+      delete map[String(aid)];
     }
   });
-  tr._usesAllAnalytes = false;
-  tr._includedAnalytes = assigned;
-  const excluded = overallIds.filter((id) => !assigned.has(id));
-  syncPrepAnalytes(tr);
+  const excluded = analyteIds.filter((id) => !assigned.includes(id));
+  const chip = (aid) => {
+    const analyte = META.analytes.find((item) => item.id === aid);
+    const setting = map[String(aid)] || {};
+    const instrument = META.instruments.find((item) => item.id === +setting.instrument_id);
+    const sel = selected.has(aid) ? " selected" : "";
+    const method = instrument?.itype === "function"
+      ? methodPickerButton(setting.method_id, "route-method", `data-aid="${aid}" title="选择公式方法"`) : "";
+    return `<span class="route-chip-wrap"><span class="route-chip${sel}" role="button" tabindex="0" draggable="true" data-aid="${aid}">${esc(analyte?.name || aid)}</span>${method}</span>`;
+  };
   const zone = (kind, iid, label, aids) => `<div class="route-zone ${kind}" data-kind="${kind}" data-iid="${iid || 0}">
-    <b>${esc(label)}</b><div class="route-items">${aids.map((aid) => routingChipHtml(tr, aid)).join("") || '<i>拖到这里</i>'}</div></div>`;
-  tr.querySelector(".p-routing").innerHTML = `<div class="route-tools"><button type="button" class="route-select-all">全选标签</button><button type="button" class="route-clear-select">取消选择</button></div><div class="route-zones">` +
+    <b>${esc(label)}</b><div class="route-items">${aids.map(chip).join("") || '<i>拖到这里</i>'}</div></div>`;
+  container.innerHTML = `<div class="route-tools"><button type="button" class="route-select-all">全选标签</button><button type="button" class="route-clear-select">取消选择</button></div><div class="route-zones">` +
     zone("excluded", 0, "不测", excluded) +
     instruments.map((instrument) => zone("instrument", instrument.id, instrument.name, grouped.get(instrument.id))).join("") + "</div>";
 
-  tr.querySelector(".route-select-all").onclick = () => {
-    tr._selectedAnalytes = new Set(overallIds); renderPrepRouting(tr);
+  const rerender = () => renderRoutingBoard(container, { analyteIds, map, onChange });
+  const emit = () => onChange?.(assigned.slice());
+  container.querySelector(".route-select-all").onclick = () => {
+    analyteIds.forEach((aid) => selected.add(aid));
+    rerender();
   };
-  tr.querySelector(".route-clear-select").onclick = () => {
-    tr._selectedAnalytes.clear(); renderPrepRouting(tr);
+  container.querySelector(".route-clear-select").onclick = () => {
+    selected.clear();
+    rerender();
   };
-  tr.querySelectorAll(".route-chip").forEach((chip) => {
-    chip.onmousedown = (event) => event.stopPropagation();
-    chip.onclick = (event) => {
+  container.querySelectorAll(".route-chip").forEach((elm) => {
+    const aid = +elm.dataset.aid;
+    elm.onmousedown = (event) => event.stopPropagation();
+    elm.onclick = (event) => {
       event.stopPropagation();
-      const aid = +chip.dataset.aid;
-      if (tr._selectedAnalytes.has(aid)) tr._selectedAnalytes.delete(aid);
-      else tr._selectedAnalytes.add(aid);
-      chip.classList.toggle("selected", tr._selectedAnalytes.has(aid));
+      if (selected.has(aid)) selected.delete(aid);
+      else selected.add(aid);
+      elm.classList.toggle("selected", selected.has(aid));
     };
-    chip.ondragstart = (event) => {
+    elm.ondragstart = (event) => {
       event.stopPropagation();
-      const aid = +chip.dataset.aid;
-      if (!tr._selectedAnalytes.has(aid)) tr._selectedAnalytes = new Set([aid]);
+      if (!selected.has(aid)) {
+        selected.clear();
+        selected.add(aid);
+      }
       event.dataTransfer.setData("text/plain", String(aid));
       event.dataTransfer.effectAllowed = "move";
-      chip.classList.add("dragging");
+      elm.classList.add("dragging");
     };
-    chip.ondragend = () => chip.classList.remove("dragging");
+    elm.ondragend = () => elm.classList.remove("dragging");
   });
   const moveToZone = (dropZone, dragged = 0) => {
-    const moving = tr._selectedAnalytes.size ? [...tr._selectedAnalytes] : (dragged ? [dragged] : []);
+    const moving = selected.size ? [...selected] : (dragged ? [dragged] : []);
     if (!moving.length) return;
     const iid = +dropZone.dataset.iid;
     const kind = dropZone.dataset.kind;
@@ -1079,25 +1083,20 @@ function renderPrepRouting(tr) {
     const rejected = [];
     moving.forEach((aid) => {
       if (kind === "excluded") {
-        tr._usesAllAnalytes = false;
-        tr._includedAnalytes.delete(aid);
-        delete tr._instrumentMap[String(aid)];
+        delete map[String(aid)];
       } else if (instrument.analytes.includes(aid)) {
-        tr._includedAnalytes.add(aid);
-        const old = tr._instrumentMap[String(aid)] || {};
-        tr._instrumentMap[String(aid)] = {
+        const old = map[String(aid)] || {};
+        map[String(aid)] = {
           instrument_id: iid,
           method_id: old.instrument_id === iid ? (old.method_id || null) : null,
         };
       } else rejected.push(META.analytes.find((item) => item.id === aid)?.name || aid);
     });
     if (rejected.length) showError(`${instrument.name} 未配置测定：${rejected.join("、")}`, "无法分配仪器");
-    tr._selectedAnalytes.clear();
-    syncPrepAnalytes(tr);
-    renderPrepRouting(tr);
-    renderPrepPreviews();
+    selected.clear();
+    rerender();
   };
-  tr.querySelectorAll(".route-zone").forEach((dropZone) => {
+  container.querySelectorAll(".route-zone").forEach((dropZone) => {
     dropZone.onmousedown = (event) => event.stopPropagation();
     dropZone.onclick = () => moveToZone(dropZone);
     dropZone.ondragover = (event) => {
@@ -1110,21 +1109,39 @@ function renderPrepRouting(tr) {
       moveToZone(dropZone, dragged);
     };
   });
-  tr.querySelectorAll(".route-method").forEach((button) => {
+  container.querySelectorAll(".route-method").forEach((button) => {
     button.onclick = (event) => {
       event.stopPropagation();
+      const analyte = META.analytes.find((a) => a.id === +button.dataset.aid);
       openMethodPicker(button.dataset.methodId, (methodId) => {
         const aid = button.dataset.aid;
-        if (tr._instrumentMap[aid]) tr._instrumentMap[aid].method_id = methodId;
+        if (map[aid]) map[aid].method_id = methodId;
         const method = methodsFor("function").find((item) => item.id === methodId);
         button.dataset.methodId = methodId || "";
         button.querySelector("span").textContent = method?.name || "选择方法";
-      }, button);
+        emit();
+      }, button, analyte?.name);
     };
+  });
+  emit();
+}
+
+function renderPrepRouting(tr) {
+  const overallIds = parseAnalyteText($("#s-analyte-text").value).matched.map((a) => a.id);
+  tr._instrumentMap ||= {};
+  renderRoutingBoard(tr.querySelector(".p-routing"), {
+    analyteIds: overallIds,
+    map: tr._instrumentMap,
+    onChange: (assignedIds) => {
+      tr._usesAllAnalytes = false;
+      tr._includedAnalytes = new Set(assignedIds);
+      syncPrepAnalytes(tr);
+      renderPrepPreviews();
+    },
   });
 }
 
-function automaticPrepName(tr) {
+function automaticPrepName(tr, index = null) {
   const base = $("#s-name").value.trim() || "?";
   const dilutionIds = dilutionIdsFrom(tr, "p-dil");
   const factor = dilutionIds.reduce((product, id) =>
@@ -1133,24 +1150,40 @@ function automaticPrepName(tr) {
   const ids = prepAnalyteIds(tr);
   const firstAnalyte = META.analytes.find((item) => item.id === ids[0])?.name || "";
   const automaticBase = firstAnalyte ? `${firstAnalyte}.${base}` : base;
-  return `${automaticBase}${tr._legacyParallelIndex ? `-${tr._legacyParallelIndex}` : ""}*${factorMark}`;
+  const parallelIndex = index ?? tr._legacyParallelIndex;
+  return `${automaticBase}${parallelIndex ? `-${parallelIndex}` : ""}*${factorMark}`;
+}
+
+function prepParallelCount(tr) {
+  return Math.min(10, Math.max(1, parseInt(tr.querySelector(".p-count")?.value) || 1));
 }
 
 // 自动名称随多级稀释总倍数变化；手工名称可完全覆盖默认值。
+// 平行份数大于 1 时按 -1、-2 后缀展开（手工名称可用 {n} 占位序号）。
 function rowPreps(tr) {
   const dilutionIds = dilutionIdsFrom(tr, "p-dil");
   const customName = tr._autoName ? "" : tr.querySelector(".p-name").value.trim();
+  const count = prepParallelCount(tr);
   const ids = prepAnalyteIds(tr);
-  return [{
-    id: tr.dataset.pid ? +tr.dataset.pid : undefined,
-    name: customName || automaticPrepName(tr),
+  const buildName = (index) => {
+    if (customName) {
+      if (count === 1) return customName;
+      return customName.includes("{n}")
+        ? customName.split("{n}").join(String(index))
+        : `${customName}-${index}`;
+    }
+    return automaticPrepName(tr, count > 1 ? index : null);
+  };
+  return Array.from({ length: count }, (_, i) => ({
+    id: count === 1 && tr.dataset.pid ? +tr.dataset.pid : undefined,
+    name: buildName(i + 1),
     mass_g: isLiquid() ? null : parseFloat(tr.querySelector(".p-mass").value) || null,
     volume_ml: isLiquid() ? null : parseFloat(tr.querySelector(".p-vol").value) || null,
     dilution_id: dilutionIds[0] || null,
     dilution_ids: dilutionIds,
     analyte_ids: ids,
     instrument_map: structuredClone(tr._instrumentMap || {}),
-  }];
+  }));
 }
 
 function renderPrepPreviews() {
@@ -1167,7 +1200,6 @@ function addPrepRow(prep = {}, afterRow = null) {
   const tr = afterRow ? afterRow.nextElementSibling : $("#p-table tbody tr:last-child");
   tr._instrumentMap = structuredClone(prep.instrument_map || FORM_INSTRUMENT_MAP || {});
   tr._legacyParallelIndex = prep._legacy_parallel_index || null;
-  tr._selectedAnalytes = new Set();
   const overallIds = parseAnalyteText($("#s-analyte-text").value).matched.map((a) => a.id);
   const configuredIds = Array.isArray(prep.analyte_ids) ? prep.analyte_ids : [];
   tr._usesAllAnalytes = configuredIds.length === 0;
@@ -1179,6 +1211,7 @@ function addPrepRow(prep = {}, afterRow = null) {
     const copied = rowPreps(tr)[0];
     copied.name = tr.querySelector(".p-name").value;
     copied._auto_name = tr._autoName;
+    copied.count = prepParallelCount(tr);
     delete copied.id;
     addPrepRow(copied, tr);
   };
@@ -4285,26 +4318,46 @@ $("#rp-add").onclick = async () => {
   await loadMeta();
 };
 
+function templateDefaultRouting() {
+  const out = {};
+  Object.entries(TEMPLATE_INSTRUMENT_MAP || {}).forEach(([aid, setting]) => {
+    if (!String(aid).startsWith("__") && setting?.instrument_id) out[aid] = { ...setting };
+  });
+  return out;
+}
+
+function renderTemplatePrepRouting() {
+  const analyteIds = parseAnalyteText($("#t-analyte-text").value).matched.map((a) => a.id);
+  $$("#t-prep-table tbody tr").forEach((row) => {
+    row._instrumentMap ||= {};
+    renderRoutingBoard(row.querySelector(".tp-routing"), {
+      analyteIds,
+      map: row._instrumentMap,
+    });
+  });
+}
+
 function templatePrepRowHtml(prep = {}) {
-  const names = (prep.analyte_ids || []).map((id) => META.analytes.find((a) => a.id === id)?.name)
-    .filter(Boolean).join(", ");
   return `<tr>
     <td class="t-solid-only"><input class="tp-mass" type="number" step="0.0001" value="${prep.mass_g ?? ""}"></td>
     <td class="t-solid-only"><select class="tp-vol">${volumePresetOptions(prep.volume_ml)}</select></td>
     <td>${dilutionChainHtml(prep, "tp-dil")}</td>
-    <td><input class="tp-analytes" value="${esc(names)}" placeholder="留空=全部项目"></td>
+    <td><input class="tp-count" type="number" min="1" max="10" step="1" value="${prep.count ?? 1}" title="平行份数，大于 1 时自动生成 -1、-2 后缀"></td>
+    <td class="p-routing-cell"><div class="p-routing tp-routing"></div></td>
     <td class="prep-row-actions"><button class="copy-row" type="button" title="复制整行">⧉</button><button class="del" type="button">×</button></td></tr>`;
 }
 
 function templatePrepData(row) {
-  const text = row.querySelector(".tp-analytes").value.trim();
   const dilution_ids = dilutionIdsFrom(row, "tp-dil");
   return {
     mass_g: parseFloat(row.querySelector(".tp-mass").value) || null,
     volume_ml: parseFloat(row.querySelector(".tp-vol").value) || null,
     dilution_id: dilution_ids[0] || null,
     dilution_ids,
-    analyte_ids: text ? parseAnalyteText(text).matched.map((a) => a.id) : [],
+    count: Math.min(10, Math.max(1, parseInt(row.querySelector(".tp-count").value) || 1)),
+    analyte_ids: Object.keys(row._instrumentMap || {}).map(Number)
+      .filter((id) => TEMPLATE_ANALYTE_SET.has(id)),
+    instrument_map: structuredClone(row._instrumentMap || {}),
   };
 }
 
@@ -4313,9 +4366,11 @@ function addTemplatePrepRow(prep = {}, afterRow = null) {
   else $("#t-prep-table tbody").insertAdjacentHTML("beforeend", templatePrepRowHtml(prep));
   const row = afterRow ? afterRow.nextElementSibling : $("#t-prep-table tbody tr:last-child");
   wireDilutionChain(row.querySelector(".dilution-chain"));
+  row._instrumentMap = structuredClone(prep.instrument_map || templateDefaultRouting());
   row.querySelector(".copy-row").onclick = () => addTemplatePrepRow(templatePrepData(row), row);
-  row.querySelector(".del").onclick = () => row.remove();
+  row.querySelector(".del").onclick = () => { row.remove(); renderTemplatePrepRouting(); };
   row.querySelectorAll(".t-solid-only").forEach((cell) => cell.style.display = $("#t-sample-type").value === "solid" ? "" : "none");
+  renderTemplatePrepRouting();
 }
 
 function syncTemplateAnalyteRow(row) {
@@ -4336,6 +4391,7 @@ function syncTemplateAnalyteRow(row) {
 
 function renderTemplateAnalyteRows() {
   const parsed = parseAnalyteText($("#t-analyte-text").value);
+  TEMPLATE_ANALYTE_SET = new Set(parsed.matched.map((item) => item.id));
   $("#t-analyte-chips").innerHTML =
     parsed.matched.map((item) => `<span class="tag ok">${esc(item.name)}</span>`).join("") +
     parsed.unmatched.map((name) => `<span class="tag bad">${esc(name)}?</span>`).join("");
@@ -4355,12 +4411,13 @@ function renderTemplateAnalyteRows() {
     row.querySelector(".ta-instrument").onchange = () => syncTemplateAnalyteRow(row);
     row.querySelector(".ta-method").onclick = (event) => {
       const button = event.currentTarget;
+      const analyte = META.analytes.find((a) => a.id === +row.dataset.aid);
       openMethodPicker(button.dataset.methodId, (methodId) => {
         const method = methodsFor("function").find((item) => item.id === methodId);
         button.dataset.methodId = methodId || "";
         button.querySelector("span").textContent = method?.name || "选择方法";
         syncTemplateAnalyteRow(row);
-      }, button);
+      }, button, analyte?.name);
     };
     const syncOrder = () => {
       $("#t-analyte-text").value = $$("#t-analytes .template-analyte-row")
@@ -4383,6 +4440,7 @@ function renderTemplateAnalyteRows() {
     };
     syncTemplateAnalyteRow(row);
   });
+  renderTemplatePrepRouting();
 }
 
 function renderTemplateXrfChips() {
@@ -4448,16 +4506,16 @@ function collectSettingsTemplate() {
   instrument_map.__report_order = analyte_ids;
   const sampleType = $("#t-sample-type").value;
   const isLiquidTemplate = sampleType !== "solid";
-  const preps = $$("#t-prep-table tbody tr").map((row) => {
-    const text = row.querySelector(".tp-analytes").value.trim();
-    return {
-      mass_g: isLiquidTemplate ? null : (parseFloat(row.querySelector(".tp-mass").value) || null),
-      volume_ml: isLiquidTemplate ? null : (parseFloat(row.querySelector(".tp-vol").value) || null),
-      dilution_id: dilutionIdsFrom(row, "tp-dil")[0] || null,
-      dilution_ids: dilutionIdsFrom(row, "tp-dil"),
-      analyte_ids: text ? parseAnalyteText(text).matched.map((a) => a.id).filter((id) => allowed.has(id)) : [],
-    };
-  });
+  const preps = $$("#t-prep-table tbody tr").map((row) => ({
+    mass_g: isLiquidTemplate ? null : (parseFloat(row.querySelector(".tp-mass").value) || null),
+    volume_ml: isLiquidTemplate ? null : (parseFloat(row.querySelector(".tp-vol").value) || null),
+    dilution_id: dilutionIdsFrom(row, "tp-dil")[0] || null,
+    dilution_ids: dilutionIdsFrom(row, "tp-dil"),
+    count: Math.min(10, Math.max(1, parseInt(row.querySelector(".tp-count").value) || 1)),
+    analyte_ids: Object.keys(row._instrumentMap || {}).map(Number)
+      .filter((id) => allowed.has(id)),
+    instrument_map: structuredClone(row._instrumentMap || {}),
+  }));
   return {
     name: $("#t-name").value.trim(),
     category: $("#t-category")?.value.trim() || "",
@@ -4679,7 +4737,7 @@ function renderSettings() {
   }
   // 分析方法
   $("#m-table tbody").innerHTML = META.methods.map((m) =>
-    `<tr class="${m.active === 0 ? "method-inactive" : ""}"><td><label class="method-active-toggle"><input class="m-row-active" type="checkbox" ${m.active !== 0 ? "checked" : ""}><span>${m.active !== 0 ? "启用" : "停用"}</span></label></td><td>${m.itype === "xrf" ? "XRF" : "公式"}</td><td>${esc(m.name)}</td><td>${m.itype === "xrf" ? "—" : `<select class="m-row-unit"><option value="%" ${m.output_unit === "%" ? "selected" : ""}>%</option><option value="ppm" ${m.output_unit === "ppm" ? "selected" : ""}>ppm</option><option value="ppb" ${m.output_unit === "ppb" ? "selected" : ""}>ppb</option><option value="mol/L" ${m.output_unit === "mol/L" ? "selected" : ""}>mol/L</option><option value="g/L" ${m.output_unit === "g/L" ? "selected" : ""}>g/L</option></select>`}</td><td><code>${esc(m.formula || "—")}</code></td>
+    `<tr class="${m.active === 0 ? "method-inactive" : ""}"><td><label class="method-active-toggle"><input class="m-row-active" type="checkbox" ${m.active !== 0 ? "checked" : ""}><span>${m.active !== 0 ? "启用" : "停用"}</span></label></td><td>${m.itype === "xrf" ? "XRF" : "公式"}</td><td>${esc(m.name)}</td><td>${m.itype === "xrf" ? "—" : `<input class="m-row-target" value="${esc(m.target || "")}" maxlength="40" style="width:80px">`}</td><td>${m.itype === "xrf" ? "—" : `<select class="m-row-unit"><option value="%" ${m.output_unit === "%" ? "selected" : ""}>%</option><option value="ppm" ${m.output_unit === "ppm" ? "selected" : ""}>ppm</option><option value="ppb" ${m.output_unit === "ppb" ? "selected" : ""}>ppb</option><option value="mol/L" ${m.output_unit === "mol/L" ? "selected" : ""}>mol/L</option><option value="g/L" ${m.output_unit === "g/L" ? "selected" : ""}>g/L</option></select>`}</td><td><code>${esc(m.formula || "—")}</code></td>
      <td>${esc(Object.entries(templateJson(m.constants, {})).map(([k, v]) => `${k}=${v}`).join(", ") || "—")}</td>
      <td><textarea class="m-row-note" rows="2" maxlength="2000">${esc(m.note || "")}</textarea></td>
      <td><span class="method-order-actions"><button class="order-up" data-mid="${m.id}" type="button" title="上移">↑</button><button class="order-down" data-mid="${m.id}" type="button" title="下移">↓</button></span><button class="m-note-save" data-mid="${m.id}" type="button">保存</button><button class="del" data-mid="${m.id}">删</button></td></tr>`).join("");
@@ -4690,7 +4748,9 @@ function renderSettings() {
     const note = row.querySelector(".m-row-note").value;
     const output_unit = row.querySelector(".m-row-unit")?.value || "%";
     const active = row.querySelector(".m-row-active").checked ? 1 : 0;
-    const result = await api(`/api/methods/${button.dataset.mid}/note`, "PUT", { note, output_unit, active });
+    const target = row.querySelector(".m-row-target")?.value ?? undefined;
+    const result = await api(`/api/methods/${button.dataset.mid}/note`, "PUT",
+      { note, output_unit, active, ...(target === undefined ? {} : { target }) });
     if (result.ok) await loadMeta();
   });
   $$("#m-table .del").forEach((b) => b.onclick = async () => {
@@ -4803,10 +4863,12 @@ $("#m-add").onclick = async () => {
     const r = await api("/api/methods", "POST", {
       name, itype, formula, constants, note: $("#m-note").value.trim(),
       output_unit: $("#m-output-unit").value,
+      target: $("#m-target").value.trim(),
     });
     if (!r.ok) return;
     $("#m-name").value = ""; $("#m-formula").value = "";
-    $("#m-constants").value = ""; $("#m-note").value = ""; loadMeta();
+    $("#m-constants").value = ""; $("#m-note").value = "";
+    $("#m-target").value = ""; loadMeta();
   }
 };
 $("#t-add").onclick = async () => {
@@ -4841,6 +4903,7 @@ $("#m-type").onchange = () => {
   $("#m-formula").disabled = xrf;
   $("#m-constants").disabled = xrf;
   $("#m-output-unit").disabled = xrf;
+  $("#m-target").disabled = xrf;
 };
 $("#t-cancel").onclick = () => { TEMPLATE_EDIT_ID = null; renderTemplateEditor(); };
 

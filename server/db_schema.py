@@ -671,6 +671,19 @@ def _seed_reference_data(db):
                   AND NOT EXISTS(SELECT 1 FROM sample_analytes WHERE method_id=methods.id)""")
 
 
+def _backfill_method_targets(db):
+    """从方法名前缀（如 Cu-碘量法）回填检测对象，仅当能精确匹配分析项目名时。"""
+    analytes = {str(row["name"]).casefold(): str(row["name"])
+                for row in db.execute("SELECT name FROM analytes")}
+    for method in db.execute("SELECT id,name,target FROM methods").fetchall():
+        if str(method["target"] or "").strip():
+            continue
+        head = str(method["name"] or "").split("-", 1)[0].strip()
+        matched = analytes.get(head.casefold())
+        if matched:
+            db.execute("UPDATE methods SET target=? WHERE id=?", (matched, method["id"]))
+
+
 def _backfill_preparation_dilutions(db):
     """Upgrade single-step preparations without changing their historical factor."""
     pending = db.execute("""SELECT p.id,p.dilution_id,d.label,d.factor
@@ -748,6 +761,8 @@ def initialize_database(database):
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_factor REAL NOT NULL DEFAULT 1")
         db.execute("ALTER TABLE preparations ADD COLUMN IF NOT EXISTS dilution_label TEXT DEFAULT ''")
         db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS report_excludes TEXT DEFAULT '[]'")
+        db.execute("ALTER TABLE terminals ADD COLUMN IF NOT EXISTS session_token TEXT DEFAULT ''")
+        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS session_token TEXT DEFAULT ''")
         db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS density_g_ml REAL")
         db.execute("ALTER TABLE samples ADD COLUMN IF NOT EXISTS result_units TEXT DEFAULT '{}'")
         db.execute("ALTER TABLE analytes ADD COLUMN IF NOT EXISTS default_unit TEXT DEFAULT ''")
@@ -764,10 +779,12 @@ def initialize_database(database):
         db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0")
         db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS output_unit TEXT DEFAULT '%'")
         db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS active INTEGER DEFAULT 1")
+        db.execute("ALTER TABLE methods ADD COLUMN IF NOT EXISTS target TEXT DEFAULT ''")
         db.execute("UPDATE methods SET sort_order=id WHERE sort_order IS NULL OR sort_order=0")
         db.execute("UPDATE methods SET output_unit='%' WHERE output_unit IS NULL OR output_unit=''")
         db.execute("UPDATE methods SET active=1 WHERE active IS NULL")
         _backfill_preparation_dilutions(db)
+        _backfill_method_targets(db)
         _upgrade_postgres_terminal_kinds(db)
         _upgrade_review_workflow(db)
         db.execute("""CREATE OR REPLACE FUNCTION safe_int(value TEXT) RETURNS INTEGER
@@ -806,10 +823,14 @@ def initialize_database(database):
     user_cols = [r[1] for r in db.execute("PRAGMA table_info(users)")]
     if "permissions" not in user_cols:
         db.execute("ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]'")
+    if "session_token" not in user_cols:
+        db.execute("ALTER TABLE users ADD COLUMN session_token TEXT DEFAULT ''")
     terminal_cols = [r[1] for r in db.execute("PRAGMA table_info(terminals)")]
     if "sort_order" not in terminal_cols:
         db.execute("ALTER TABLE terminals ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
         db.execute("UPDATE terminals SET sort_order=id")
+    if "session_token" not in terminal_cols:
+        db.execute("ALTER TABLE terminals ADD COLUMN session_token TEXT DEFAULT ''")
     _upgrade_sqlite_terminal_kinds(db)
     for user in db.execute("SELECT id,role,permissions FROM users").fetchall():
         try:
@@ -940,6 +961,8 @@ def initialize_database(database):
         db.execute("ALTER TABLE methods ADD COLUMN output_unit TEXT DEFAULT '%'")
     if "active" not in method_cols:
         db.execute("ALTER TABLE methods ADD COLUMN active INTEGER DEFAULT 1")
+    if "target" not in method_cols:
+        db.execute("ALTER TABLE methods ADD COLUMN target TEXT DEFAULT ''")
     db.execute("UPDATE methods SET sort_order=id WHERE sort_order IS NULL OR sort_order=0")
     db.execute("UPDATE methods SET output_unit='%' WHERE output_unit IS NULL OR output_unit=''")
     db.execute("UPDATE methods SET active=1 WHERE active IS NULL")
@@ -951,6 +974,7 @@ def initialize_database(database):
         WHEN lower(itype)='icp' THEN 'ppm'
         ELSE lower(itype) END""")
     db.execute("UPDATE methods SET itype='function' WHERE lower(itype)='titration'")
+    _backfill_method_targets(db)
     result_cols = [r[1] for r in db.execute("PRAGMA table_info(results)")]
     if "aux" not in result_cols:
         db.execute("ALTER TABLE results ADD COLUMN aux TEXT DEFAULT '{}'")

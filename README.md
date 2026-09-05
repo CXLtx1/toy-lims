@@ -54,7 +54,7 @@ python server.py
 
 服务默认运行在 **http://127.0.0.1:5000**。第一次打开会进入初始化页面，创建固定首个用户 `cxl`，并设置“二组”和“管理终端”的终端密码。已有用户的数据库升级后只需验证现有管理员密码并初始化终端，不会重建或删除用户。
 
-`python server/app.py` 可用于本机开发；日常运行仍使用根目录的 `server.py`，它会转入 `server/run.py` 并通过 Waitress 提供服务。PostgreSQL 地址在 `server/app.py` 顶部的 `POSTGRES_CONFIG` 中集中配置，也可通过 `LIMS_DATABASE_URL` 整体覆盖。`LIMS_HOST`、`LIMS_PORT`、`LIMS_XRF_CLIENT_TOKEN` 和 `LIMS_STANDARD_CLIENT_TOKEN` 分别调整监听地址和仪器设备认证；`LIMS_THREADS` 调整 Waitress 线程数（默认 32，SSE 协同推送连接会常驻占用线程，需留余量）。
+`python server/app.py` 可用于本机开发；日常运行仍使用根目录的 `server.py`，它会转入 `server/run.py` 并通过 Waitress 提供服务。PostgreSQL 地址在 `server/app.py` 顶部的 `POSTGRES_CONFIG` 中集中配置，也可通过 `LIMS_DATABASE_URL` 整体覆盖。`LIMS_HOST`、`LIMS_PORT`、`LIMS_XRF_CLIENT_TOKEN` 和 `LIMS_STANDARD_CLIENT_TOKEN` 分别调整监听地址和仪器设备认证；`LIMS_THREADS` 调整 Waitress 线程数（默认 32，SSE 协同推送连接会常驻占用线程，需留余量）。反向代理（nginx 等）部署时设 `LIMS_TRUST_PROXY=1`，审计、请求日志和仪器页将显示 `X-Forwarded-For` 中的真实来源 IP；该开关同时让 Waitress 信任本机反代转发的 `X-Forwarded-For/Proto` 头（Waitress 3.x 默认剥离不可信来源的 `X-Forwarded-*`，不设此项即使代码里有 ProxyFix 也拿不到真实 IP）。直连部署不要开启，否则来源头可被伪造。
 
 ### 2.2 环境依赖
 
