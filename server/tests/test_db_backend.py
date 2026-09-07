@@ -57,16 +57,16 @@ class DatabaseBackendTest(unittest.TestCase):
             initialize_database(database)
             db = sqlite3.connect(database)
             try:
-                self.assertEqual(83, db.execute("SELECT COUNT(*) FROM chemical_elements").fetchone()[0])
+                self.assertEqual(87, db.execute("SELECT COUNT(*) FROM chemical_elements").fetchone()[0])
                 self.assertEqual((26, "Fe", "铁", 55.845, 0), db.execute(
                     "SELECT atomic_number,symbol,name_zh,atomic_weight,is_mass_number "
                     "FROM chemical_elements WHERE symbol='Fe'").fetchone())
-                self.assertEqual({("Tc", 98.0), ("Pm", 145.0)}, set(db.execute(
+                self.assertEqual({("Tc", 98.0), ("Pm", 145.0), ("Pu", 244.0), ("Am", 243.0)}, set(db.execute(
                     "SELECT symbol,atomic_weight FROM chemical_elements WHERE is_mass_number=1")))
                 self.assertEqual(("Bi", "铋", 208.98), db.execute(
                     "SELECT symbol,name_zh,atomic_weight FROM chemical_elements "
                     "WHERE atomic_number=83").fetchone())
-                self.assertEqual(68, db.execute("SELECT COUNT(*) FROM common_oxides").fetchone()[0])
+                self.assertEqual(79, db.execute("SELECT COUNT(*) FROM common_oxides").fetchone()[0])
                 ferric = db.execute("""SELECT name_zh,element_count,oxygen_count,
                     molar_mass,element_mass_fraction,element_to_oxide_factor,is_conventional
                     FROM common_oxides WHERE formula='Fe2O3'""").fetchone()
@@ -77,6 +77,12 @@ class DatabaseBackendTest(unittest.TestCase):
                 self.assertEqual(1, ferric[6])
                 self.assertEqual({"FeO", "Fe2O3", "Fe3O4"}, {row[0] for row in db.execute(
                     "SELECT formula FROM common_oxides WHERE element_symbol='Fe'")})
+                mercury = db.execute("""SELECT element_symbol,element_count,oxygen_count,
+                    element_to_oxide_factor,is_conventional FROM common_oxides
+                    WHERE formula='HgO'""").fetchone()
+                self.assertEqual(("Hg", 1, 1), mercury[:3])
+                self.assertAlmostEqual(1.0797597089, mercury[3], places=9)
+                self.assertEqual(1, mercury[4])
                 db.execute("UPDATE chemical_elements SET atomic_weight=999 WHERE symbol='Fe'")
                 db.execute("UPDATE common_oxides SET element_to_oxide_factor=999 WHERE formula='Fe2O3'")
                 db.commit()

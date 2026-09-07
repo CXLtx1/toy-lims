@@ -19,6 +19,8 @@ server/instance/
 
 # Node
 node_modules/
+dist/
+*.tsbuildinfo
 
 # OS
 Thumbs.db
