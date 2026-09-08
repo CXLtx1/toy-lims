@@ -10,6 +10,7 @@ from flask import (Blueprint, current_app, g, jsonify, redirect, render_template
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from lims_workflow import audit_changes, audit_event
+from security import INSTRUMENT_ENDPOINTS, csrf_token
 
 
 bp = Blueprint("auth", __name__)
@@ -33,21 +34,58 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 AUTHORIZATION_SECONDS = 120
 FORCED_AUTHORIZATION_SECONDS = 60
 TERMINAL_KINDS = {"standard", "admin"}
-PASSWORD_METHOD = "pbkdf2:sha256:20000"
+PASSWORD_METHOD = "scrypt:32768:8:3"
+MIN_PASSWORD_LENGTH = 12
+MAX_PASSWORD_LENGTH = 1024
+
+
+def password_error(password):
+    if not MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH:
+        return f"新密码长度必须为 {MIN_PASSWORD_LENGTH} 至 {MAX_PASSWORD_LENGTH} 个字符"
+    return None
 
 
 def hash_password(password):
+    error = password_error(password)
+    if error:
+        raise ValueError(error)
     return generate_password_hash(password, method=PASSWORD_METHOD)
 
 
-def _check_password(db, row, password, entity):
-    if not check_password_hash(row["password_hash"], password):
+def _password_matches(row, password):
+    try:
+        return check_password_hash(row["password_hash"], password)
+    except (ValueError, TypeError):
         return False
-    if not row["password_hash"].startswith(PASSWORD_METHOD + "$"):
+
+
+def _upgrade_password(db, row, password, entity):
+    method = row["password_hash"].split("$", 1)[0].split(":")
+    upgrade = False
+    try:
+        if method[0] == "scrypt" and len(method) == 4:
+            costs = tuple(map(int, method[1:]))
+            target = (32768, 8, 3)
+            # Never decrease any scrypt cost, including unfamiliar stronger hashes.
+            upgrade = costs != target and all(old <= new for old, new in zip(costs, target))
+        elif method[:2] == ["pbkdf2", "sha256"] and len(method) == 3:
+            # Stronger/different legacy KDFs need an explicit migration policy.
+            upgrade = int(method[2]) < 600000
+    except ValueError:
+        return
+    if upgrade:
         table = "users" if entity == "user" else "terminals"
-        db.execute(f"UPDATE {table} SET password_hash=? WHERE id=?",
-                   (hash_password(password), row["id"]))
+        # Legacy short passwords may still log in and receive a stronger hash.
+        upgraded = generate_password_hash(password, method=PASSWORD_METHOD)
+        db.execute(f"UPDATE {table} SET password_hash=? WHERE id=? AND password_hash=?",
+                   (upgraded, row["id"], row["password_hash"]))
         db.commit()
+
+
+def _check_password(db, row, password, entity):
+    if not _password_matches(row, password):
+        return False
+    _upgrade_password(db, row, password, entity)
     return True
 
 
@@ -90,7 +128,7 @@ def _clean_permissions(value):
 def _matching_users(db, password, *, active=True):
     where = " WHERE active=1" if active else ""
     return [row for row in db.execute("SELECT * FROM users" + where).fetchall()
-            if _check_password(db, row, password, "user")]
+            if _password_matches(row, password)]
 
 
 def authenticate_capable_user(db, password, capability):
@@ -101,18 +139,19 @@ def authenticate_capable_user(db, password, capability):
     user = matches[0]
     if capability not in user_permissions(user):
         return None, f"该用户没有“{CAPABILITIES[capability]}”权限"
+    _upgrade_password(db, user, password, "user")
     return user, None
 
 
 def _password_in_use(db, password, excluding_user_id=None):
     return any(row["id"] != excluding_user_id and
-               _check_password(db, row, password, "user")
+               _password_matches(row, password)
                 for row in db.execute("SELECT id,password_hash FROM users WHERE active=1"))
 
 
 def _terminal_password_in_use(db, password, excluding_terminal_id=None):
     return any(row["id"] != excluding_terminal_id and
-                 _check_password(db, row, password, "terminal")
+                 _password_matches(row, password)
                 for row in db.execute(
                     "SELECT id,password_hash FROM terminals WHERE active=1 AND kind<>'personal'"))
 
@@ -167,10 +206,14 @@ def consume_forced_authorization(capability):
 
 def load_user():
     g.authorization_should_extend = False
+    g.user = None
+    g.terminal = None
     if current_app.config.get("AUTH_DISABLED"):
         g.terminal = None
         g.user = {"id": None, "username": "test", "display_name": "测试管理员",
                   "permissions": json.dumps(sorted(CAPABILITIES))}
+        return
+    if request.endpoint in INSTRUMENT_ENDPOINTS:
         return
     db = get_db()
     personal_user_id = session.get("personal_user_id")
@@ -228,10 +271,10 @@ def login_required_before_request():
     endpoint = request.endpoint or ""
     if current_app.config.get("AUTH_DISABLED") or endpoint.startswith("static"):
         return None
-    if endpoint == "health":
+    if endpoint in {"health", "auth.session_bootstrap"}:
         return None
-    # 仪器客户端使用自己的本机/设备令牌认证，不依赖浏览器 Session。
-    if request.path.startswith(("/api/instrument/xrf", "/api/instrument/standard")):
+    # 仪器客户端必须使用独立设备令牌认证，不依赖浏览器 Session。
+    if endpoint in INSTRUMENT_ENDPOINTS:
         return None
     db = get_db()
     has_users = db.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -271,6 +314,23 @@ def extend_write_authorization(response):
     return response
 
 
+@bp.get("/api/session")
+def session_bootstrap():
+    db = get_db()
+    setup_required = (not db.execute("SELECT 1 FROM users LIMIT 1").fetchone() or
+                      not db.execute("SELECT 1 FROM terminals LIMIT 1").fetchone())
+    terminal = getattr(g, "terminal", None)
+    user = getattr(g, "user", None)
+    return jsonify(ok=True, csrf_token=csrf_token(), authenticated=bool(terminal),
+                   setup_required=bool(setup_required),
+                   terminal=({key: terminal[key] for key in ("id", "name", "kind")}
+                             if terminal else None),
+                   user=_public_user(user) if user else None,
+                   authorization_required=bool(terminal and not user),
+                   requireHTTPS=current_app.config.get("SECURITY_REQUIRE_HTTPS", True),
+                   min_password_length=MIN_PASSWORD_LENGTH)
+
+
 @bp.route("/setup", methods=["GET", "POST"])
 def setup():
     db = get_db()
@@ -295,6 +355,10 @@ def setup():
         display_name = request.form.get("display_name", "").strip() or "cxl"
         if not user_password or not standard_password or not admin_password:
             error = "所有密码均不能为空"
+        elif not has_users and password_error(user_password):
+            error = password_error(user_password)
+        elif not has_terminals and (password_error(standard_password) or password_error(admin_password)):
+            error = password_error(standard_password) or password_error(admin_password)
         elif standard_password == admin_password:
             error = "两个终端必须使用不同的密码"
         elif has_users:
@@ -302,6 +366,8 @@ def setup():
             if len(matches) != 1 or "user_manage" not in user_permissions(matches[0]):
                 error = "请输入具备用户管理能力的启用用户密码"
         if not error:
+            if has_users:
+                _upgrade_password(db, matches[0], user_password, "user")
             if not has_users:
                 permissions = json.dumps(sorted(CAPABILITIES))
                 cur = db.execute("""INSERT INTO users(
@@ -389,7 +455,7 @@ def login():
                            kicked=request.args.get("kicked"))
 
 
-@bp.route("/logout", methods=["GET", "POST"])
+@bp.post("/logout")
 def logout():
     if getattr(g, "terminal", None):
         db = get_db()
@@ -428,6 +494,7 @@ def authorize():
     user = matches[0]
     if purpose and purpose not in user_permissions(user):
         return jsonify(ok=False, error=f"该用户没有“{CAPABILITIES[purpose]}”权限"), 403
+    _upgrade_password(get_db(), user, password, "user")
     session["authorized_user_id"] = user["id"]
     session["last_write"] = time.time()
     if purpose:
@@ -465,8 +532,10 @@ def add_user():
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", ""))
     permissions = _clean_permissions(data.get("permissions"))
-    if len(username) < 3 or not password or permissions is None:
-        return jsonify(ok=False, error="用户名至少 3 位、密码不能为空，并请选择有效能力"), 400
+    if len(username) < 3 or permissions is None:
+        return jsonify(ok=False, error="用户名至少 3 位，并请选择有效能力"), 400
+    if password_error(password):
+        return jsonify(ok=False, error=password_error(password)), 400
     inheritance_error = _permission_inheritance_error(permissions)
     if inheritance_error:
         return jsonify(ok=False, error=inheritance_error, code="permission_inheritance"), 403
@@ -522,6 +591,8 @@ def update_user(user_id):
         if not managers:
             return jsonify(ok=False, error="系统必须至少保留一个具备用户管理能力的启用账号"), 400
     password = str(data.get("password", ""))
+    if password and password_error(password):
+        return jsonify(ok=False, error=password_error(password)), 400
     if password and _password_in_use(db, password, user_id):
         return jsonify(ok=False, error="该密码已被其他启用用户使用，请设置唯一密码"), 409
     display_name = str(data.get("display_name", before["display_name"])).strip()
@@ -554,8 +625,8 @@ def add_terminal():
     kind = str(data.get("kind", "standard"))
     if not name or kind not in TERMINAL_KINDS:
         return jsonify(ok=False, error="请输入终端名称并选择有效类型"), 400
-    if not password:
-        return jsonify(ok=False, error="终端密码不能为空"), 400
+    if password_error(password):
+        return jsonify(ok=False, error=password_error(password)), 400
     db = get_db()
     if db.execute("SELECT 1 FROM terminals WHERE name=?", (name,)).fetchone():
         return jsonify(ok=False, error="终端名称已存在"), 409
@@ -585,6 +656,8 @@ def update_terminal(terminal_id):
     password = str(data.get("password", ""))
     if not name or kind not in TERMINAL_KINDS:
         return jsonify(ok=False, error="终端名称或类型无效"), 400
+    if password and password_error(password):
+        return jsonify(ok=False, error=password_error(password)), 400
     if db.execute("SELECT 1 FROM terminals WHERE name=? AND id<>?",
                   (name, terminal_id)).fetchone():
         return jsonify(ok=False, error="终端名称已存在"), 409

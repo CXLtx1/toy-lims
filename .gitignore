@@ -21,6 +21,15 @@ server/instance/
 node_modules/
 dist/
 *.tsbuildinfo
+playwright-report/
+test-results/
+coverage/
+.env
+.env.*
+!.env.example
+.venv/
+.vs/
+server/logs/
 
 # OS
 Thumbs.db

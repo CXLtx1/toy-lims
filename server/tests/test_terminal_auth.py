@@ -2,8 +2,10 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 
 import app as lims
+from client_helpers import browser_client
 from lims_auth import PASSWORD_METHOD
 from werkzeug.security import generate_password_hash
 
@@ -18,7 +20,7 @@ class TerminalAuthenticationTest(unittest.TestCase):
         lims.DB = os.path.join(self.tmp.name, "test.db")
         lims.init_db()
         lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
-        self.client = lims.app.test_client()
+        self.client = browser_client(self, lims.app)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -67,8 +69,8 @@ class TerminalAuthenticationTest(unittest.TestCase):
 
     def test_successful_login_and_authorization_upgrade_legacy_hashes(self):
         self.initialize()
-        legacy_user_hash = generate_password_hash(self.USER_PASSWORD)
-        legacy_terminal_hash = generate_password_hash(self.STANDARD_PASSWORD)
+        legacy_user_hash = generate_password_hash(self.USER_PASSWORD, method="pbkdf2:sha256:20000")
+        legacy_terminal_hash = generate_password_hash(self.STANDARD_PASSWORD, method="pbkdf2:sha256:20000")
         db = sqlite3.connect(lims.DB)
         try:
             db.execute("UPDATE users SET password_hash=? WHERE username='cxl'", (legacy_user_hash,))
@@ -90,26 +92,29 @@ class TerminalAuthenticationTest(unittest.TestCase):
         self.assertTrue(user_hash.startswith(PASSWORD_METHOD + "$"))
         self.assertTrue(terminal_hash.startswith(PASSWORD_METHOD + "$"))
 
-    def test_setup_accepts_short_nonempty_passwords(self):
+    def test_setup_rejects_short_nonempty_passwords(self):
         response = self.client.post("/setup", data={
             "display_name": "CXL 管理员",
             "password": "u",
             "normal_terminal_password": "s",
             "admin_terminal_password": "a",
         })
-        self.assertEqual(302, response.status_code, response.get_data(as_text=True))
-        self.assertEqual(302, self.login("admin", "a").status_code)
+        self.assertEqual(200, response.status_code, response.get_data(as_text=True))
+        self.assertIn("12", response.get_data(as_text=True))
+        with closing(sqlite3.connect(lims.DB)) as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM terminals").fetchone()[0])
 
-    def test_user_page_is_between_audit_and_settings(self):
+    def test_admin_session_exposes_user_and_terminal_management_data(self):
         self.initialize()
         self.login("admin")
-        page = self.client.get("/").get_data(as_text=True)
-        self.assertLess(page.index('data-page="audit"'), page.index('data-page="users"'))
-        self.assertLess(page.index('data-page="users"'), page.index('data-page="settings"'))
-        users_start = page.index('id="page-users"')
-        settings_start = page.index('id="page-settings"')
-        self.assertLess(users_start, page.index('id="u-table"'))
-        self.assertLess(page.index('id="terminal-table"'), settings_start)
+        bootstrap = self.client.get("/api/session").get_json()
+        self.assertTrue(bootstrap["authenticated"])
+        self.assertIn("user_manage", bootstrap["user"]["permissions"])
+        self.assertIn("terminal_manage", bootstrap["user"]["permissions"])
+        self.assertEqual("cxl", self.client.get("/api/users").get_json()[0]["username"])
+        self.assertEqual({"standard", "admin"}, {
+            terminal["kind"] for terminal in self.client.get("/api/terminals").get_json()})
 
     def test_existing_database_setup_requires_unique_active_admin_password(self):
         db = sqlite3.connect(lims.DB)
@@ -323,7 +328,7 @@ class TerminalAuthenticationTest(unittest.TestCase):
         self.login("admin")
         user_id = self.client.post("/api/users", json={
             "username": "personal-user", "display_name": "个人用户",
-            "password": "p", "permissions": ["result_edit"],
+            "password": "personal-password", "permissions": ["result_edit"],
         }).get_json()["id"]
         self.client.post("/logout")
         login_page = self.client.get("/login").get_data(as_text=True)
@@ -334,7 +339,7 @@ class TerminalAuthenticationTest(unittest.TestCase):
         })
         self.assertEqual(200, wrong.status_code)
         logged_in = self.client.post("/login", data={
-            "terminal_kind": "personal", "username": "personal-user", "password": "p",
+            "terminal_kind": "personal", "username": "personal-user", "password": "personal-password",
         })
         self.assertEqual(302, logged_in.status_code)
         self.assertEqual(user_id, self._session()["personal_user_id"])
@@ -370,22 +375,22 @@ class TerminalAuthenticationTest(unittest.TestCase):
         self.login("admin")
         manager_id = self.client.post("/api/users", json={
             "username": "delegated-manager", "display_name": "委派管理员",
-            "password": "m", "permissions": ["user_manage", "result_edit"],
+            "password": "manager-password", "permissions": ["user_manage", "result_edit"],
         }).get_json()["id"]
         self.client.post("/logout")
         self.assertEqual(302, self.client.post("/login", data={
-            "terminal_kind": "personal", "username": "delegated-manager", "password": "m",
+            "terminal_kind": "personal", "username": "delegated-manager", "password": "manager-password",
         }).status_code)
 
         excessive = self.client.post("/api/users", json={
             "username": "too-powerful", "display_name": "越权用户",
-            "password": "x", "permissions": ["user_manage", "report_edit"],
+            "password": "excessive-password", "permissions": ["user_manage", "report_edit"],
         })
         self.assertEqual(403, excessive.status_code)
         self.assertEqual("permission_inheritance", excessive.get_json()["code"])
         child = self.client.post("/api/users", json={
             "username": "child-user", "display_name": "继承用户",
-            "password": "c", "permissions": ["result_edit"],
+            "password": "child-password", "permissions": ["result_edit"],
         })
         self.assertEqual(200, child.status_code, child.get_data(as_text=True))
         child_id = child.get_json()["id"]

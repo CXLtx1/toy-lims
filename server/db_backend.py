@@ -33,7 +33,7 @@ POSTGRES_TABLE_ORDER = (
     "volume_presets", "methods", "method_catalog_migrations", "templates", "preparation_combinations", "report_profiles",
     "result_order_templates",
     "special_methods", "users", "samples", "sample_tags", "special_results",
-    "preparations", "sample_analytes", "results", "readings",
+    "preparations", "sample_analytes", "results", "readings", "reading_create_requests",
     "instrument_imports", "standard_client_submissions",
     "standard_client_sessions", "standard_client_status", "xrf_analyses",
     "xrf_values", "xrf_report_targets", "uq_analyses", "uq_channels", "xrf_client_status",

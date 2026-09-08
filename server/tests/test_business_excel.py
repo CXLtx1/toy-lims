@@ -8,6 +8,7 @@ import unittest
 from openpyxl import load_workbook
 
 import app as lims
+from client_helpers import browser_client
 
 
 class BusinessExcelApiTest(unittest.TestCase):
@@ -16,7 +17,7 @@ class BusinessExcelApiTest(unittest.TestCase):
         lims.DB = os.path.join(self.tmp.name, "test.db")
         lims.init_db()
         lims.app.config.update(TESTING=True, AUTH_DISABLED=True)
-        self.client = lims.app.test_client()
+        self.client = browser_client(self, lims.app)
         self.meta = self.client.get("/api/meta").get_json()
 
     def tearDown(self):

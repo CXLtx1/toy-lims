@@ -4,6 +4,7 @@
 <link rel="icon" type="image/png" href="/static/mes.png?v=20260902">
 <link rel="stylesheet" href="/static/style.css?v=20260902-labflow"></head>
 <body class="auth-page"><form class="auth-card" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <h1>LabFlow</h1><p>选择这台设备使用的终端入口</p>
   {% if kicked %}<div class="auth-error">该登录已在其他设备使用，本机已下线，请重新登录。</div>{% endif %}
   {% if error %}<div class="auth-error">{{ error }}</div>{% endif %}
@@ -31,7 +32,7 @@
   <label><span id="login-password-label">终端密码</span><input id="login-password" name="password" type="password" autocomplete="current-password" required></label>
   <button id="login-submit" class="primary" type="submit">进入终端</button>
 </form>
-<script>
+<script nonce="{{ csp_nonce() }}">
 (() => {
   const choices = [...document.querySelectorAll('[name="terminal_id"]')];
   const kindButtons = [...document.querySelectorAll('.terminal-kind-choices button')];

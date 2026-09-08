@@ -365,6 +365,11 @@ CREATE TABLE IF NOT EXISTS readings(        -- 平行读数: 同一任务测多�
     extra TEXT DEFAULT '{}',   -- 滴定读数的 V/V0/c 等
     use_avg INTEGER DEFAULT 1,  -- 参与平均
     is_final INTEGER DEFAULT 0); -- 作为该任务终值
+CREATE TABLE IF NOT EXISTS reading_create_requests(
+    client_reading_id TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    reading_id INTEGER,
+    version TEXT);
 CREATE TABLE IF NOT EXISTS instrument_imports(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source TEXT NOT NULL,

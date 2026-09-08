@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 import app as lims
+from client_helpers import browser_client
 from maintenance import create_backup
 
 
@@ -14,7 +15,7 @@ class PhaseOneWorkflowTest(unittest.TestCase):
         lims.DB = os.path.join(self.tmp.name, "test.db")
         lims.init_db()
         lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
-        self.client = lims.app.test_client()
+        self.client = browser_client(self, lims.app)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -79,9 +80,6 @@ class PhaseOneWorkflowTest(unittest.TestCase):
 
     def test_template_preserves_separate_xrf_method_and_report_items(self):
         self.setup_admin()
-        page = self.client.get("/").get_data(as_text=True)
-        self.assertIn('id="t-xrf-config"', page)
-        self.assertIn('id="t-xrf-text"', page)
         meta = self.client.get("/api/meta").get_json()
         method_id = next(item["id"] for item in meta["methods"] if item["itype"] == "xrf")
         fe_id = next(item["id"] for item in meta["analytes"] if item["name"] == "Fe")

@@ -2,7 +2,7 @@
 
 一个面向**无机分析实验室**的轻量级 LIMS（实验室信息管理系统），用于记录来样、管理检测流程、录入分析原始数据、自动换算质量分数并生成报告单。
 
-服务端使用 **Flask + PostgreSQL + Waitress**，SQLite 保留用于自动化测试和旧库迁移；浏览器端使用原生 HTML/CSS/JavaScript，仪器侧提供 **.NET 10 WPF** 客户端。项目面向局域网内的小型实验室，优先保证部署简单、数据可追溯和仪器操作便捷。
+服务端使用 **Flask + PostgreSQL + Waitress**，SQLite 保留用于自动化测试和旧库迁移；浏览器端使用 **Vue 3 + TypeScript + Vite**（源码在 `frontend/`，构建产物由 Flask 托管），仪器侧提供 **.NET 10 WPF** 客户端。项目面向局域网内的小型实验室，优先保证部署简单、数据可追溯和仪器操作便捷。
 
 本系统由陈炫霖构思，由**Kimi K3**，**GLM 5.3 Flash**和**GPT 5.6 Sol**构建。
 代码项目仍命名为 **toy-lims**，网站面向用户显示为 **LabFlow · 化验室执行系统**。
@@ -54,7 +54,7 @@ python server.py
 
 服务默认运行在 **http://127.0.0.1:5000**。第一次打开会进入初始化页面，创建固定首个用户 `cxl`，并设置“二组”和“管理终端”的终端密码。已有用户的数据库升级后只需验证现有管理员密码并初始化终端，不会重建或删除用户。
 
-`python server/app.py` 可用于本机开发；日常运行仍使用根目录的 `server.py`，它会转入 `server/run.py` 并通过 Waitress 提供服务。PostgreSQL 地址在 `server/app.py` 顶部的 `POSTGRES_CONFIG` 中集中配置，也可通过 `LIMS_DATABASE_URL` 整体覆盖。`LIMS_HOST`、`LIMS_PORT`、`LIMS_XRF_CLIENT_TOKEN` 和 `LIMS_STANDARD_CLIENT_TOKEN` 分别调整监听地址和仪器设备认证；`LIMS_THREADS` 调整 Waitress 线程数（默认 32，SSE 协同推送连接会常驻占用线程，需留余量）。反向代理（nginx 等）部署时设 `LIMS_TRUST_PROXY=1`，审计、请求日志和仪器页将显示 `X-Forwarded-For` 中的真实来源 IP；该开关同时让 Waitress 信任本机反代转发的 `X-Forwarded-For/Proto` 头（Waitress 3.x 默认剥离不可信来源的 `X-Forwarded-*`，不设此项即使代码里有 ProxyFix 也拿不到真实 IP）。直连部署不要开启，否则来源头可被伪造。
+`python server/app.py` 可用于本机开发；日常运行仍使用根目录的 `server.py`，它会转入 `server/run.py` 并通过 Waitress 提供服务。数据库连接必须通过环境变量 `LIMS_DATABASE_URL`（PostgreSQL 连接串）配置，服务启动时校验，缺失即拒绝启动。`LIMS_HOST`、`LIMS_PORT`、`LIMS_XRF_CLIENT_TOKEN` 和 `LIMS_STANDARD_CLIENT_TOKEN` 分别调整监听地址和仪器设备认证（仪器接口一律要求设备令牌，不再有本机免认证放行）；`LIMS_THREADS` 调整 Waitress 线程数（默认 32，SSE 协同推送连接会常驻占用线程，需留余量）。反向代理（nginx 等）部署时设 `LIMS_TRUST_PROXY=1`，审计、请求日志和仪器页将显示 `X-Forwarded-For` 中的真实来源 IP；该开关同时让 Waitress 信任本机反代转发的 `X-Forwarded-For/Proto` 头（Waitress 3.x 默认剥离不可信来源的 `X-Forwarded-*`，不设此项即使代码里有 ProxyFix 也拿不到真实 IP）。直连部署不要开启，否则来源头可被伪造。
 
 ### 2.2 环境依赖
 
@@ -87,7 +87,7 @@ python server.py
 
 由于普通终端仅凭密码识别操作者，所有启用用户必须使用不同密码；新增用户和重置密码时服务器会强制检查。能力和两分钟授权均由服务器端检查，隐藏按钮不是唯一防线。
 
-顶部独立的**用户**页维护用户以及普通、管理两类实体终端。用户支持修改登录名、姓名、能力组合、密码和启停；实体终端支持新增、改名、切换普通/管理类型、重置密码、启停，以及通过上移/下移调整登录页显示顺序。个人入口不在终端管理中显示，对所有启用用户自动开放。当前正在使用的实体终端不能停用或切换类型，系统始终至少保留一个具备“用户管理”能力的启用用户和一个启用的管理终端。所有用户和终端密码均要求非空，不限制最短长度。
+顶部独立的**用户**页维护用户以及普通、管理两类实体终端。用户支持修改登录名、姓名、能力组合、密码和启停；实体终端支持新增、改名、切换普通/管理类型、重置密码、启停，以及通过上移/下移调整登录页显示顺序。个人入口不在终端管理中显示，对所有启用用户自动开放。当前正在使用的实体终端不能停用或切换类型，系统始终至少保留一个具备“用户管理”能力的启用用户和一个启用的管理终端。用户和终端密码使用 scrypt 哈希存储，新设置/修改的密码要求至少 12 位（既有旧哈希登录不受影响，校验通过后自动升级）。
 
 Web 页面通过 SSE 实时接收数据修订号推送，仅在有变化时刷新当前业务页；仪器页每 2 秒刷新在线状态。输入控件聚焦时暂停自动重绘，避免覆盖正在填写的数据。独立审计页显示最近 500 条记录，终端、用户、样品、设置和仪器客户端操作均可追溯。
 
@@ -535,8 +535,11 @@ c * V * 65.38 * v / Va / m / 1000 * 100
 D:/文件/Projects/toy-lims/
 ├── server.py               # 兼容启动入口
 ├── README.md               # 项目总说明
-├── server/                 # LIMS 服务端及浏览器页面
+├── frontend/               # Vue 3 + TypeScript + Vite 浏览器端（构建产物 dist/）
+├── server/                 # LIMS 服务端及旧版页面
 │   ├── app.py              # Flask、数据库地址、主要 API 和换算逻辑
+│   ├── security.py         # CSRF、限速、安全头与 HTTPS/Cookie 策略
+│   ├── mutation_guard.py   # 写入乐观锁与幂等创建
 │   ├── db_schema.py        # 表结构、SQLite 升级、种子数据和初始化
 │   ├── db_backend.py       # SQLite/PostgreSQL 连接、SQL 方言和行兼容层
 │   ├── migrate_to_postgres.py # 筛选并迁移旧 SQLite 数据
@@ -550,8 +553,8 @@ D:/文件/Projects/toy-lims/
 │   ├── instance/           # Flask 密钥
 │   ├── backups/            # 迁移前 SQLite 备份
 │   ├── logs/               # 可选的按日请求日志
-│   ├── templates/          # Web 页面
-│   ├── static/             # Web 样式和交互
+│   ├── templates/          # 旧版页面（过渡回退）与登录/初始化页
+│   ├── static/             # 旧版样式和交互、共享静态资源
 │   └── tests/              # 服务端测试
 ├── client/                 # .NET 10 Windows 工具与仪器客户端
 │   ├── docs/               # 总体方案及 OXSAS 资料
@@ -579,6 +582,8 @@ D:/文件/Projects/toy-lims/
 
 ## 11. 开发与验证
 
+### 11. 开发与验证
+
 服务端测试使用 Python 标准库 `unittest`：
 
 ```powershell
@@ -586,11 +591,17 @@ cd server
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-前端没有单独构建步骤，修改 JavaScript 后至少执行语法检查：
+浏览器端为 `frontend/` 下的 Vue 3 + TypeScript + Vite 工程（Node 22+）：
 
 ```powershell
-node --check server/static/app.js
+cd frontend
+npm install
+npm test           # Vitest 单元测试
+npm run lint       # ESLint
+npm run build      # vue-tsc 类型检查 + 产出 frontend/dist/
 ```
+
+`npm run dev` 启动 Vite 开发服务器（自动把 `/api` 等请求代理到 127.0.0.1:5000）；生产部署执行 `npm run build` 后由 Flask 托管 `frontend/dist/`。
 
 两个仪器客户端可分别构建：
 

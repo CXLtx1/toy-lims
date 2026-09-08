@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import app as lims
+from client_helpers import browser_client
 
 
 class UniversalOrderTemplateTest(unittest.TestCase):
@@ -12,7 +13,7 @@ class UniversalOrderTemplateTest(unittest.TestCase):
         lims.DB = os.path.join(self.tmp.name, "test.db")
         lims.init_db()
         lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
-        self.client = lims.app.test_client()
+        self.client = browser_client(self, lims.app)
 
     def tearDown(self):
         self.tmp.cleanup()

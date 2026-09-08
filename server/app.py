@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """toy-lims —— 无机分析实验室轻量级 LIMS
-Flask + PostgreSQL（SQLite 测试兼容）+ 原生前端
+Flask + PostgreSQL（SQLite 测试兼容）+ Vue 3 工程化前端
 """
 import gzip
 import json
@@ -18,14 +18,15 @@ from functools import wraps
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from flask import Flask, Response, g, jsonify, request, render_template, send_file
+from uuid import UUID
+from flask import Flask, Response, g, jsonify, request, render_template, send_file, send_from_directory
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from business_excel import (BusinessExcelError, MIME as EXCEL_MIME, build_data,
                             build_overview, build_plan, build_report,
                             parse_data, parse_plan)
 from db_backend import (DATABASE_ERRORS, INTEGRITY_ERRORS, connect_database,
-                        is_postgres_database, postgres_dsn)
+                        is_postgres_database)
 from db_schema import initialize_database
 from lims_auth import (CAPABILITIES, bp as auth_bp,
                        authenticate_capable_user, capability_required, consume_forced_authorization,
@@ -35,40 +36,37 @@ from lims_workflow import (CAPABILITY_STATUS_TARGETS, SAMPLE_STATUS_LABELS, SAMP
                            can_transition, next_lims_no,
                            recompute_sample_progress, recompute_task_progress)
 from result_report_excel import build_result_report
+from mutation_guard import (begin_mutation, locked_row, lock_reading,
+                            lock_reading_task, next_updated_at, reading_version, stable_hash)
+from security import init_security
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 BASE_DIR = Path(__file__).resolve().parent
+# Vite 构建产物（frontend/dist，base 为 /frontend/）；未构建时首页回退到旧模板。
+FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
 # 反向代理部署时设 LIMS_TRUST_PROXY=1：request.remote_addr 改读 X-Forwarded-For，
 # 审计、请求日志和仪器页才能显示真实来源 IP；直连部署不要开启（头可被伪造）。
-if os.environ.get("LIMS_TRUST_PROXY", "").strip() in {"1", "true", "yes"}:
+if os.environ.get("LIMS_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes"}:
     from werkzeug.middleware.proxy_fix import ProxyFix
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 # 请求日志开关：设为 False 后不创建日志目录，也不写请求日志。
 REQUEST_LOG_ENABLED = False
 
-secret_file = BASE_DIR / "instance" / "secret_key"
-secret_file.parent.mkdir(exist_ok=True)
-if not secret_file.exists():
-    secret_file.write_text(secrets.token_hex(32), encoding="ascii")
-app.secret_key = os.environ.get("LIMS_SECRET_KEY") or secret_file.read_text(encoding="ascii").strip()
+app.secret_key = os.environ.get("LIMS_SECRET_KEY")
+if not app.secret_key:
+    secret_file = BASE_DIR / "instance" / "secret_key"
+    secret_file.parent.mkdir(exist_ok=True)
+    if not secret_file.exists():
+        secret_file.write_text(secrets.token_hex(32), encoding="ascii")
+    app.secret_key = secret_file.read_text(encoding="ascii").strip()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict")
 
-# 正式数据库配置。测试仍可把 DB 覆盖为临时 SQLite 文件。
-DATABASE_BACKEND = "postgresql"
-POSTGRES_CONFIG = {
-    "host": "192.168.2.4",
-    "port": 5432,
-    "database": "toy_lims",
-    "user": "cxltx",
-    "password": "qwe123qwe123",
-}
-SQLITE_DB = os.environ.get("LIMS_DB", str(BASE_DIR / "lims.db"))
-DB = os.environ.get("LIMS_DATABASE_URL") or (
-    postgres_dsn(POSTGRES_CONFIG) if DATABASE_BACKEND == "postgresql" else SQLITE_DB)
-# 仪器客户端设备令牌：可直接写在这里（内网部署），环境变量优先。
+# No implicit database or embedded credentials. Tests may supply a temporary DB.
+DB = os.environ.get("LIMS_DATABASE_URL") or os.environ.get("LIMS_DB")
+# Instrument tokens must also be configured for loopback clients.
 XRF_CLIENT_TOKEN = os.environ.get("LIMS_XRF_CLIENT_TOKEN", "").strip() or ""
 STANDARD_CLIENT_TOKEN = os.environ.get("LIMS_STANDARD_CLIENT_TOKEN", "").strip() or ""
 LOG_DIR = Path(os.environ.get("LIMS_LOG_DIR", str(BASE_DIR / "logs")))
@@ -92,43 +90,42 @@ RESULT_DISPLAY_UNITS = ("%", "ppm", "ppb", "g/L", "mg/L", "ug/L")
 
 # Database schema and initialization live in db_schema.py.
 
+def database_target():
+    target = app.config.get("LIMS_DATABASE_URL") or app.config.get("DATABASE_URL") or DB
+    if not target:
+        raise RuntimeError("Configure LIMS_DATABASE_URL before starting the server")
+    return target
+
+
 def get_db():
     if "db" not in g:
-        g.db = connect_database(DB)
+        g.db = connect_database(database_target())
     return g.db
 
 
 def xrf_client_required(view):
-    """本机测试直接放行；跨机器访问必须提供环境变量配置的设备令牌。"""
+    """Require a device token regardless of network origin."""
     @wraps(view)
     def wrapped(*args, **kwargs):
-        remote = request.remote_addr or ""
-        if remote in {"127.0.0.1", "::1"}:
-            return view(*args, **kwargs)
-        expected = XRF_CLIENT_TOKEN
+        expected = app.config.get("XRF_CLIENT_TOKEN", XRF_CLIENT_TOKEN)
         supplied = request.headers.get("X-Instrument-Token", "").strip()
         if not expected:
             return jsonify(ok=False, error="服务端尚未配置 LIMS_XRF_CLIENT_TOKEN"), 503
-        if not secrets.compare_digest(supplied, expected):
+        if not secrets.compare_digest(supplied.encode(), expected.encode()):
             return jsonify(ok=False, error="仪器客户端令牌无效"), 401
         return view(*args, **kwargs)
     return wrapped
 
 
 def standard_client_required(view):
-    """标准仪器客户端使用独立设备令牌；本机联调直接放行。"""
+    """Require a separate standard-instrument token, including during tests."""
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if app.config.get("AUTH_DISABLED"):
-            return view(*args, **kwargs)
-        remote = request.remote_addr or ""
-        if remote in {"127.0.0.1", "::1"}:
-            return view(*args, **kwargs)
-        expected = STANDARD_CLIENT_TOKEN
+        expected = app.config.get("STANDARD_CLIENT_TOKEN", STANDARD_CLIENT_TOKEN)
         supplied = request.headers.get("X-Instrument-Token", "").strip()
         if not expected:
             return jsonify(ok=False, error="服务端尚未配置 LIMS_STANDARD_CLIENT_TOKEN"), 503
-        if not secrets.compare_digest(supplied, expected):
+        if not secrets.compare_digest(supplied.encode(), expected.encode()):
             return jsonify(ok=False, error="标准仪器客户端令牌无效"), 401
         return view(*args, **kwargs)
     return wrapped
@@ -142,6 +139,7 @@ def close_db(_=None):
 
 
 app.extensions["lims_get_db"] = get_db
+init_security(app)
 app.register_blueprint(auth_bp)
 
 
@@ -244,7 +242,7 @@ def route_not_found(error):
 
 
 def init_db():
-    initialize_database(DB)
+    initialize_database(database_target())
 
 
 # ---------------------------------------------------------------- 工具
@@ -721,8 +719,21 @@ def attach_sample_status_history(db, samples):
 
 @app.route("/")
 def index():
-    response = app.make_response(render_template("index.html"))
+    built = FRONTEND_DIST / "index.html"
+    if built.exists():
+        response = app.make_response(send_file(built))
+    else:
+        response = app.make_response(render_template("index.html"))
     response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/frontend/<path:filename>")
+def frontend_assets(filename):
+    response = send_from_directory(FRONTEND_DIST, filename)
+    # 资产文件名带内容哈希，可以长缓存；manifest 与 index.html 除外。
+    if filename.startswith("assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return response
 
 
@@ -792,7 +803,7 @@ SSE_HEARTBEAT_TICKS = 15
 def sse_events():
     """SSE 推送：audit_logs 最大 id 变化（即服务器 revision 变化）时通知浏览器刷新。"""
     def generate():
-        connection = connect_database(DB)
+        connection = connect_database(database_target())
         # 只读单语句轮询，必须 autocommit：否则连接终身 idle in transaction，
         # 长期持有旧快照，阻止 VACUUM 回收 audit_logs 死元组。
         connection.autocommit = True
@@ -1323,9 +1334,9 @@ def _import_plan(sid=None):
         db.rollback()
         conflict = any(word in str(exc) for word in ("已审核", "已出报告", "已作废", "已被他人", "身份", "不能相互转换", "已有专项数据"))
         return excel_error(exc, 409 if conflict else 400)
-    except DATABASE_ERRORS as exc:
+    except DATABASE_ERRORS:
         db.rollback()
-        return excel_error(BusinessExcelError(f"导入失败，数据未改变：{exc}"), 400)
+        return excel_error(BusinessExcelError("导入失败，数据未改变"), 400)
     except Exception:
         db.rollback()
         raise
@@ -1459,9 +1470,9 @@ def excel_sample_data_overwrite(sid):
         conflict = any(word in str(exc) for word in ("状态", "身份", "已被他人"))
         status = 404 if str(exc) == "样品不存在" else (409 if conflict else 400)
         return excel_error(exc, status)
-    except DATABASE_ERRORS as exc:
+    except DATABASE_ERRORS:
         db.rollback()
-        return excel_error(BusinessExcelError(f"导入失败，数据未改变：{exc}"), 400)
+        return excel_error(BusinessExcelError("导入失败，数据未改变"), 400)
     except Exception:
         db.rollback()
         raise
@@ -2283,6 +2294,7 @@ def sample_detail(sid):
                     WHERE sa.sample_id=? ORDER BY rd.id""", (sid,))
     by_task = {}
     for rd in reads:
+        rd["version"] = reading_version(rd)
         by_task.setdefault(rd["sample_analyte_id"], []).append(rd)
     for it in items:
         it["readings"] = by_task.get(it["id"], [])
@@ -2416,9 +2428,13 @@ def update_sample(sid):
     if not name:
         return jsonify(ok=False, error="来样序号不能为空"), 400
     db = get_db()
-    before_row = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    begin_mutation(db)
+    before_row = locked_row(db, "SELECT * FROM samples WHERE id=?", (sid,))
     if not before_row:
         return jsonify(ok=False, error="样品不存在"), 404
+    if "expected_updated_at" in d and d["expected_updated_at"] != before_row["updated_at"]:
+        db.rollback()
+        return jsonify(ok=False, code="version_conflict", error="Sample changed; reload before saving"), 409
     if before_row["status"] in {"reviewed", "reported", "cancelled"}:
         return jsonify(ok=False, error="已审核、已出报告或已作废的样品不能直接修改"), 409
     before = sample_audit_snapshot(db, sid)
@@ -2447,10 +2463,13 @@ def update_sample(sid):
         db.execute("""INSERT INTO special_results(sample_id,method_id) VALUES(?,?)
             ON CONFLICT(sample_id) DO UPDATE SET method_id=excluded.method_id""",
             (sid, special_method_id))
+        updated_at = next_updated_at(before_row["updated_at"])
+        db.execute("UPDATE samples SET updated_at=? WHERE id=?", (updated_at, sid))
         audit_event(db, "update", "sample", sid, before=before,
                     after=sample_audit_snapshot(db, sid))
         db.commit()
-        return jsonify(ok=True, id=sid, lims_no=before_row["lims_no"], status=before_row["status"])
+        return jsonify(ok=True, id=sid, lims_no=before_row["lims_no"], status=before_row["status"],
+                       updated_at=updated_at)
     instrument_map = d.get("instrument_map", {})
     try:
         requested_tags = clean_sample_tags(d.get("tags")) if "tags" in d else None
@@ -2537,11 +2556,13 @@ def update_sample(sid):
         db.execute("DELETE FROM preparations WHERE id=?", (pid,))
 
     recompute_sample_progress(db, sid)
+    db.execute("UPDATE samples SET updated_at=? WHERE id=?", (next_updated_at(before_row["updated_at"]), sid))
     after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
     audit_event(db, "update", "sample", sid, before=before,
                 after=sample_audit_snapshot(db, sid))
     db.commit()
-    return jsonify(ok=True, id=sid, lims_no=after["lims_no"], status=after["status"])
+    return jsonify(ok=True, id=sid, lims_no=after["lims_no"], status=after["status"],
+                   updated_at=after["updated_at"])
 
 
 @app.route("/api/samples/<int:sid>/report-meta", methods=["PUT"])
@@ -2550,9 +2571,13 @@ def update_report_meta(sid):
     """保存可编辑票面信息；审核人只能由审核动作写入。"""
     d = request.json or {}
     db = get_db()
-    before = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    begin_mutation(db)
+    before = locked_row(db, "SELECT * FROM samples WHERE id=?", (sid,))
     if not before:
         return jsonify(ok=False, error="样品不存在"), 404
+    if "expected_updated_at" in d and d["expected_updated_at"] != before["updated_at"]:
+        db.rollback()
+        return jsonify(ok=False, code="version_conflict", error="Sample changed; reload before saving"), 409
     if before["status"] in {"reported", "cancelled"}:
         return jsonify(ok=False, error="已作废的样品不能修改票面信息"), 409
     profile_id = d.get("report_profile_id")
@@ -2565,12 +2590,12 @@ def update_report_meta(sid):
     fields = ("customer", "report_no", "analysis_date", "analyst")
     values = [str(d.get(field, "")).strip() for field in fields]
     db.execute("""UPDATE samples SET customer=?,report_no=?,analysis_date=?,
-                  analyst=?,report_profile_id=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
-               values + [profile_id, sid])
+                  analyst=?,report_profile_id=?,updated_at=? WHERE id=?""",
+               values + [profile_id, next_updated_at(before["updated_at"]), sid])
     after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
     audit_event(db, "report_meta", "sample", sid, before=before, after=after)
     db.commit()
-    return jsonify(ok=True)
+    return jsonify(ok=True, updated_at=after["updated_at"])
 
 
 @app.route("/api/results", methods=["POST"])
@@ -2579,11 +2604,16 @@ def save_result():
     d = request.json or {}
     db = get_db()
     said = d.get("sample_analyte_id")
-    task = db.execute("""SELECT sa.*,s.status AS sample_status,i.itype FROM sample_analytes sa
+    begin_mutation(db)
+    lock_reading_task(db, said)
+    task = db.execute("""SELECT sa.*,s.status AS sample_status,s.updated_at AS sample_updated_at,i.itype FROM sample_analytes sa
         JOIN samples s ON s.id=sa.sample_id
         LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=?""", (said,)).fetchone()
     if not task:
         return jsonify(ok=False, error="分析任务不存在"), 404
+    if "expected_updated_at" in d and d["expected_updated_at"] != task["sample_updated_at"]:
+        db.rollback()
+        return jsonify(ok=False, code="version_conflict", error="Sample changed; reload before saving"), 409
     if task["sample_status"] in {"registered", "received", "queued"} and task["itype"] != "xrf":
         return jsonify(ok=False, error="请先完成制样并开始测量"), 409
     if task["sample_status"] in {"reviewed", "reported", "cancelled"}:
@@ -2619,12 +2649,14 @@ def save_result():
                SET raw=excluded.raw, extra=excluded.extra, aux=excluded.aux""",
             (said, raw, json.dumps(extra or {}), json.dumps(aux or {})))
     recompute_task_progress(db, said)
+    updated_at = next_updated_at(task["sample_updated_at"])
+    db.execute("UPDATE samples SET updated_at=? WHERE id=?", (updated_at, task["sample_id"]))
     after = {"task": dict(db.execute("SELECT * FROM sample_analytes WHERE id=?", (said,)).fetchone()),
              "result": dict(db.execute("SELECT * FROM results WHERE sample_analyte_id=?",
                                        (said,)).fetchone() or {})}
     audit_event(db, "result_update", "sample_analyte", said, before=before, after=after)
     db.commit()
-    return jsonify(ok=True)
+    return jsonify(ok=True, updated_at=updated_at)
 
 
 @app.route("/api/sample-analytes/<int:said>/report-use", methods=["PUT"])
@@ -2653,9 +2685,51 @@ def set_report_use(said):
 @app.route("/api/readings", methods=["POST"])
 @capability_required("result_edit")
 def add_reading():
-    said = request.json["sample_analyte_id"]
+    d = request.json or {}
+    try:
+        said = int(d["sample_analyte_id"])
+        if isinstance(d["sample_analyte_id"], bool) or said <= 0 or str(said) != str(d["sample_analyte_id"]):
+            raise ValueError("sample_analyte_id must be a positive integer")
+        client_key = d.get("client_reading_id")
+        if "client_reading_id" in d:
+            if not isinstance(client_key, str) or str(UUID(client_key)) != client_key.lower():
+                raise ValueError("client_reading_id must be a UUID string")
+            client_key = str(UUID(client_key))
+        raw = d.get("raw")
+        if raw is not None and (isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw)):
+            raise ValueError("raw must be a finite number or null")
+        extra = d.get("extra", {})
+        if not isinstance(extra, dict):
+            raise ValueError("extra must be an object")
+        json.dumps(extra, allow_nan=False)
+        payload = {"sample_analyte_id": said, "raw": float(raw) if raw is not None else None,
+                   "extra": extra, "use_avg": int(bool(d.get("use_avg", True))),
+                   "is_final": int(bool(d.get("is_final", False)))}
+        payload_hash = stable_hash(payload)
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     db = get_db()
-    task = db.execute("""SELECT sa.sample_id,s.status,i.itype FROM sample_analytes sa
+    begin_mutation(db)
+    if client_key:
+        # The unique key reservation and the reading/audit commit together. Keep
+        # this record without a cascading FK so deleted readings cannot reappear.
+        inserted = db.execute("""INSERT INTO reading_create_requests(client_reading_id,payload_hash)
+            VALUES(?,?) ON CONFLICT(client_reading_id) DO NOTHING""", (client_key, payload_hash)).rowcount
+        saved = locked_row(db, "SELECT * FROM reading_create_requests WHERE client_reading_id=?", (client_key,))
+        if not inserted:
+            if saved["payload_hash"] != payload_hash:
+                db.rollback()
+                return jsonify(ok=False, code="idempotency_conflict", error="Client reading ID already used with different values"), 409
+            existing = lock_reading(db, saved["reading_id"])
+            if not existing:
+                db.rollback()
+                return jsonify(ok=False, code="version_conflict", error="The original reading was deleted"), 409
+            db.commit()
+            # Return the creation version, not a fresh token that could let an
+            # old queued draft overwrite edits made after the original create.
+            return jsonify(ok=True, id=saved["reading_id"], version=saved["version"], replayed=True)
+    lock_reading_task(db, said)
+    task = db.execute("""SELECT sa.sample_id,s.status,s.updated_at,i.itype FROM sample_analytes sa
         JOIN samples s ON s.id=sa.sample_id
         LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=?""", (said,)).fetchone()
     if not task:
@@ -2664,12 +2738,23 @@ def add_reading():
         return jsonify(ok=False, error="请先完成制样并开始测量"), 409
     if task["status"] in {"reviewed", "reported", "cancelled"}:
         return jsonify(ok=False, error="该样品已锁定，不能增加读数"), 409
-    cur = db.execute("INSERT INTO readings(sample_analyte_id) VALUES(?)", (said,))
+    if payload["is_final"]:
+        db.execute("UPDATE readings SET is_final=0 WHERE sample_analyte_id=?", (said,))
+    cur = db.execute("""INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final)
+        VALUES(?,?,?,?,?)""", (said, payload["raw"], json.dumps(extra, sort_keys=True),
+                              payload["use_avg"], payload["is_final"]))
+    created = db.execute("SELECT * FROM readings WHERE id=?", (cur.lastrowid,)).fetchone()
+    version = reading_version(created)
+    if client_key:
+        db.execute("UPDATE reading_create_requests SET reading_id=?,version=? WHERE client_reading_id=?",
+                   (cur.lastrowid, version, client_key))
     recompute_task_progress(db, said)
+    db.execute("UPDATE samples SET updated_at=? WHERE id=?",
+               (next_updated_at(task["updated_at"]), task["sample_id"]))
     audit_event(db, "create", "reading", cur.lastrowid,
-                after={"sample_analyte_id": said})
+                after=created)
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=cur.lastrowid, version=version, replayed=False)
 
 
 @app.route("/api/readings/<int:rid>", methods=["PUT"])
@@ -2677,10 +2762,14 @@ def add_reading():
 def update_reading(rid):
     d = request.json or {}
     db = get_db()
-    row = db.execute("SELECT * FROM readings WHERE id=?", (rid,)).fetchone()
+    begin_mutation(db)
+    row = lock_reading(db, rid)
+    if "expected_version" in d and (not row or d["expected_version"] != reading_version(row)):
+        db.rollback()
+        return jsonify(ok=False, code="version_conflict", error="Reading changed or deleted; reload before saving"), 409
     if not row:
         return jsonify(ok=False, error="读数不存在"), 404
-    sample = db.execute("""SELECT s.status,i.itype FROM samples s JOIN sample_analytes sa
+    sample = db.execute("""SELECT s.id,s.status,s.updated_at,i.itype FROM samples s JOIN sample_analytes sa
         ON sa.sample_id=s.id LEFT JOIN instruments i ON i.id=sa.instrument_id
         WHERE sa.id=?""", (row["sample_analyte_id"],)).fetchone()
     if sample["status"] in {"registered", "received", "queued"} and sample["itype"] != "xrf":
@@ -2702,20 +2791,28 @@ def update_reading(rid):
         db.execute("UPDATE readings SET is_final=? WHERE id=?",
                    (int(bool(d["is_final"])), rid))
     recompute_task_progress(db, row["sample_analyte_id"])
+    db.execute("UPDATE samples SET updated_at=? WHERE id=?",
+               (next_updated_at(sample["updated_at"]), sample["id"]))
     after = db.execute("SELECT * FROM readings WHERE id=?", (rid,)).fetchone()
+    version = reading_version(after)
     audit_event(db, "update", "reading", rid, before=row, after=after)
     db.commit()
-    return jsonify(ok=True)
+    return jsonify(ok=True, id=rid, version=version)
 
 
 @app.route("/api/readings/<int:rid>", methods=["DELETE"])
 @capability_required("result_edit")
 def del_reading(rid):
+    d = (request.get_json() if request.is_json else {}) or {}
     db = get_db()
-    before = db.execute("SELECT * FROM readings WHERE id=?", (rid,)).fetchone()
+    begin_mutation(db)
+    before = lock_reading(db, rid)
+    if "expected_version" in d and (not before or d["expected_version"] != reading_version(before)):
+        db.rollback()
+        return jsonify(ok=False, code="version_conflict", error="Reading changed or deleted; reload before deleting"), 409
     if not before:
         return jsonify(ok=False, error="读数不存在"), 404
-    sample = db.execute("""SELECT s.status,i.itype FROM samples s JOIN sample_analytes sa
+    sample = db.execute("""SELECT s.id,s.status,s.updated_at,i.itype FROM samples s JOIN sample_analytes sa
         ON sa.sample_id=s.id LEFT JOIN instruments i ON i.id=sa.instrument_id
         WHERE sa.id=?""", (before["sample_analyte_id"],)).fetchone()
     if sample["status"] in {"registered", "received", "queued"} and sample["itype"] != "xrf":
@@ -2724,6 +2821,8 @@ def del_reading(rid):
         return jsonify(ok=False, error="该样品已锁定，不能删除读数"), 409
     db.execute("DELETE FROM readings WHERE id=?", (rid,))
     recompute_task_progress(db, before["sample_analyte_id"])
+    db.execute("UPDATE samples SET updated_at=? WHERE id=?",
+               (next_updated_at(sample["updated_at"]), sample["id"]))
     audit_event(db, "delete", "reading", rid, before=before)
     db.commit()
     return jsonify(ok=True)
@@ -3938,7 +4037,7 @@ _REPORT_CACHE_REBUILDER_STARTED = False
 
 
 def cached_report_payload(db, sid):
-    cache_key = (str(DB), sid)
+    cache_key = (str(database_target()), sid)
     now = time.monotonic()
     cached = REPORT_PAYLOAD_CACHE.get(cache_key)
     if cached and now - cached[0] < REPORT_PAYLOAD_CACHE_TTL:
@@ -4002,12 +4101,12 @@ def _rebuild_report_payloads(sids, cleared_at):
     if not sids:
         return
     try:
-        connection = connect_database(DB)
+        connection = connect_database(database_target())
     except Exception:
         return
     try:
         for sid in sids:
-            cache_key = (str(DB), sid)
+            cache_key = (str(database_target()), sid)
             cached = REPORT_PAYLOAD_CACHE.get(cache_key)
             if cached and cached[0] >= cleared_at:
                 continue  # 等待期内已被请求同步重建过，数据更新，跳过

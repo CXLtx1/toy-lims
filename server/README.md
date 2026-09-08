@@ -1,6 +1,6 @@
 # toy-lims 服务端
 
-本目录保存 Flask + PostgreSQL LIMS 的服务端代码和 Web 页面；SQLite 保留用于测试与旧库迁移。
+本目录保存 Flask + PostgreSQL LIMS 的服务端代码；浏览器端为 Vue 3 + TypeScript + Vite 工程（`frontend/`）。SQLite 保留用于测试与旧库迁移。
 
 ## 运行
 
@@ -28,7 +28,21 @@ python server/app.py
 python -m pip install -r server/requirements.txt
 ```
 
-PostgreSQL 连接集中配置在 `app.py` 的 `POSTGRES_CONFIG`，也可用 `LIMS_DATABASE_URL` 覆盖；表结构、旧库升级和种子数据位于 `db_schema.py`，数据库兼容层位于 `db_backend.py`。旧 `lims.db` 仅作迁移源/回退档案，`migrate_to_postgres.py` 默认只迁移 `RY28888` 及其关联业务记录，同时保留全部配置。PostgreSQL 请使用 `pg_dump` 或数据库服务器快照备份。在 `app.py` 中启用 `REQUEST_LOG_ENABLED` 后，请求日志写入 `server/logs/requests.log` 并按日永久保留。反向代理部署时设 `LIMS_TRUST_PROXY=1` 读取 `X-Forwarded-For` 真实来源 IP（直连部署不要开启）；该开关同时让 Waitress 放行本机反代转发的 `X-Forwarded-For/Proto`（Waitress 3.x 默认会剥掉它们，这是“配置都对但审计 IP 仍是 127.0.0.1”的常见病根）。仪器客户端的"本机放行"判定同样基于来源 IP，代理模式下跨机器客户端必须正确配置设备令牌。
+数据库连接必须通过环境变量 `LIMS_DATABASE_URL` 配置（PostgreSQL 连接串），服务启动时会校验，缺失即拒绝启动；表结构、旧库升级和种子数据位于 `db_schema.py`，数据库兼容层位于 `db_backend.py`。旧 `lims.db` 仅作迁移源/回退档案，`migrate_to_postgres.py` 默认只迁移 `RY28888` 及其关联业务记录，同时保留全部配置。PostgreSQL 请使用 `pg_dump` 或数据库服务器快照备份。在 `app.py` 中启用 `REQUEST_LOG_ENABLED` 后，请求日志写入 `server/logs/requests.log` 并按日永久保留。反向代理部署时设 `LIMS_TRUST_PROXY=1` 读取 `X-Forwarded-For` 真实来源 IP（直连部署不要开启）；该开关同时让 Waitress 放行本机反代转发的 `X-Forwarded-For/Proto`（Waitress 3.x 默认会剥掉它们，这是“配置都对但审计 IP 仍是 127.0.0.1”的常见病根）。仪器客户端不再区分本机与远程，一律要求设备令牌。
+
+## 前端构建
+
+浏览器端在 `frontend/`（Vue 3 + TypeScript + Vite，Node 22+）：
+
+```powershell
+cd frontend
+npm install
+npm run build      # 类型检查 + 产出 frontend/dist/（base 为 /frontend/）
+npm test           # Vitest 单元测试
+npm run lint       # ESLint
+```
+
+Flask 从 `frontend/dist/` 托管构建产物：`/` 返回 SPA 首页，`/frontend/assets/*` 带内容哈希返回一年不可变缓存；`frontend/dist` 不存在时回退到旧版 `templates/index.html`（仅过渡用途）。开发时可用 `npm run dev`（Vite 开发服务器代理 `/api` 到 127.0.0.1:5000）。
 
 ## Linux 部署（systemd）
 
@@ -109,7 +123,19 @@ python server/migrate_to_postgres.py --replace
 
 浏览器先选择标准、个人或管理入口。普通终端使用终端密码登录，可以浏览和打印；写请求需要通过右下角窗口输入唯一的用户密码，授权在最后一次成功写操作 2 分钟后失效。个人入口默认对所有启用用户开放，无需创建或选择终端，使用用户名和用户密码登录，整个会话按该真实用户的能力执行并记录审计。管理终端使用终端密码登录且无需用户授权，其修改以管理终端身份记录。旧数据库升级后会进入一次性终端初始化页，验证现有管理员密码后设置“二组”和“管理终端”的密码。
 
-顶部独立“用户”页维护用户和普通、管理两类实体终端，并通过上移、下移调整登录页顺序；个人入口不需要管理。用户权限采用继承式可组合能力，不使用固定角色：操作者不能授予自己没有的能力，也不能修改权限高于自己的账号。用户和终端密码只要求非空，不限制最短长度。终端接口为 `GET/POST /api/terminals`、`PUT /api/terminals/<id>` 和 `PUT /api/terminals/<id>/order`；服务器禁止停用当前终端，并保证至少保留一个启用的管理终端。
+顶部独立“用户”页维护用户和普通、管理两类实体终端，并通过上移、下移调整登录页顺序；个人入口不需要管理。用户权限采用继承式可组合能力，不使用固定角色：操作者不能授予自己没有的能力，也不能修改权限高于自己的账号。用户和终端密码使用 scrypt 哈希存储，新设置/修改的密码要求至少 12 位（既有旧哈希登录不受影响，校验通过后自动升级为 scrypt）。终端接口为 `GET/POST /api/terminals`、`PUT /api/terminals/<id>` 和 `PUT /api/terminals/<id>/order`；服务器禁止停用当前终端，并保证至少保留一个启用的管理终端。
+
+## Web 安全
+
+服务端强制以下防线（`security.py`，启动即启用，无需配置）：
+
+- **CSRF 防护**：所有非 GET/HEAD/OPTIONS 请求必须携带 `X-CSRF-Token`（登录后经 `/api/session` 下发）且 `Origin` 与站点一致；仪器接口以设备令牌单独认证，不受 CSRF 约束。
+- **限速**：登录、初始化、写授权等敏感端点按来源 IP 与账号限速，超限返回 429 及 `Retry-After`。
+- **安全响应头**：`Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`Referrer-Policy`、`X-Frame-Options` 等统一注入。
+- **HTTPS/Cookie**：默认要求 HTTPS（反向代理需正确转发 `X-Forwarded-Proto`，配合 `LIMS_TRUST_PROXY=1`）；本机明文调试可设 `LIMS_REQUIRE_HTTPS=0`。会话 Cookie 默认 `HttpOnly + SameSite=Strict`，HTTPS 下自动 `Secure`（可用 `LIMS_SESSION_COOKIE_SECURE` 显式控制）。
+- **通用 500 脱敏**：未捕获异常只返回通用错误信息，详情仅写服务端日志。
+
+写入可靠性由 `mutation_guard.py` 提供乐观锁与幂等：读数更新/删除可携带 `expected_version`，样品修改与票面信息保存可携带 `expected_updated_at`，冲突时返回 409 `version_conflict`；新建读数携带 `client_reading_id`（UUID）实现幂等创建，重复提交返回原读数（`replayed: true`），同一编号配不同数据返回 409 `idempotency_conflict`。浏览器端（`frontend/src`）已全面接入这些契约，冲突时保留草稿并提示重新载入。
 
 ## XRF 仪器
 
@@ -138,11 +164,15 @@ Web 顶部“审计”页集中显示最近 500 条审计记录，可按关键�
 
 ## 边界
 
-- `app.py`：HTTP API、数据库配置和报告计算。
+- `app.py`：HTTP API、数据库配置和报告计算；托管 `frontend/dist/` 构建产物。
 - `db_schema.py`：表结构、旧 SQLite 升级、种子数据和初始化。
 - `db_backend.py`：PostgreSQL/SQLite 连接与 SQL 兼容层。
+- `security.py`：CSRF、限速、安全头、HTTPS/Cookie 策略。
+- `mutation_guard.py`：写入乐观锁与幂等创建。
+- `lims_auth.py`：初始化、登录、能力权限与审计查询。
 - `migrate_to_postgres.py`：旧 SQLite 的筛选迁移与核验。
 - `run.py`：Waitress 正式入口；仅 SQLite 模式启动旧在线备份，并以后台线程预热报告缓存。
-- `templates/`、`static/`：浏览器端 LIMS。
+- `../frontend/`：Vue 3 + TypeScript + Vite 浏览器端工程（构建产物 `frontend/dist/`）。
+- `templates/`、`static/`：旧版原生页面（过渡回退与静态资源）。
 - `tests/`：现有服务端测试。
 - 仪器客户端不得直接连接 PostgreSQL 或 `lims.db`，统一通过 HTTP API 通信。
