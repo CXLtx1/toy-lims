@@ -6,6 +6,8 @@ export const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: "/", redirect: "/samples" },
+    { path: "/observatory", name: "observatory", component: () => import("./views/ObservatoryView.vue"),
+      meta: { immersive: true } },
     { path: "/samples", name: "samples", component: SamplesView },
     { path: "/xrf", name: "xrf", component: XrfView },
   ],

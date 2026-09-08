@@ -2,14 +2,15 @@
   <n-config-provider :locale="zhCN" :date-locale="dateZhCN" :theme-overrides="themeOverrides">
     <n-message-provider>
       <n-dialog-provider>
-        <div class="app-shell">
-          <header class="app-header">
+        <div class="app-shell" :class="{ 'immersive-shell': route.meta.immersive }">
+          <header v-if="!route.meta.immersive" class="app-header">
             <div class="brand">
               <span class="brand-mark">◇</span>
               <span class="brand-name">insta</span>
               <span class="brand-sub">样品与仪器数据浏览</span>
             </div>
             <nav class="nav">
+              <router-link to="/observatory" class="nav-link" active-class="active">实验星港</router-link>
               <router-link to="/samples" class="nav-link" active-class="active">样品聚合</router-link>
               <router-link to="/xrf" class="nav-link" active-class="active">XRF 数据</router-link>
             </nav>
@@ -25,6 +26,9 @@
 
 <script setup lang="ts">
 import { dateZhCN, NConfigProvider, NDialogProvider, NMessageProvider, zhCN } from "naive-ui";
+import { useRoute } from "vue-router";
+
+const route = useRoute();
 
 const themeOverrides = {
   common: {

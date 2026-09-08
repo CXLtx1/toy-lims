@@ -21,6 +21,19 @@ def _placeholders(count):
     return ",".join("?" for _ in range(count))
 
 
+def _positive_int_arg(name, default=None):
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw.isascii() or not raw.isdecimal():
+        raise ValueError(f"{name} must be a positive integer")
+    value = int(raw)
+    if not 1 <= value <= 9223372036854775807:
+        raise ValueError(f"{name} must be a positive 64-bit integer")
+    return value
+
+
 def _sample_type(row):
     if row["workflow_type"] == "special":
         return "其他样"
@@ -33,6 +46,10 @@ def _sample_type(row):
 
 @bp.get("/samples")
 def list_samples():
+    try:
+        instrument_id = _positive_int_arg("instrument_id")
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     keyword = (request.args.get("keyword") or "").strip()
     status = (request.args.get("status") or "").strip()
     date_from = (request.args.get("date_from") or "").strip()
@@ -41,6 +58,10 @@ def list_samples():
     per_page = min(max(int(request.args.get("per_page", 30) or 30), 1), 100)
 
     conditions, params = [], []
+    if instrument_id is not None:
+        conditions.append("""EXISTS(SELECT 1 FROM sample_analytes sa
+            WHERE sa.sample_id=s.id AND sa.instrument_id=?)""")
+        params.append(instrument_id)
     if keyword:
         like = f"%{keyword}%"
         conditions.append("""(s.name ILIKE ? OR s.lims_no ILIKE ? OR s.category ILIKE ?
@@ -53,7 +74,7 @@ def list_samples():
             conditions.append("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag=?)")
             params.append(tag)
     if status:
-        conditions.append("s.status=?")
+        conditions.append("COALESCE(s.status,'received')=?")
         params.append(status)
     if date_from:
         conditions.append("s.created_at >= ?")
@@ -72,6 +93,7 @@ def list_samples():
 
     ids = [row["id"] for row in rows]
     tags, analytes, prep_counts, xrf_counts = {}, {}, {}, {}
+    task_counts, instrument_ids = {}, {}
     if ids:
         marks = _placeholders(len(ids))
         for row in db.execute(f"SELECT sample_id,tag FROM sample_tags WHERE sample_id IN ({marks})", ids):
@@ -85,6 +107,15 @@ def list_samples():
         for row in db.execute(f"""SELECT sample_id,COUNT(*) AS c FROM xrf_analyses
             WHERE sample_id IN ({marks}) GROUP BY sample_id""", ids):
             xrf_counts[row["sample_id"]] = row["c"]
+        for row in db.execute(f"""SELECT sample_id,instrument_id,COUNT(*) AS task_total,
+            SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS task_completed
+            FROM sample_analytes WHERE sample_id IN ({marks})
+            GROUP BY sample_id,instrument_id ORDER BY sample_id,instrument_id""", ids):
+            counts = task_counts.setdefault(row["sample_id"], [0, 0])
+            counts[0] += row["task_total"]
+            counts[1] += row["task_completed"]
+            if row["instrument_id"] is not None:
+                instrument_ids.setdefault(row["sample_id"], []).append(row["instrument_id"])
 
     order_list = ordering.load_order_list(db)
     items = []
@@ -92,7 +123,7 @@ def list_samples():
         items.append({
             "id": row["id"], "lims_no": row["lims_no"], "name": row["name"],
             "category": row["category"], "type": _sample_type(row),
-            "status": row["status"], "xrf": bool(row["xrf"]),
+            "status": row["status"] or "received", "xrf": bool(row["xrf"]),
             "created_at": row["created_at"], "customer": row["customer"],
             "analysis_date": row["analysis_date"],
             "analyst": row["analyst"], "reviewer": row["reviewer"],
@@ -100,6 +131,9 @@ def list_samples():
             "analytes": ordering.order_items(analytes.get(row["id"], []), order_list),
             "prep_count": prep_counts.get(row["id"], 0),
             "xrf_scan_count": xrf_counts.get(row["id"], 0),
+            "task_total": task_counts.get(row["id"], [0, 0])[0],
+            "task_completed": task_counts.get(row["id"], [0, 0])[1],
+            "instrument_ids": instrument_ids.get(row["id"], []),
         })
     return jsonify(ok=True, total=total, page=page, per_page=per_page, items=items)
 
@@ -248,12 +282,15 @@ _AUDIT_ACTION_LABELS = {
     "xrf_report_use": "修改 XRF 结果参与计算", "special_result": "修改专项检测数据",
     "excel_plan_create": "用 Excel 新建样品", "excel_plan_overwrite": "用 Excel 覆盖样品方案",
     "excel_data_overwrite": "用 Excel 覆盖检测数据",
+    "result_unit": "修改结果显示单位", "login": "登录", "logout": "退出登录",
+    "session_replaced": "替换终端会话",
 }
 
 _AUDIT_ENTITY_LABELS = {
     "sample": "样品", "sample_analyte": "检测任务", "reading": "读数",
     "xrf_analysis": "XRF 扫描", "xrf_value": "XRF 结果",
     "instrument_import": "仪器导入", "special_result": "专项检测",
+    "session": "终端会话", "user": "用户", "instrument": "仪器",
 }
 
 
@@ -261,25 +298,21 @@ _AUDIT_ENTITY_LABELS = {
 def sample_audit(sid):
     """样品的完整审计时间线：样品本体 + 检测任务 + 读数 + 关联 XRF 的全部事件。"""
     db = g.db
-    # entity_id 可能是非数字（扫描编号等），CAST 前用正则护栏
+    # Compare text IDs rather than casting untrusted audit IDs to integers.
     rows = db.execute("""SELECT al.id,al.username,al.terminal_name,al.action,al.entity_type,
         al.entity_id,al.before_json,al.after_json,al.reason,al.ip_address,al.created_at
         FROM audit_logs al WHERE
           (al.entity_type='sample' AND al.entity_id=?)
           OR (al.entity_type='instrument_import' AND al.entity_id=?)
-          OR (al.entity_type='sample_analyte' AND al.entity_id ~ '^\\d+$'
-              AND CAST(al.entity_id AS INTEGER) IN (
-                SELECT id FROM sample_analytes WHERE sample_id=?))
-          OR (al.entity_type='reading' AND al.entity_id ~ '^\\d+$'
-              AND CAST(al.entity_id AS INTEGER) IN (
-                SELECT r.id FROM readings r JOIN sample_analytes sa
+          OR (al.entity_type='sample_analyte' AND al.entity_id IN (
+                SELECT CAST(id AS TEXT) FROM sample_analytes WHERE sample_id=?))
+          OR (al.entity_type='reading' AND al.entity_id IN (
+                SELECT CAST(r.id AS TEXT) FROM readings r JOIN sample_analytes sa
                   ON sa.id=r.sample_analyte_id WHERE sa.sample_id=?))
-          OR (al.entity_type='xrf_analysis' AND al.entity_id ~ '^\\d+$'
-              AND CAST(al.entity_id AS INTEGER) IN (
-                SELECT id FROM xrf_analyses WHERE sample_id=?))
-          OR (al.entity_type='xrf_value' AND al.entity_id ~ '^\\d+$'
-              AND CAST(al.entity_id AS INTEGER) IN (
-                SELECT xv.id FROM xrf_values xv JOIN xrf_analyses xa
+          OR (al.entity_type='xrf_analysis' AND al.entity_id IN (
+                SELECT CAST(id AS TEXT) FROM xrf_analyses WHERE sample_id=?))
+          OR (al.entity_type='xrf_value' AND al.entity_id IN (
+                SELECT CAST(xv.id AS TEXT) FROM xrf_values xv JOIN xrf_analyses xa
                   ON xa.id=xv.analysis_id WHERE xa.sample_id=?))
         ORDER BY al.id DESC LIMIT 300""",
         (str(sid), str(sid), sid, sid, sid, sid)).fetchall()
@@ -297,6 +330,7 @@ def sample_audit(sid):
         if before is not None and after is not None:
             for change in audit_changes(before, after, limit=20):
                 changes.append({
+                    "field": change.get("field", ""),
                     "label": change.get("label") or change.get("field", ""),
                     "before": change.get("before"),
                     "after": change.get("after"),
@@ -306,6 +340,7 @@ def sample_audit(sid):
             "username": row["username"], "terminal_name": row["terminal_name"],
             "ip_address": row["ip_address"],
             "action": row["action"],
+            "entity_type": row["entity_type"], "entity_id": row["entity_id"],
             "action_label": _AUDIT_ACTION_LABELS.get(row["action"], row["action"]),
             "entity_label": _AUDIT_ENTITY_LABELS.get(row["entity_type"], row["entity_type"]),
             "reason": row["reason"] or "", "changes": changes,

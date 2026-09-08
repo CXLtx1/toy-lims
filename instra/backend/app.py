@@ -9,7 +9,7 @@ from pathlib import Path
 from flask import Flask, g, jsonify, send_from_directory
 
 import db as db_module
-from api import exports, samples, xrf
+from api import exports, overview, samples, xrf
 
 DIST_DIR = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 
@@ -39,6 +39,7 @@ def create_app():
         return jsonify(ok=False, error=f"服务端错误：{exc}"), 500
 
     app.register_blueprint(samples.bp, url_prefix="/api")
+    app.register_blueprint(overview.bp, url_prefix="/api")
     app.register_blueprint(xrf.bp, url_prefix="/api")
     app.register_blueprint(exports.bp, url_prefix="/api")
 
