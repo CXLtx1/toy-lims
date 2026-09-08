@@ -1,5 +1,9 @@
+<script setup lang="ts">
+import { useAppState } from '../../app/state';
+const app = useAppState();
+</script>
 <template>
-  <section id="page-about" class="page active">
+  <section id="page-about" class="page" :class="{ active: app.page === 'about' }">
     <div class="panel about-panel">
       <h2>关于 LabFlow</h2>
       <div class="about-introduction">

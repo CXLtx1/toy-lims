@@ -99,7 +99,7 @@ function trapFocus(event: KeyboardEvent) {
 </script>
 
 <template>
-  <section id="page-users" class="page active" :aria-busy="busy" :inert="busy || !loaded">
+  <section id="page-users" class="page" :class="{ active: app.page === 'users' }" :aria-busy="busy" :inert="busy || !loaded">
     <div class="grid2">
       <div v-show="!loaded || can('user_manage')" class="panel admin-only">
         <h2>用户与能力</h2>
