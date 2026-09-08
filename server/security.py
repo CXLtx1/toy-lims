@@ -80,7 +80,10 @@ class SecuritySessionInterface(SecureCookieSessionInterface):
         override = app.config["SECURITY_COOKIE_SECURE"]
         if override is not None:
             return override
-        return bool(app.config.get("SESSION_COOKIE_SECURE") or request.is_secure or not _local_http())
+        # Auto-Secure only for real HTTPS traffic or when HTTPS is enforced;
+        # plain-HTTP LAN deployments (enforcement off) need a storable cookie.
+        return bool(app.config.get("SESSION_COOKIE_SECURE") or request.is_secure
+                    or (app.config["SECURITY_REQUIRE_HTTPS"] and not _local_http()))
 
 
 def csrf_token():
@@ -177,7 +180,7 @@ def init_security(app):
     """
     if "security_rate_limiter" in app.extensions:
         raise RuntimeError("security already initialized")
-    app.config.setdefault("SECURITY_REQUIRE_HTTPS", _env_bool("LIMS_REQUIRE_HTTPS", True))
+    app.config.setdefault("SECURITY_REQUIRE_HTTPS", _env_bool("LIMS_REQUIRE_HTTPS", False))
     app.config.setdefault("SECURITY_COOKIE_SECURE", _env_bool("LIMS_SESSION_COOKIE_SECURE", None))
     app.config.setdefault("SECURITY_RATE_LIMITS", {
         "login": (10, 60), "setup": (5, 60), "authorize": (20, 60)})

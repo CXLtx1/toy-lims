@@ -59,11 +59,11 @@ async function mutate(url: string, method: string, body: unknown, success: () =>
   }
 }
 function addUser() {
-  if (newUser.password.length < 12) { showError('新密码至少需要 12 个字符'); return; }
+  if (newUser.password.length < 6) { showError('新密码至少需要 6 个字符'); return; }
   void mutate('/api/users', 'POST', { ...newUser, username: newUser.username.trim(), display_name: newUser.display_name.trim() }, () => Object.assign(newUser, { username: '', display_name: '', password: '', permissions: [] }));
 }
 function addTerminal() {
-  if (newTerminal.password.length < 12) { showError('新密码至少需要 12 个字符'); return; }
+  if (newTerminal.password.length < 6) { showError('新密码至少需要 6 个字符'); return; }
   void mutate('/api/terminals', 'POST', { ...newTerminal, name: newTerminal.name.trim() }, () => Object.assign(newTerminal, { name: '', password: '', kind: 'standard' }));
 }
 function saveUser(user: User) { void mutate(`/api/users/${user.id}`, 'PUT', { username: user.username.trim(), display_name: user.display_name.trim(), permissions: user.permissions }, () => dirtyUsers.delete(user.id)); }
@@ -82,7 +82,7 @@ function closePassword() { if (busy.value || (password.value || passwordConfirm.
 function resetPassword() {
   const target = passwordTarget.value;
   if (!target) return;
-  if (password.value.length < 12) { showError('新密码至少需要 12 个字符'); return; }
+  if (password.value.length < 6) { showError('新密码至少需要 6 个字符'); return; }
   if (password.value !== passwordConfirm.value) { showError('两次输入的密码不一致'); return; }
   void mutate(`/api/${target.kind}/${target.id}`, 'PUT', { password: password.value }, () => {
     passwordTarget.value = null; password.value = ''; passwordConfirm.value = '';
@@ -104,7 +104,7 @@ function trapFocus(event: KeyboardEvent) {
       <div v-show="!loaded || can('user_manage')" class="panel admin-only">
         <h2>用户与能力</h2>
         <div class="row"><input id="u-username" v-model="newUser.username" placeholder="登录用户名" minlength="3"><input id="u-display-name" v-model="newUser.display_name" placeholder="姓名">
-          <input id="u-password" v-model="newUser.password" type="password" placeholder="初始密码" autocomplete="new-password" minlength="12">
+          <input id="u-password" v-model="newUser.password" type="password" placeholder="初始密码" autocomplete="new-password" minlength="6">
           <button id="u-add" :disabled="busy" @click="addUser">添加用户</button></div>
         <p class="hint">新用户只能继承当前操作者已有的能力，不能获得更高权限。</p>
         <div id="u-new-permissions" class="permission-picker"><label v-for="[value, label] in capabilities" :key="value"><input v-model="newUser.permissions" type="checkbox" class="u-new-permission" :value="value" :disabled="!canGrant(value)"> {{ label }}</label></div>
@@ -120,7 +120,7 @@ function trapFocus(event: KeyboardEvent) {
       </div>
       <div v-show="!loaded || can('terminal_manage')" class="panel admin-only">
         <h2>终端管理</h2>
-        <div class="row"><input id="terminal-name" v-model="newTerminal.name" placeholder="终端名称"><input id="terminal-password" v-model="newTerminal.password" type="password" placeholder="终端密码" autocomplete="new-password" minlength="12">
+          <div class="row"><input id="terminal-name" v-model="newTerminal.name" placeholder="终端名称"><input id="terminal-password" v-model="newTerminal.password" type="password" placeholder="终端密码" autocomplete="new-password" minlength="6">
           <select id="terminal-kind" v-model="newTerminal.kind"><option value="standard">普通终端</option><option value="admin">管理终端</option></select><button id="terminal-add" type="button" :disabled="busy" @click="addTerminal">添加终端</button></div>
         <p class="hint">这里只维护需要终端密码的普通终端和管理终端。个人入口默认对所有启用用户开放，不需要添加终端。当前终端不能停用或切换类型；系统必须至少保留一个启用的管理终端。</p>
         <div class="table-shell"><table id="terminal-table" class="data-grid"><thead><tr><th>终端名称</th><th>类型</th><th>登录页顺序</th><th>状态</th><th>操作</th></tr></thead><tbody>
@@ -134,7 +134,7 @@ function trapFocus(event: KeyboardEvent) {
     </div>
     <Teleport to="body"><div v-if="passwordTarget" class="dialog-backdrop" @mousedown.self="closePassword" @keydown.esc.stop.prevent="closePassword" @keydown="trapFocus">
       <section class="error-dialog" role="dialog" aria-modal="true" aria-labelledby="password-reset-title" :inert="busy"><button class="dialog-x" type="button" aria-label="关闭" :disabled="busy" @click="closePassword">×</button><h2 id="password-reset-title">重置密码：{{ passwordTarget.name }}</h2>
-        <form @submit.prevent="resetPassword"><label>新密码（至少 12 个字符）<input ref="passwordInput" v-model="password" type="password" minlength="12" required autocomplete="new-password"></label><label>确认新密码<input v-model="passwordConfirm" type="password" minlength="12" required autocomplete="new-password"></label><div class="dialog-actions"><button type="button" :disabled="busy" @click="closePassword">取消</button><button class="primary" type="submit" :disabled="busy">保存密码</button></div></form>
+        <form @submit.prevent="resetPassword"><label>新密码（至少 6 个字符）<input ref="passwordInput" v-model="password" type="password" minlength="6" required autocomplete="new-password"></label><label>确认新密码<input v-model="passwordConfirm" type="password" minlength="6" required autocomplete="new-password"></label><div class="dialog-actions"><button type="button" :disabled="busy" @click="closePassword">取消</button><button class="primary" type="submit" :disabled="busy">保存密码</button></div></form>
       </section>
     </div></Teleport>
   </section>

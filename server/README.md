@@ -63,6 +63,8 @@ User=lims
 WorkingDirectory=/home/lims/labflow
 Environment=LIMS_DATABASE_URL=postgresql://用户:密码@主机/toy_lims
 Environment=LIMS_TRUST_PROXY=1
+# TLS 由反向代理终止时建议开启强制 HTTPS：
+# Environment=LIMS_REQUIRE_HTTPS=1
 Environment=LIMS_XRF_CLIENT_TOKEN=XRF客户端令牌
 Environment=LIMS_STANDARD_CLIENT_TOKEN=标准客户端令牌
 ExecStart=/home/lims/labflow/venv/bin/python run.py
@@ -95,6 +97,8 @@ Type=simple
 WorkingDirectory=%h/labflow
 Environment=LIMS_DATABASE_URL=postgresql://用户:密码@主机/toy_lims
 Environment=LIMS_TRUST_PROXY=1
+# TLS 由反向代理终止时建议开启强制 HTTPS：
+# Environment=LIMS_REQUIRE_HTTPS=1
 Environment=LIMS_XRF_CLIENT_TOKEN=XRF客户端令牌
 Environment=LIMS_STANDARD_CLIENT_TOKEN=标准客户端令牌
 ExecStart=%h/labflow/venv/bin/python run.py
@@ -123,7 +127,7 @@ python server/migrate_to_postgres.py --replace
 
 浏览器先选择标准、个人或管理入口。普通终端使用终端密码登录，可以浏览和打印；写请求需要通过右下角窗口输入唯一的用户密码，授权在最后一次成功写操作 2 分钟后失效。个人入口默认对所有启用用户开放，无需创建或选择终端，使用用户名和用户密码登录，整个会话按该真实用户的能力执行并记录审计。管理终端使用终端密码登录且无需用户授权，其修改以管理终端身份记录。旧数据库升级后会进入一次性终端初始化页，验证现有管理员密码后设置“二组”和“管理终端”的密码。
 
-顶部独立“用户”页维护用户和普通、管理两类实体终端，并通过上移、下移调整登录页顺序；个人入口不需要管理。用户权限采用继承式可组合能力，不使用固定角色：操作者不能授予自己没有的能力，也不能修改权限高于自己的账号。用户和终端密码使用 scrypt 哈希存储，新设置/修改的密码要求至少 12 位（既有旧哈希登录不受影响，校验通过后自动升级为 scrypt）。终端接口为 `GET/POST /api/terminals`、`PUT /api/terminals/<id>` 和 `PUT /api/terminals/<id>/order`；服务器禁止停用当前终端，并保证至少保留一个启用的管理终端。
+顶部独立“用户”页维护用户和普通、管理两类实体终端，并通过上移、下移调整登录页顺序；个人入口不需要管理。用户权限采用继承式可组合能力，不使用固定角色：操作者不能授予自己没有的能力，也不能修改权限高于自己的账号。用户和终端密码使用 scrypt 哈希存储，新设置/修改的密码要求至少 6 位（既有旧哈希登录不受影响，校验通过后自动升级为 scrypt）。终端接口为 `GET/POST /api/terminals`、`PUT /api/terminals/<id>` 和 `PUT /api/terminals/<id>/order`；服务器禁止停用当前终端，并保证至少保留一个启用的管理终端。
 
 ## Web 安全
 
@@ -132,7 +136,7 @@ python server/migrate_to_postgres.py --replace
 - **CSRF 防护**：所有非 GET/HEAD/OPTIONS 请求必须携带 `X-CSRF-Token`（登录后经 `/api/session` 下发）且 `Origin` 与站点一致；仪器接口以设备令牌单独认证，不受 CSRF 约束。
 - **限速**：登录、初始化、写授权等敏感端点按来源 IP 与账号限速，超限返回 429 及 `Retry-After`。
 - **安全响应头**：`Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`Referrer-Policy`、`X-Frame-Options` 等统一注入。
-- **HTTPS/Cookie**：默认要求 HTTPS（反向代理需正确转发 `X-Forwarded-Proto`，配合 `LIMS_TRUST_PROXY=1`）；本机明文调试可设 `LIMS_REQUIRE_HTTPS=0`。会话 Cookie 默认 `HttpOnly + SameSite=Strict`，HTTPS 下自动 `Secure`（可用 `LIMS_SESSION_COOKIE_SECURE` 显式控制）。
+- **HTTPS/Cookie**：默认不强制 HTTPS（局域网明文 HTTP 可直接使用）；需要公网或反代 HTTPS 部署时设 `LIMS_REQUIRE_HTTPS=1`（反向代理需正确转发 `X-Forwarded-Proto`，配合 `LIMS_TRUST_PROXY=1`）。会话 Cookie 默认 `HttpOnly + SameSite=Strict`，HTTPS 请求下自动 `Secure`（可用 `LIMS_SESSION_COOKIE_SECURE` 显式控制；明文 HTTP 部署建议保持关闭，否则浏览器不会回传 Cookie）。
 - **通用 500 脱敏**：未捕获异常只返回通用错误信息，详情仅写服务端日志。
 
 写入可靠性由 `mutation_guard.py` 提供乐观锁与幂等：读数更新/删除可携带 `expected_version`，样品修改与票面信息保存可携带 `expected_updated_at`，冲突时返回 409 `version_conflict`；新建读数携带 `client_reading_id`（UUID）实现幂等创建，重复提交返回原读数（`replayed: true`），同一编号配不同数据返回 409 `idempotency_conflict`。浏览器端（`frontend/src`）已全面接入这些契约，冲突时保留草稿并提示重新载入。

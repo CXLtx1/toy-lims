@@ -18,12 +18,12 @@
   <input name="username" type="hidden" value="cxl">
   <label>首个用户<input value="cxl" disabled></label>
   <label>显示姓名<input name="display_name" autocomplete="name" required autofocus></label>
-  <label>用户密码<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+  <label>用户密码<input name="password" type="password" autocomplete="new-password" minlength="6" maxlength="1024" required></label>
   {% endif %}
   <div class="auth-divider"><span>终端入口</span></div>
-  <label>标准终端密码<input name="normal_terminal_password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+  <label>标准终端密码<input name="normal_terminal_password" type="password" autocomplete="new-password" minlength="6" maxlength="1024" required></label>
   <small class="auth-hint">用于日常浏览；修改数据时再验证具体用户。</small>
-  <label>管理终端密码<input name="admin_terminal_password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+  <label>管理终端密码<input name="admin_terminal_password" type="password" autocomplete="new-password" minlength="6" maxlength="1024" required></label>
   <small class="auth-hint">用于受控的管理终端入口，请使用不同密码。</small>
   <button class="primary" type="submit">完成初始化</button>
 </form></body></html>

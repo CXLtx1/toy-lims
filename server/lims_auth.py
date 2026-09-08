@@ -34,8 +34,8 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 AUTHORIZATION_SECONDS = 120
 FORCED_AUTHORIZATION_SECONDS = 60
 TERMINAL_KINDS = {"standard", "admin"}
-PASSWORD_METHOD = "scrypt:32768:8:3"
-MIN_PASSWORD_LENGTH = 12
+PASSWORD_METHOD = "scrypt:16384:8:1"
+MIN_PASSWORD_LENGTH = 6
 MAX_PASSWORD_LENGTH = 1024
 
 
@@ -65,7 +65,7 @@ def _upgrade_password(db, row, password, entity):
     try:
         if method[0] == "scrypt" and len(method) == 4:
             costs = tuple(map(int, method[1:]))
-            target = (32768, 8, 3)
+            target = tuple(int(part) for part in PASSWORD_METHOD.split(":")[1:4])
             # Never decrease any scrypt cost, including unfamiliar stronger hashes.
             upgrade = costs != target and all(old <= new for old, new in zip(costs, target))
         elif method[:2] == ["pbkdf2", "sha256"] and len(method) == 3:

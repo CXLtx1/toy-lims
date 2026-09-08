@@ -90,7 +90,7 @@ class SecurityTest(unittest.TestCase):
         response = self.client.get("/api/session")
         self.assertTrue(response.json["setup_required"])
         self.assertFalse(response.json["authenticated"])
-        self.assertEqual(12, response.json["min_password_length"])
+        self.assertEqual(6, response.json["min_password_length"])
         self.assertEqual("no-store", response.headers["Cache-Control"])
         self.seed()
         self.assertFalse(self.client.get("/api/session").json["setup_required"])
@@ -311,7 +311,7 @@ class SecurityTest(unittest.TestCase):
             with self.subTest(path=path):
                 response = self.write(path, method=method, json={**data, "password": "short"})
                 self.assertEqual(400, response.status_code)
-                self.assertIn("12", response.json["error"])
+                self.assertIn("6", response.json["error"])
 
     def test_existing_short_admin_can_complete_setup_with_strong_new_passwords(self):
         self.seed("short")
@@ -367,7 +367,7 @@ class SecurityTest(unittest.TestCase):
 
     def test_weaker_scrypt_upgraded_and_current_hash_stable(self):
         self.seed()
-        old = generate_password_hash(self.PASSWORD, method="scrypt:32768:8:1")
+        old = generate_password_hash(self.PASSWORD, method="scrypt:8192:8:1")
         self.db.execute("UPDATE users SET password_hash=?", (old,))
         row = self.db.execute("SELECT * FROM users").fetchone()
         self.assertFalse(auth._check_password(self.db, row, "wrong", "user"))

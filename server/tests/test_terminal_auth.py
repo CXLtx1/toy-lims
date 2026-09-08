@@ -100,7 +100,7 @@ class TerminalAuthenticationTest(unittest.TestCase):
             "admin_terminal_password": "a",
         })
         self.assertEqual(200, response.status_code, response.get_data(as_text=True))
-        self.assertIn("12", response.get_data(as_text=True))
+        self.assertIn("6", response.get_data(as_text=True))
         with closing(sqlite3.connect(lims.DB)) as db:
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM terminals").fetchone()[0])
