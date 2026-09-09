@@ -38,3 +38,6 @@ instra/start.ps1
 # OS
 Thumbs.db
 Desktop.ini
+
+# docx
+*.docx
