@@ -13,6 +13,25 @@ export interface TaskDraft extends SaveState { task: Task; readings: ReadingDraf
 export interface EntryDraft extends SaveState { detail: SampleDetail; tasks: TaskDraft[]; raw: Record<string, string>; generation: number; focused: boolean; busy: boolean }
 interface ReadingPayload { raw?: number | null; extra?: Fields; use_avg: boolean; is_final: boolean }
 const initialState = (): SaveState => ({ dirty: false, saving: false, error: '', savedAt: '' });
+let fallbackKeySeed = 0;
+
+function createClientReadingId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (typeof cryptoApi?.getRandomValues === 'function') cryptoApi.getRandomValues(bytes);
+  else {
+    let seed = (Date.now() + fallbackKeySeed++) >>> 0;
+    for (let index = 0; index < bytes.length; index++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      bytes[index] = (seed & 0xff) ^ Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 export function useEntryDrafts(onSaved: (id: number) => void) {
   const drafts = reactive(new Map<number, EntryDraft>());
@@ -31,7 +50,7 @@ export function useEntryDrafts(onSaved: (id: number) => void) {
     if (lockedStatuses.includes(draft.detail.sample.status)) throw new Error('当前样品已锁定，草稿已保留。');
   }
   function makeReading(reading?: Task['readings'][number], hasFinal = false): ReadingDraft {
-    return reactive({ ...initialState(), key: crypto.randomUUID(), id: reading?.id ?? null,
+    return reactive({ ...initialState(), key: createClientReadingId(), id: reading?.id ?? null,
       version: typeof reading?.version === 'string' && reading.version ? reading.version : null,
       raw: reading?.raw == null ? '' : String(reading.raw), extra: Object.fromEntries(Object.entries(fields(reading?.extra)).map(([key, value]) => [key, value == null ? '' : String(value)])),
       included: hasFinal ? Boolean(reading?.is_final) : reading ? Boolean(reading.use_avg) : true,

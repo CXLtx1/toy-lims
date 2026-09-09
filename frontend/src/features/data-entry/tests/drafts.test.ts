@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useEntryDrafts } from '../use-entry-drafts';
 import { requestMock, markDirty } from './core-stub';
 import { deferred, detail } from './fixtures';
@@ -7,7 +7,16 @@ vi.mock('../../../api/client', () => import('./core-stub'));
 vi.mock('../../../app/state', () => import('./core-stub'));
 vi.mock('../../../app/dialogs', () => import('./core-stub'));
 beforeEach(() => { requestMock.mockReset(); markDirty.mockClear(); });
+afterEach(() => { vi.unstubAllGlobals(); });
 describe('reading drafts', () => {
+  it('generates a valid client UUID when crypto.randomUUID is unavailable', () => {
+    vi.stubGlobal('crypto', { getRandomValues(bytes: Uint8Array) {
+      for (let index = 0; index < bytes.length; index++) bytes[index] = index;
+      return bytes;
+    } });
+    const store = useEntryDrafts(vi.fn()), rd = store.install(detail()).tasks[0]!.readings[0]!;
+    expect(rd.key).toBe('00010203-0405-4607-8809-0a0b0c0d0e0f');
+  });
   it('creates exactly once while edits queue behind creation, then saves immutable values in order', async () => {
     const create = deferred<{ id: number }>(), put = deferred<unknown>();
     requestMock.mockImplementation(async (url, options) => options?.method === 'POST' ? create.promise : url.endsWith('/42') ? put.promise : {});
