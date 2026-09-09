@@ -32,6 +32,7 @@ coverage/
 server/logs/
 
 # Local launchers with development credentials
+start-server.ps1
 instra/start.ps1
 
 # OS
