@@ -10,7 +10,7 @@
               <span class="brand-sub">样品与仪器数据浏览</span>
             </div>
             <nav class="nav">
-              <router-link to="/observatory" class="nav-link" active-class="active">实验星港</router-link>
+              <router-link v-if="showObservatoryEntry" to="/observatory" class="nav-link" active-class="active">实验星港</router-link>
               <router-link to="/samples" class="nav-link" active-class="active">样品聚合</router-link>
               <router-link to="/xrf" class="nav-link" active-class="active">XRF 数据</router-link>
             </nav>
@@ -29,6 +29,7 @@ import { dateZhCN, NConfigProvider, NDialogProvider, NMessageProvider, zhCN } fr
 import { useRoute } from "vue-router";
 
 const route = useRoute();
+const showObservatoryEntry = false;
 
 const themeOverrides = {
   common: {
