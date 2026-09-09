@@ -1,29 +1,21 @@
-import os
-import sqlite3
-import tempfile
 import unittest
-from contextlib import closing
 
 import app as lims
 from client_helpers import browser_client
 from lims_auth import PASSWORD_METHOD
+from postgres_case import PostgresTestCase
 from werkzeug.security import generate_password_hash
 
 
-class TerminalAuthenticationTest(unittest.TestCase):
+class TerminalAuthenticationTest(PostgresTestCase):
     USER_PASSWORD = "cxl-password-123"
     STANDARD_PASSWORD = "standard-terminal-123"
     ADMIN_PASSWORD = "admin-terminal-123"
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
         self.client = browser_client(self, lims.app)
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def initialize(self):
         response = self.client.post("/setup", data={
@@ -36,9 +28,9 @@ class TerminalAuthenticationTest(unittest.TestCase):
         self.assertTrue(response.headers["Location"].endswith("/login"))
 
     def terminal_id(self, kind):
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            return db.execute("SELECT id FROM terminals WHERE kind=?", (kind,)).fetchone()[0]
+            return db.execute("SELECT id FROM terminals WHERE kind=%s", (kind,)).fetchone()[0]
         finally:
             db.close()
 
@@ -55,33 +47,34 @@ class TerminalAuthenticationTest(unittest.TestCase):
 
     def test_setup_creates_fixed_user_and_two_distinct_terminals(self):
         self.initialize()
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            self.assertEqual([("cxl", "CXL 管理员")], db.execute(
-                "SELECT username,display_name FROM users").fetchall())
-            self.assertEqual([("二组", "standard"), ("管理终端", "admin")], db.execute(
-                "SELECT name,kind FROM terminals ORDER BY id").fetchall())
+            self.assertEqual([("cxl", "CXL 管理员")], [
+                row[:] for row in db.execute("SELECT username,display_name FROM users").fetchall()])
+            self.assertEqual([("二组", "standard"), ("管理终端", "admin")], [
+                row[:] for row in db.execute(
+                    "SELECT name,kind FROM terminals ORDER BY id").fetchall()])
             hashes = [row[0] for row in db.execute("SELECT password_hash FROM users")] + [
                 row[0] for row in db.execute("SELECT password_hash FROM terminals")]
             self.assertTrue(all(value.startswith(PASSWORD_METHOD + "$") for value in hashes))
         finally:
             db.close()
 
-    def test_successful_login_and_authorization_upgrade_legacy_hashes(self):
+    def test_login_accepts_preexisting_hash_without_rewrite(self):
         self.initialize()
         legacy_user_hash = generate_password_hash(self.USER_PASSWORD, method="pbkdf2:sha256:20000")
         legacy_terminal_hash = generate_password_hash(self.STANDARD_PASSWORD, method="pbkdf2:sha256:20000")
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            db.execute("UPDATE users SET password_hash=? WHERE username='cxl'", (legacy_user_hash,))
-            db.execute("UPDATE terminals SET password_hash=? WHERE kind='standard'", (legacy_terminal_hash,))
+            db.execute("UPDATE users SET password_hash=%s WHERE username='cxl'", (legacy_user_hash,))
+            db.execute("UPDATE terminals SET password_hash=%s WHERE kind='standard'", (legacy_terminal_hash,))
             db.commit()
         finally:
             db.close()
 
         self.assertEqual(302, self.login().status_code)
         self.assertEqual(200, self.authorize().status_code)
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
             user_hash = db.execute(
                 "SELECT password_hash FROM users WHERE username='cxl'").fetchone()[0]
@@ -89,8 +82,8 @@ class TerminalAuthenticationTest(unittest.TestCase):
                 "SELECT password_hash FROM terminals WHERE kind='standard'").fetchone()[0]
         finally:
             db.close()
-        self.assertTrue(user_hash.startswith(PASSWORD_METHOD + "$"))
-        self.assertTrue(terminal_hash.startswith(PASSWORD_METHOD + "$"))
+        self.assertEqual(legacy_user_hash, user_hash)
+        self.assertEqual(legacy_terminal_hash, terminal_hash)
 
     def test_setup_rejects_short_nonempty_passwords(self):
         response = self.client.post("/setup", data={
@@ -101,9 +94,12 @@ class TerminalAuthenticationTest(unittest.TestCase):
         })
         self.assertEqual(200, response.status_code, response.get_data(as_text=True))
         self.assertIn("6", response.get_data(as_text=True))
-        with closing(sqlite3.connect(lims.DB)) as db:
+        db = self.connect()
+        try:
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM terminals").fetchone()[0])
+        finally:
+            db.close()
 
     def test_admin_session_exposes_user_and_terminal_management_data(self):
         self.initialize()
@@ -117,9 +113,9 @@ class TerminalAuthenticationTest(unittest.TestCase):
             terminal["kind"] for terminal in self.client.get("/api/terminals").get_json()})
 
     def test_existing_database_setup_requires_unique_active_admin_password(self):
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            db.execute("INSERT INTO users(username,password_hash,display_name,role) VALUES(?,?,?,'admin')",
+            db.execute("INSERT INTO users(username,password_hash,display_name) VALUES(%s,%s,%s)",
                        ("cxl", generate_password_hash(self.USER_PASSWORD), "原管理员"))
             db.commit()
         finally:
@@ -134,7 +130,7 @@ class TerminalAuthenticationTest(unittest.TestCase):
             "admin_terminal_password": self.ADMIN_PASSWORD,
         })
         self.assertEqual(302, accepted.status_code)
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM users WHERE username='cxl'").fetchone()[0])
             self.assertEqual(2, db.execute("SELECT COUNT(*) FROM terminals").fetchone()[0])
@@ -192,10 +188,10 @@ class TerminalAuthenticationTest(unittest.TestCase):
 
     def test_ambiguous_password_is_rejected(self):
         self.initialize()
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
             password_hash = db.execute("SELECT password_hash FROM users WHERE username='cxl'").fetchone()[0]
-            db.execute("INSERT INTO users(username,password_hash,display_name,role) VALUES(?,?,?,'analyst')",
+            db.execute("INSERT INTO users(username,password_hash,display_name) VALUES(%s,%s,%s)",
                        ("duplicate", password_hash, "重复密码用户"))
             db.commit()
         finally:
@@ -218,10 +214,11 @@ class TerminalAuthenticationTest(unittest.TestCase):
     def test_manual_report_requires_one_time_user_password_on_admin_terminal(self):
         self.initialize()
         self.login("admin")
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            db.execute("INSERT INTO samples(name,status,workflow_type) VALUES('强授权报告','completed','regular')")
-            sid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            sid = db.execute(
+                "INSERT INTO samples(name,status,workflow_type) VALUES('强授权报告','completed','regular') RETURNING id"
+            ).fetchone()[0]
             db.commit()
         finally:
             db.close()
@@ -361,9 +358,9 @@ class TerminalAuthenticationTest(unittest.TestCase):
         self.assertEqual(user_id, login_event["user_id"])
         self.assertEqual("personal-user", login_event["username"])
 
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            db.execute("UPDATE users SET active=0 WHERE id=?", (user_id,))
+            db.execute("UPDATE users SET active=0 WHERE id=%s", (user_id,))
             db.commit()
         finally:
             db.close()
@@ -437,16 +434,6 @@ class TerminalAuthenticationTest(unittest.TestCase):
         })
         self.assertEqual(400, personal.status_code)
 
-        db = sqlite3.connect(lims.DB)
-        try:
-            db.execute("""INSERT INTO terminals(name,password_hash,kind,sort_order)
-                VALUES('旧个人终端','legacy','personal',99)""")
-            db.commit()
-        finally:
-            db.close()
-        self.assertNotIn("旧个人终端", [
-            item["name"] for item in self.client.get("/api/terminals").get_json()])
-
         current_id = self.terminal_id("admin")
         deactivate_current = self.client.put(
             f"/api/terminals/{current_id}", json={"active": False})
@@ -482,10 +469,10 @@ class TerminalAuthenticationTest(unittest.TestCase):
         admin_id = self.terminal_id("admin")
         standard_id = self.terminal_id("standard")
         self.client.put(f"/api/terminals/{standard_id}", json={"kind": "standard"})
-        conn = sqlite3.connect(lims.DB)
+        conn = self.connect()
         try:
             token = conn.execute(
-                "SELECT session_token FROM terminals WHERE id=?", (standard_id,)).fetchone()[0]
+                "SELECT session_token FROM terminals WHERE id=%s", (standard_id,)).fetchone()[0]
         finally:
             conn.close()
         with self.client.session_transaction() as session:

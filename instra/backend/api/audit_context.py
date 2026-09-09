@@ -55,7 +55,7 @@ def _numeric_object(value, aux=False):
         if aux and key == "use":
             clean[key] = item is True or type(item) is int and item == 1
         elif (isinstance(key, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key)
-              and (not aux or key in {"expected", "measured", "coefficient"})
+              and (not aux or key in {"expected", "measured"})
               and _raw_value(item)["available"]):
             clean[key] = item
     return json.dumps(clean, allow_nan=False), obj is None or clean != obj
@@ -64,7 +64,7 @@ def _numeric_object(value, aux=False):
 _TASK_SELECT = """SELECT sa.id,sa.sample_id,sa.preparation_id,sa.instrument_id,
     a.name AS analyte,p.name AS prep_name,i.name AS instrument,i.itype,
     m.name AS method_name,m.formula,m.constants AS method_constants,
-    p.mass_g AS prep_mass,p.volume_ml AS prep_vol,r.raw,r.extra,r.aux,sa.status
+    p.mass_g AS prep_mass,p.volume_ml AS prep_vol,r.aux,sa.status
     FROM sample_analytes sa
     LEFT JOIN analytes a ON a.id=sa.analyte_id
     LEFT JOIN instruments i ON i.id=sa.instrument_id
@@ -78,7 +78,7 @@ def load_context(db, aid):
     aid = _positive_id(aid)
     event = None if aid is None else db.execute("""SELECT id,created_at,username,
         action,entity_type,entity_id,before_json,after_json
-        FROM audit_logs WHERE id=?""", (aid,)).fetchone()
+        FROM audit_logs WHERE id=%s""", (aid,)).fetchone()
     if event is None:
         return {"ok": False, "error": "Audit not found."}
     audit = {key: event[key] for key in ("id", "created_at", "username")}
@@ -110,10 +110,10 @@ def load_context(db, aid):
                 or snapshot.get("formula")):
             return unsupported("Snapshot context is not a plain raw reading.")
 
-    reading = db.execute("SELECT sample_analyte_id FROM readings WHERE id=?", (rid,)).fetchone()
+    reading = db.execute("SELECT sample_analyte_id FROM readings WHERE id=%s", (rid,)).fetchone()
     if reading is not None and reading["sample_analyte_id"] != said:
         return unsupported("The current reading has been reassigned to another task.")
-    target = db.execute(_TASK_SELECT + " WHERE sa.id=?", (said,)).fetchone()
+    target = db.execute(_TASK_SELECT + " WHERE sa.id=%s", (said,)).fetchone()
     if target is None:
         return unsupported("The original task is missing or deleted.")
     sid = _positive_id(target["sample_id"])
@@ -122,7 +122,7 @@ def load_context(db, aid):
     for snapshot in (before, after):
         if "sample_id" in snapshot and _positive_id(snapshot["sample_id"]) != sid:
             return unsupported("Snapshot sample parent disagrees with the current task.")
-    sample = db.execute("SELECT id,name,lims_no,status FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT id,name,lims_no,status FROM samples WHERE id=%s", (sid,)).fetchone()
     if sample is None:
         return unsupported("The original sample is missing or deleted.")
     if target["analyte"] is None:
@@ -139,9 +139,9 @@ def load_context(db, aid):
     ]
     # results has one row per task; readings are fetched separately to avoid fan-out.
     rows = [dict(row) for row in db.execute(_TASK_SELECT + """
-        WHERE sa.sample_id=? AND sa.instrument_id=?
-          AND (sa.preparation_id=? OR (sa.preparation_id IS NULL AND CAST(? AS BIGINT) IS NULL))
-        ORDER BY ABS(sa.id - ?),sa.id LIMIT 3""",
+        WHERE sa.sample_id=%s AND sa.instrument_id=%s
+          AND (sa.preparation_id=%s OR (sa.preparation_id IS NULL AND CAST(%s AS BIGINT) IS NULL))
+        ORDER BY ABS(sa.id - %s),sa.id LIMIT 3""",
         (sid, target["instrument_id"], target["preparation_id"], target["preparation_id"], said))]
     rows.sort(key=lambda row: row["id"])
     by_id = {row["id"]: row for row in rows}
@@ -150,15 +150,15 @@ def load_context(db, aid):
     sanitized = False
     for row in rows:
         del row["preparation_id"], row["instrument_id"]
-        for key in ("raw", "prep_mass", "prep_vol"):
+        for key in ("prep_mass", "prep_vol"):
             value = _raw_value(row[key])
             sanitized |= not value["available"]
             row[key] = value["value"]
-        for key in ("extra", "aux", "method_constants"):
+        for key in ("aux", "method_constants"):
             row[key], changed = _numeric_object(row[key], aux=key == "aux")
             sanitized |= changed
         row["readings"] = []
-    marks = ",".join("?" for _ in rows)
+    marks = ",".join("%s" for _ in rows)
     current = None
     for rd in db.execute(f"""SELECT id,sample_analyte_id,raw,extra,use_avg,is_final
             FROM readings WHERE sample_analyte_id IN ({marks}) ORDER BY id""", list(by_id)):
@@ -221,4 +221,6 @@ def audit_scene(aid):
         "style-src 'self' 'unsafe-inline'; connect-src 'none'; form-action 'none'; "
         "base-uri 'none'; frame-ancestors 'self'"
     )
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
     return response

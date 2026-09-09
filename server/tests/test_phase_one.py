@@ -1,24 +1,16 @@
 import json
-import os
-import sqlite3
-import tempfile
 import unittest
 
 import app as lims
 from client_helpers import browser_client
-from maintenance import create_backup
+from postgres_case import PostgresTestCase
 
 
-class PhaseOneWorkflowTest(unittest.TestCase):
+class PhaseOneWorkflowTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
         self.client = browser_client(self, lims.app)
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def setup_admin(self):
         response = self.client.post("/setup", data={
@@ -27,7 +19,7 @@ class PhaseOneWorkflowTest(unittest.TestCase):
             "admin_password": "terminal-admin-123",
         })
         self.assertEqual(302, response.status_code)
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
             terminal_id = db.execute(
                 "SELECT id FROM terminals WHERE kind='admin'").fetchone()[0]
@@ -66,7 +58,7 @@ class PhaseOneWorkflowTest(unittest.TestCase):
         })
         self.assertEqual(200, created.status_code)
         self.client.post("/logout")
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
             terminal_id = db.execute(
                 "SELECT id FROM terminals WHERE kind='standard'").fetchone()[0]
@@ -144,7 +136,7 @@ class PhaseOneWorkflowTest(unittest.TestCase):
         for status in ("queued", "measuring"):
             response = self.client.put(f"/api/samples/{sid}/status", json={"status": status})
             self.assertEqual(200, response.status_code, response.get_data(as_text=True))
-        saved = self.client.post("/api/results", json={
+        saved = self.client.post("/api/readings", json={
             "sample_analyte_id": task["id"], "raw": 9.5,
         })
         self.assertEqual(200, saved.status_code)
@@ -152,7 +144,7 @@ class PhaseOneWorkflowTest(unittest.TestCase):
         self.assertEqual(200, response.status_code, response.get_data(as_text=True))
         reviewed = self.client.get(f"/api/samples/{sid}").get_json()["sample"]
         self.assertEqual(reviewed["status_operator"], reviewed["reviewer"])
-        locked = self.client.post("/api/results", json={
+        locked = self.client.post("/api/readings", json={
             "sample_analyte_id": task["id"], "raw": 10,
         })
         self.assertEqual(409, locked.status_code)
@@ -180,7 +172,7 @@ class PhaseOneWorkflowTest(unittest.TestCase):
         task = self.client.get(f"/api/samples/{sid}").get_json()["items"][0]
         for status in ("queued", "measuring"):
             self.client.put(f"/api/samples/{sid}/status", json={"status": status})
-        self.client.post("/api/results", json={"sample_analyte_id": task["id"], "raw": 9.5})
+        self.client.post("/api/readings", json={"sample_analyte_id": task["id"], "raw": 9.5})
         reviewed = self.client.put(f"/api/samples/{sid}/status", json={"status": "reviewed"})
         self.assertEqual(200, reviewed.status_code, reviewed.get_data(as_text=True))
         payload = self.client.get(f"/api/report/{sid}").get_json()
@@ -206,17 +198,6 @@ class PhaseOneWorkflowTest(unittest.TestCase):
         payload = self.client.get(f"/api/report/{sid}").get_json()
         self.assertTrue(payload["groups"][0]["print"])
         self.assertEqual(1, len(payload["default_report_rows"]))
-
-    def test_online_backup_is_valid_sqlite_copy(self):
-        self.setup_admin()
-        self.create_sample()
-        target = create_backup(lims.DB, os.path.join(self.tmp.name, "backups"), keep_days=30)
-        connection = sqlite3.connect(target)
-        try:
-            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
-            self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
-        finally:
-            connection.close()
 
 
 if __name__ == "__main__":

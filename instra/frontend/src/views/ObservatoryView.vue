@@ -159,6 +159,31 @@
                     <p v-if="entry.reason" class="stratum-reason">{{ entry.reason }}</p>
                     <div v-if="'changes' in entry && entry.changes.length" class="stratum-changes"><div v-for="(change, i) in entry.changes" :key="i"><b>{{ change.label }}</b><del>{{ displayValue(change.before) }}</del><span aria-hidden="true">→</span><ins>{{ displayValue(change.after) }}</ins></div></div>
                     <p v-else-if="'has_snapshot' in entry && entry.has_snapshot" class="stratum-note">创建 / 删除快照，或无可展示的字段差异</p>
+                    <button v-if="canOpenScene(entry)" type="button" class="scene-trigger"
+                            :aria-expanded="selectedSceneId === entry.id" @click="toggleScene(entry)">
+                      <span aria-hidden="true">▣</span>{{ selectedSceneId === entry.id ? '关闭原始现场' : '在原始界面中查看这次修改' }}<b aria-hidden="true">{{ selectedSceneId === entry.id ? '收合 ↑' : '反向定位 ↘' }}</b>
+                    </button>
+                    <section v-if="selectedSceneId === entry.id" class="source-scene" aria-label="LabFlow 原始录入现场">
+                      <header><div><span>LIVE CONTEXT / ARCHIVE VALUE</span><strong>LabFlow 只读现场</strong></div><small>审计 #{{ entry.id }} · 原始数据录入</small></header>
+                      <p v-if="sceneContextFetching" class="scene-state" role="status">正在沿审计索引定位原始数据…</p>
+                      <p v-else-if="sceneContextError" class="scene-state error" role="alert">现场定位失败：{{ sceneContextError.message }} <button type="button" @click="refetchSceneContext()">重试</button></p>
+                      <p v-else-if="sceneContext && !sceneContext.supported" class="scene-state">这条记录无法可靠还原。当前只支持普通数值型仪器的原始读数修改。</p>
+                      <template v-else-if="sceneContext?.supported && sceneContext.values">
+                        <nav class="scene-modes" aria-label="审计现场时态">
+                          <button v-for="mode in sceneModes" :key="mode.value" type="button" :class="{ active: sceneMode === mode.value }"
+                                  :disabled="!sceneContext.values[mode.value].available" @click="setSceneMode(mode.value)">
+                            <small>{{ mode.code }}</small>{{ mode.label }}
+                            <b>{{ sceneContext.values[mode.value].available ? displayValue(sceneContext.values[mode.value].value) : '不可用' }}</b>
+                          </button>
+                        </nav>
+                        <div class="scene-frame" :class="{ loading: sceneFrameLoading }">
+                          <div class="scene-frame-rivets" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+                          <iframe :key="sceneSrc" :src="sceneSrc" title="LabFlow 原始数据录入只读现场"
+                                  sandbox="allow-scripts allow-same-origin" referrerpolicy="no-referrer" @load="sceneFrameLoading = false"></iframe>
+                        </div>
+                        <p class="scene-disclaimer">修改前/后仅覆盖该审计保存的原始值；相邻行、项目、溶样、仪器、方法及单位来自当前数据库。所有输入均已禁用，不会启动 toy-lims 的保存逻辑。</p>
+                      </template>
+                    </section>
                     <button v-if="selectedId === null && auditSampleId(entry) !== null" type="button" class="port-text-button" @click="openAuditSample(entry)">追踪该样品 ↘</button>
                   </div>
                 </article>
@@ -183,7 +208,7 @@ import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { useInfiniteQuery, useQuery } from "@tanstack/vue-query";
 import { api } from "../api/client";
 import type { Aggregate, Paged } from "../api/types";
-import type { AuditPage, Overview, PortAudit, PortSample, SampleAudit } from "../api/overview";
+import type { AuditPage, AuditSceneContext, Overview, PortAudit, PortSample, SampleAudit } from "../api/overview";
 import { fmtNumber, fmtTime, fmtXrfValue, statusLabel } from "../utils";
 import { useKeyboardShortcuts } from "../composables/useKeyboardShortcuts";
 import "../observatory.css";
@@ -199,6 +224,9 @@ const depth = ref(false);
 const travelling = ref(false);
 const refreshing = ref(false);
 const selectedId = ref<number | null>(null);
+const selectedSceneId = ref<number | null>(null);
+const sceneMode = ref<"before" | "after" | "current">("after");
+const sceneFrameLoading = ref(false);
 const depthHeading = ref<HTMLElement>();
 const orbitEntry = ref<HTMLElement>();
 let flightTimer: ReturnType<typeof setTimeout> | undefined;
@@ -247,10 +275,12 @@ function changeInstrument(event: Event) {
 async function refresh() {
   refreshing.value = true;
   try {
-    const requests = [refetchOverview(), refetchSamples()];
+    const requests: Promise<unknown>[] = [refetchOverview(), refetchSamples()];
     if (depth.value) {
-      if (selectedId.value === null) await Promise.all([...requests, refetchGlobalAudit()]);
-      else await Promise.all([...requests, refetchAggregate(), refetchSampleAudit()]);
+      if (selectedId.value === null) requests.push(refetchGlobalAudit());
+      else requests.push(refetchAggregate(), refetchSampleAudit());
+      if (selectedSceneId.value !== null) requests.push(refetchSceneContext());
+      await Promise.all(requests);
     } else await Promise.all(requests);
   } finally { refreshing.value = false; }
 }
@@ -293,6 +323,17 @@ const globalEntries = computed(() => auditPages.value?.pages.flatMap((batch) => 
 const historyEntries = computed<(PortAudit | SampleAudit)[]>(() => selectedId.value === null ? globalEntries.value : sampleAudit.value?.items ?? []);
 const historyError = computed(() => selectedId.value === null ? globalAuditError.value : sampleAuditError.value);
 const historyFetching = computed(() => selectedId.value === null ? globalAuditFetching.value : sampleAuditFetching.value);
+const { data: sceneContext, error: sceneContextError, isFetching: sceneContextFetching, refetch: refetchSceneContext } = useQuery({
+  queryKey: computed(() => ["audit-scene-context", selectedSceneId.value]),
+  queryFn: ({ signal }) => api<AuditSceneContext>(`/api/audits/${selectedSceneId.value}/context`, { signal }),
+  enabled: computed(() => depth.value && selectedId.value !== null && selectedSceneId.value !== null),
+});
+const sceneModes = [
+  { value: "before" as const, label: "修改前", code: "T−1" },
+  { value: "after" as const, label: "修改后", code: "T+0" },
+  { value: "current" as const, label: "当前", code: "NOW" },
+];
+const sceneSrc = computed(() => selectedSceneId.value === null ? "about:blank" : `/api/audits/${selectedSceneId.value}/scene?mode=${sceneMode.value}`);
 function retryHistory() { if (selectedId.value === null) void refetchGlobalAudit(); else void refetchSampleAudit(); }
 function auditSampleId(entry: PortAudit | SampleAudit) {
   if (entry.entity_type !== "sample" || !/^\d+$/.test(entry.entity_id ?? "")) return null;
@@ -301,6 +342,24 @@ function auditSampleId(entry: PortAudit | SampleAudit) {
 }
 function displayValue(value: unknown) {
   return value === null || value === undefined || value === "" ? "—" : typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+function canOpenScene(entry: PortAudit | SampleAudit) {
+  return "changes" in entry && entry.entity_type === "reading" && entry.action === "update"
+    && entry.changes.some((change) => change.field === "raw" && change.before !== change.after);
+}
+function toggleScene(entry: PortAudit | SampleAudit) {
+  if (selectedSceneId.value === entry.id) {
+    selectedSceneId.value = null;
+    return;
+  }
+  selectedSceneId.value = entry.id;
+  sceneMode.value = "after";
+  sceneFrameLoading.value = true;
+}
+function setSceneMode(mode: "before" | "after" | "current") {
+  if (sceneMode.value === mode) return;
+  sceneMode.value = mode;
+  sceneFrameLoading.value = true;
 }
 function fly() {
   clearTimeout(flightTimer);
@@ -317,6 +376,7 @@ async function enterDepth(id: number | null, event: MouseEvent) {
   depthHeading.value?.scrollIntoView({ behavior: "instant", block: "start" });
 }
 async function leaveDepth() {
+  selectedSceneId.value = null;
   depth.value = false;
   fly();
   await nextTick();
@@ -324,8 +384,8 @@ async function leaveDepth() {
   target?.focus({ preventScroll: true });
   target?.scrollIntoView({ behavior: "instant", block: "center" });
 }
-function showGlobal() { selectedId.value = null; depthHeading.value?.focus({ preventScroll: true }); }
-function openAuditSample(entry: PortAudit | SampleAudit) { selectedId.value = auditSampleId(entry); depthHeading.value?.scrollIntoView({ behavior: "instant", block: "start" }); depthHeading.value?.focus({ preventScroll: true }); }
+function showGlobal() { selectedSceneId.value = null; selectedId.value = null; depthHeading.value?.focus({ preventScroll: true }); }
+function openAuditSample(entry: PortAudit | SampleAudit) { selectedSceneId.value = null; selectedId.value = auditSampleId(entry); depthHeading.value?.scrollIntoView({ behavior: "instant", block: "start" }); depthHeading.value?.focus({ preventScroll: true }); }
 useKeyboardShortcuts([{ key: "Escape", enabled: () => depth.value, run: () => { void leaveDepth(); } }]);
 onUnmounted(() => { clearTimeout(flightTimer); });
 </script>

@@ -1,7 +1,7 @@
 # 滴定方法与公式引擎实现说明
 
 > 本文描述系统中**实际实现**的滴定（公式方法）机制，依据当前代码整理，不是设计稿。
-> 代码位置：`server/app.py`（公式引擎、结果计算）、`server/db_schema.py`（内置方法种子）、`server/static/app.js`（录入界面）。
+> 代码位置：`server/app.py`（公式引擎、结果计算）、`server/db_schema.py`（内置方法种子）、`frontend/src/features/data-entry/`（录入界面）。
 
 ## 1. 核心模型
 
@@ -64,7 +64,7 @@
 
 ## 4. 数据页录入
 
-数据页对 `function` 任务（`readingLineHtml` app.js:1787）：
+数据页对 `function` 任务：
 
 - 自动解析公式变量（前端用正则提取标识符），对**未被常数、m、v 覆盖**的变量逐个渲染数字输入框，如 `V=<input> V0=<input> c=<input>`。
 - 方法名旁边显示已固定的变量摘要（如 `M=65.38 m=2.0 v=250.0`）和"详情"按钮，弹窗显示公式、常数和方法说明。
@@ -117,6 +117,5 @@
 | `server/app.py:356` `calc_result` | 读数聚合、回标、4 位小数 |
 | `server/app.py:77` `METHOD_FIXED_VARS` | 保留变量 `m`/`v` |
 | `server/app.py:1489` `add_method` | 方法新增与校验 |
-| `server/db_schema.py` `FORMULA_METHOD_CATALOG` | 27 个正式公式方法与一次性目录迁移 |
-| `server/static/app.js:1746` `methodFormulaVariables` | 前端变量提取（正则） |
-| `server/static/app.js:1787` `readingLineHtml` | 滴定变量输入框渲染 |
+| `server/db_schema.py` `FORMULA_METHOD_CATALOG` | 27 个正式公式方法种子 |
+| `frontend/src/features/data-entry/` | 录入界面：公式变量提取与滴定变量输入框渲染 |

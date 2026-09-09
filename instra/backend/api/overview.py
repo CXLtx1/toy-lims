@@ -10,11 +10,11 @@ bp = Blueprint("overview", __name__)
 
 
 def _recent_audits(before_id=None, limit=30):
-    where = "WHERE id < ?" if before_id is not None else ""
+    where = "WHERE id < %s" if before_id is not None else ""
     params = [before_id] if before_id is not None else []
     # Deliberately never load snapshots, terminal details or IP addresses.
     rows = g.db.execute(f"""SELECT id,created_at,username,action,entity_type,entity_id,reason
-        FROM audit_logs {where} ORDER BY id DESC LIMIT ?""", params + [limit + 1]).fetchall()
+        FROM audit_logs {where} ORDER BY id DESC LIMIT %s""", params + [limit + 1]).fetchall()
     items = []
     for row in rows[:limit]:
         action, entity_type = row["action"] or "", row["entity_type"] or ""
@@ -59,7 +59,7 @@ def overview():
         FROM (
             SELECT sa.instrument_id,sa.sample_id,sa.status,
                 CASE WHEN COALESCE(sa.status,'pending') NOT IN ('completed','cancelled')
-                    AND COALESCE(s.status,'received') NOT IN ('reviewed','reported','cancelled')
+                    AND COALESCE(s.status,'received') NOT IN ('reviewed','cancelled')
                     THEN 1 ELSE 0 END AS is_open
             FROM sample_analytes sa JOIN samples s ON s.id=sa.sample_id
         ) tasks GROUP BY instrument_id"""):
@@ -75,7 +75,7 @@ def overview():
     xrf = dict(db.execute("""SELECT
         COALESCE(SUM(CASE WHEN xrf=1 THEN 1 ELSE 0 END),0) AS requested_samples,
         COALESCE(SUM(CASE WHEN xrf=1 AND has_scan=0
-            AND COALESCE(status,'received') NOT IN ('reviewed','reported','cancelled')
+            AND COALESCE(status,'received') NOT IN ('reviewed','cancelled')
             THEN 1 ELSE 0 END),0) AS awaiting_scan,
         COALESCE(SUM(has_scan),0) AS linked_samples
         FROM (

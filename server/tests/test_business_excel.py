@@ -1,27 +1,20 @@
 import io
 import inspect
-import os
-import sqlite3
-import tempfile
 import unittest
 
 from openpyxl import load_workbook
 
 import app as lims
 from client_helpers import browser_client
+from postgres_case import PostgresTestCase
 
 
-class BusinessExcelApiTest(unittest.TestCase):
+class BusinessExcelApiTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=True)
         self.client = browser_client(self, lims.app)
         self.meta = self.client.get("/api/meta").get_json()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def create_sample(self, name="Excel业务样品", xrf=False):
         aid = next(a["id"] for a in self.meta["analytes"] if a["name"] == "Ag")
@@ -54,11 +47,13 @@ class BusinessExcelApiTest(unittest.TestCase):
 
     def test_overview_uses_inclusive_creation_dates_and_filters(self):
         first, second = self.create_sample("首日样品"), self.create_sample("次日样品")
-        con = sqlite3.connect(lims.DB)
-        con.execute("UPDATE samples SET created_at='2026-08-01 00:00:00' WHERE id=?", (first,))
-        con.execute("UPDATE samples SET created_at='2026-08-02 23:59:59' WHERE id=?", (second,))
-        con.commit()
-        con.close()
+        db = self.connect()
+        try:
+            db.execute("UPDATE samples SET created_at='2026-08-01 00:00:00' WHERE id=%s", (first,))
+            db.execute("UPDATE samples SET created_at='2026-08-02 23:59:59' WHERE id=%s", (second,))
+            db.commit()
+        finally:
+            db.close()
         blob = self.download("/api/excel/samples-overview?date_from=2026-08-01&date_to=2026-08-02")
         wb = load_workbook(io.BytesIO(blob), read_only=True)
         names = [row[1] for row in wb["样品总览"].iter_rows(min_row=4, values_only=True)]
@@ -136,11 +131,11 @@ class BusinessExcelApiTest(unittest.TestCase):
         aid = detail["items"][0]["analyte_id"]
         xrf_instrument = next(i for i in self.meta["instruments"] if i["itype"] == "xrf")
         xrf_method = next(m for m in self.meta["methods"] if m["itype"] == "xrf")
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            db.execute("""INSERT INTO sample_analytes(sample_id,preparation_id,analyte_id,instrument_id,method_id)
-                          VALUES(?,NULL,?,?,?)""", (sid, aid, xrf_instrument["id"], xrf_method["id"]))
-            xrf_task_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            xrf_task_id = db.execute("""INSERT INTO sample_analytes(sample_id,preparation_id,analyte_id,instrument_id,method_id)
+                          VALUES(%s,NULL,%s,%s,%s) RETURNING id""",
+                          (sid, aid, xrf_instrument["id"], xrf_method["id"])).fetchone()[0]
             db.commit()
         finally:
             db.close()
@@ -161,9 +156,9 @@ class BusinessExcelApiTest(unittest.TestCase):
                                     content_type="multipart/form-data")
         self.assertEqual(400, rejected.status_code)
         self.assertIn("XRF仪器任务", rejected.get_json()["error"])
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            self.assertIsNotNone(db.execute("SELECT id FROM sample_analytes WHERE id=?", (xrf_task_id,)).fetchone())
+            self.assertIsNotNone(db.execute("SELECT id FROM sample_analytes WHERE id=%s", (xrf_task_id,)).fetchone())
         finally:
             db.close()
 
@@ -171,12 +166,15 @@ class BusinessExcelApiTest(unittest.TestCase):
         sid = self.create_sample(xrf=True)
         detail = self.client.get(f"/api/samples/{sid}").get_json()
         task_id = detail["items"][0]["id"]
-        db = sqlite3.connect(lims.DB)
-        db.execute("INSERT INTO xrf_analyses(sample_id,external_id,method) VALUES(?,?,?)", (sid, "X-1", "UQ"))
-        analysis_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-        db.execute("INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(?,?,?,1)", (analysis_id, "Ag", 9.9))
-        db.commit()
-        db.close()
+        db = self.connect()
+        try:
+            analysis_id = db.execute(
+                "INSERT INTO xrf_analyses(sample_id,external_id,method) VALUES(%s,%s,%s) RETURNING id",
+                (sid, "X-1", "UQ")).fetchone()[0]
+            db.execute("INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(%s,%s,%s,1)", (analysis_id, "Ag", 9.9))
+            db.commit()
+        finally:
+            db.close()
         blob = self.download(f"/api/excel/samples/{sid}/data")
         wb = load_workbook(io.BytesIO(blob))
         ws = wb["数据录入"]
@@ -360,13 +358,14 @@ class BusinessExcelApiTest(unittest.TestCase):
         detail = self.client.get(f"/api/samples/{sid}").get_json()
         aid = detail["items"][0]["analyte_id"]
         xrf_instrument = next(i for i in self.meta["instruments"] if i["itype"] == "xrf")
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
-            db.execute("INSERT INTO preparations(sample_id,name) VALUES(?,?)", (sid, "XRF只读任务"))
-            prep_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            db.execute("""INSERT INTO sample_analytes(sample_id,preparation_id,analyte_id,instrument_id)
-                          VALUES(?,?,?,?)""", (sid, prep_id, aid, xrf_instrument["id"]))
-            xrf_task_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            prep_id = db.execute(
+                "INSERT INTO preparations(sample_id,name) VALUES(%s,%s) RETURNING id",
+                (sid, "XRF只读任务")).fetchone()[0]
+            xrf_task_id = db.execute("""INSERT INTO sample_analytes(sample_id,preparation_id,analyte_id,instrument_id)
+                          VALUES(%s,%s,%s,%s) RETURNING id""",
+                          (sid, prep_id, aid, xrf_instrument["id"])).fetchone()[0]
             db.commit()
         finally:
             db.close()

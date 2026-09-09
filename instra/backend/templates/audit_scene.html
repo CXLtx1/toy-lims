@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LabFlow 审计现场</title>
+  <link rel="stylesheet" href="/labflow-preview/style.css">
+  <style>
+    html,body{margin:0;min-height:100%;background:#eef1f3;color:#20272d}
+    body{padding:0;font-size:12px;overflow:auto}
+    .scene-shell{min-width:0;padding:14px 16px 18px;background:linear-gradient(180deg,#f9fafb,#edf1f3)}
+    .scene-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:9px}
+    .scene-brand{display:flex;align-items:center;gap:9px;color:#263d4d;font-weight:700}
+    .scene-mark{width:22px;height:22px;display:grid;place-items:center;border:1px solid #496373;transform:rotate(45deg);background:#fff;box-shadow:2px 2px #c7d0d5}
+    .scene-mark i{width:7px;height:7px;border:1px solid #b17d34;background:#f5e6c9}
+    .scene-brand span span{display:block;font:8px Consolas,monospace;letter-spacing:1.4px;color:#76858e;font-weight:400}
+    .scene-event{text-align:right;color:#627580;font:10px Consolas,"Microsoft YaHei",monospace}
+    .scene-event b{display:block;color:#263d4d;font:600 12px "Segoe UI","Microsoft YaHei",sans-serif}
+    .scene-notice{display:flex;justify-content:space-between;gap:14px;margin:0 0 8px;padding:6px 9px;border-left:3px solid #b98946;background:#fff8e9;color:#67542f}
+    .scene-notice span:last-child{color:#87939a;font-size:10px}
+    .scene-table-shell{overflow:auto;border:1px solid #c8d0d5;background:#fff;box-shadow:0 4px 12px #24343f18}
+    #d-table{min-width:920px;margin:0}
+    #d-table th:nth-child(1){width:9%}#d-table th:nth-child(2){width:16%}#d-table th:nth-child(3){width:18%}#d-table th:nth-child(4){width:25%}#d-table th:nth-child(5){width:25%}#d-table th:nth-child(6){width:7%}
+    #d-table input:disabled{opacity:1;color:#263b32;-webkit-text-fill-color:#263b32;cursor:default}
+    #d-table input[type=checkbox]:disabled{filter:none}
+    #d-table tr.audit-target-row td{position:relative;background:#e6f2f8!important;border-top:1px solid #2980b9;border-bottom:1px solid #2980b9}
+    #d-table tr.audit-target-row td:first-child{border-left:4px solid #2980b9}
+    #d-table .audit-target-reading{position:relative;padding:5px 7px;margin:-2px -3px;border:1px solid #2d83b5;background:#f2fbff;box-shadow:0 0 0 3px #3498db20}
+    #d-table .audit-target-field{border:2px solid #2582b7!important;background:#fff!important;color:#153a50!important;-webkit-text-fill-color:#153a50!important;font-weight:700;box-shadow:0 0 0 4px #3498db22}
+    body[data-mode=before] #d-table .audit-target-field{border-color:#a76258!important;background:#fff4f1!important;color:#783e37!important;-webkit-text-fill-color:#783e37!important}
+    body[data-mode=after] #d-table .audit-target-field{border-color:#41845e!important;background:#effaf3!important;color:#245b39!important;-webkit-text-fill-color:#245b39!important}
+    .scene-legend{display:flex;justify-content:space-between;gap:14px;margin-top:8px;color:#72818a;font-size:10px}
+    .scene-legend b{color:#475c68;font-weight:600}.scene-legend strong{color:#9a6828;letter-spacing:.5px}
+    .scene-error{padding:30px;border:1px solid #d8c2b2;background:#fff8f1;color:#764b38}
+    @media(max-width:640px){.scene-shell{padding:10px}.scene-head{align-items:flex-start}.scene-event{max-width:300px}.scene-notice span:last-child{display:none}}
+  </style>
+</head>
+<body data-mode="{{ mode }}">
+{% if scene.supported %}
+  <main class="scene-shell">
+    <header class="scene-head">
+      <div class="scene-brand"><span class="scene-mark"><i></i></span><span>LabFlow 原始数据录入<span>READ-ONLY AUDIT SCENE</span></span></div>
+      <div class="scene-event"><b>{{ scene.sample.lims_no or scene.sample.name }} · {{ scene.audit.action_label }}</b>{{ scene.audit.created_at }} / {{ scene.audit.username or "系统" }}</div>
+    </header>
+    <p class="scene-notice"><span><strong>{{ {"before":"修改前", "after":"修改后", "current":"当前现场"}[mode] }}</strong> · 已定位到 {{ scene.sample.name }} 的原始读数</span><span>仅目标值来自审计快照；行名、仪器及单位为当前上下文</span></p>
+    <div class="scene-table-shell">
+      <table id="d-table" class="data-grid spreadsheet">
+        <thead><tr><th>项目</th><th>溶样</th><th>仪器/方法</th><th>原始值</th><th>辅助数据</th><th>状态</th></tr></thead>
+        <tbody id="scene-rows"></tbody>
+      </table>
+    </div>
+    <footer class="scene-legend"><span><b>蓝色行</b> = 当前定位上下文</span><span><strong>ARCHIVE VALUE / {{ mode|upper }}</strong> · 所有控件均为只读</span></footer>
+  </main>
+  <script src="/labflow-preview/entry-renderer.js"></script>
+  <script nonce="{{ nonce }}">
+    (() => {
+      const scene = {{ scene|tojson }};
+      const mode = {{ mode|tojson }};
+      const rows = JSON.parse(JSON.stringify(scene.rows));
+      const targetRow = rows.find((row) => row.id === scene.locator.sample_analyte_id);
+      const targetReading = targetRow?.readings.find((reading) => reading.id === scene.locator.reading_id);
+      if (targetReading) targetReading.raw = scene.values[mode].value;
+      document.querySelector("#scene-rows").innerHTML = rows
+        .map((row) => globalThis.LabflowEntryRenderer.entryRowHtml(row, 1, { readOnly: true })).join("");
+      const row = document.querySelector(`[data-said="${scene.locator.sample_analyte_id}"]`);
+      const reading = row?.querySelector(`[data-rid="${scene.locator.reading_id}"]`);
+      row?.classList.add("audit-target-row");
+      reading?.classList.add("audit-target-reading");
+      const field = reading?.querySelector('[data-field="raw"]');
+      field?.classList.add("audit-target-field");
+      const shell = document.querySelector(".scene-table-shell");
+      if (field && shell && shell.scrollWidth > shell.clientWidth) {
+        const shellRect = shell.getBoundingClientRect();
+        const fieldRect = field.getBoundingClientRect();
+        const fieldCenter = fieldRect.left - shellRect.left + shell.scrollLeft + fieldRect.width / 2;
+        shell.scrollLeft = Math.max(0, fieldCenter - shell.clientWidth / 2);
+      }
+    })();
+  </script>
+{% else %}
+  <main class="scene-shell"><div class="scene-error"><b>这条审计暂时无法还原原始录入现场</b><p>{{ scene.reason }}</p></div></main>
+{% endif %}
+</body>
+</html>

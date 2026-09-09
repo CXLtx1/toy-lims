@@ -1,14 +1,10 @@
-"""正式运行入口：Waitress；SQLite 模式附带每日在线备份。"""
+"""Production Waitress entry point."""
 
 import os
 import threading
-from datetime import datetime
-from pathlib import Path
-from time import sleep
 
 import app as lims
 from db_backend import connect_database
-from maintenance import create_backup
 
 
 def warm_report_cache():
@@ -34,24 +30,6 @@ def warm_report_cache():
         connection.close()
 
 
-def backup_loop():
-    backup_hour = min(max(int(os.environ.get("LIMS_BACKUP_HOUR", "2")), 0), 23)
-    keep_days = max(int(os.environ.get("LIMS_BACKUP_KEEP_DAYS", "30")), 1)
-    backup_dir = os.environ.get("LIMS_BACKUP_DIR", str(lims.BASE_DIR / "backups"))
-    today_pattern = f"toy-lims-{datetime.now():%Y%m%d}-*.db"
-    last_day = datetime.now().date() if any(Path(backup_dir).glob(today_pattern)) else None
-    while True:
-        now = datetime.now()
-        if now.hour >= backup_hour and now.date() != last_day:
-            try:
-                target = create_backup(lims.database_target(), backup_dir, keep_days)
-                print(f"[{now:%Y-%m-%d %H:%M:%S}] 数据库备份完成：{target}", flush=True)
-                last_day = now.date()
-            except Exception:  # 后台任务失败不能终止 Web 服务
-                print(f"[{now:%Y-%m-%d %H:%M:%S}] 数据库备份失败", flush=True)
-        sleep(60)
-
-
 def main():
     lims.database_target()
     from waitress import serve
@@ -60,8 +38,6 @@ def main():
         lims.init_db()
     except Exception:
         raise SystemExit("Database initialization failed; check external database configuration") from None
-    if not lims.is_postgres_database(lims.database_target()):
-        threading.Thread(target=backup_loop, name="lims-backup", daemon=True).start()
     host = os.environ.get("LIMS_HOST", "127.0.0.1")
     port = int(os.environ.get("LIMS_PORT", "5000"))
     # 每个浏览器的 SSE 协同推送连接会常驻占用一个线程，线程数需要留出余量。

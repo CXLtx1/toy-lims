@@ -24,12 +24,6 @@ CAPABILITIES = {
     "user_manage": "用户管理",
     "terminal_manage": "终端管理",
 }
-LEGACY_ROLE_CAPABILITIES = {
-    "receiver": {"sample_manage"},
-    "analyst": {"sample_manage", "result_edit", "report_edit"},
-    "reviewer": {"report_edit", "review_release"},
-    "admin": set(CAPABILITIES),
-}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 AUTHORIZATION_SECONDS = 120
 FORCED_AUTHORIZATION_SECONDS = 60
@@ -59,34 +53,8 @@ def _password_matches(row, password):
         return False
 
 
-def _upgrade_password(db, row, password, entity):
-    method = row["password_hash"].split("$", 1)[0].split(":")
-    upgrade = False
-    try:
-        if method[0] == "scrypt" and len(method) == 4:
-            costs = tuple(map(int, method[1:]))
-            target = tuple(int(part) for part in PASSWORD_METHOD.split(":")[1:4])
-            # Never decrease any scrypt cost, including unfamiliar stronger hashes.
-            upgrade = costs != target and all(old <= new for old, new in zip(costs, target))
-        elif method[:2] == ["pbkdf2", "sha256"] and len(method) == 3:
-            # Stronger/different legacy KDFs need an explicit migration policy.
-            upgrade = int(method[2]) < 600000
-    except ValueError:
-        return
-    if upgrade:
-        table = "users" if entity == "user" else "terminals"
-        # Legacy short passwords may still log in and receive a stronger hash.
-        upgraded = generate_password_hash(password, method=PASSWORD_METHOD)
-        db.execute(f"UPDATE {table} SET password_hash=? WHERE id=? AND password_hash=?",
-                   (upgraded, row["id"], row["password_hash"]))
-        db.commit()
-
-
-def _check_password(db, row, password, entity):
-    if not _password_matches(row, password):
-        return False
-    _upgrade_password(db, row, password, entity)
-    return True
+def _check_password(row, password):
+    return _password_matches(row, password)
 
 
 def get_db():
@@ -110,11 +78,6 @@ def user_permissions(user):
         permissions = set(json.loads(raw or "[]"))
     except (TypeError, json.JSONDecodeError):
         permissions = set()
-    if not permissions:
-        try:
-            permissions = set(LEGACY_ROLE_CAPABILITIES.get(user["role"], set()))
-        except (KeyError, IndexError, TypeError):
-            pass
     return permissions & set(CAPABILITIES)
 
 
@@ -139,7 +102,6 @@ def authenticate_capable_user(db, password, capability):
     user = matches[0]
     if capability not in user_permissions(user):
         return None, f"该用户没有“{CAPABILITIES[capability]}”权限"
-    _upgrade_password(db, user, password, "user")
     return user, None
 
 
@@ -153,7 +115,7 @@ def _terminal_password_in_use(db, password, excluding_terminal_id=None):
     return any(row["id"] != excluding_terminal_id and
                  _password_matches(row, password)
                 for row in db.execute(
-                    "SELECT id,password_hash FROM terminals WHERE active=1 AND kind<>'personal'"))
+                    "SELECT id,password_hash FROM terminals WHERE active=1"))
 
 
 def _permission_inheritance_error(permissions):
@@ -199,7 +161,7 @@ def consume_forced_authorization(capability):
     if purpose != capability or not user_id or not current:
         return None
     user = get_db().execute(
-        "SELECT id,username,display_name,role,permissions,active FROM users WHERE id=? AND active=1",
+        "SELECT id,username,display_name,permissions,active FROM users WHERE id=%s AND active=1",
         (user_id,)).fetchone()
     return user if user and capability in user_permissions(user) else None
 
@@ -219,7 +181,7 @@ def load_user():
     personal_user_id = session.get("personal_user_id")
     if personal_user_id:
         user = db.execute(
-            "SELECT id,username,display_name,role,permissions,active,session_token FROM users WHERE id=? AND active=1",
+            "SELECT id,username,display_name,permissions,active,session_token FROM users WHERE id=%s AND active=1",
             (personal_user_id,)).fetchone()
         if not user:
             session.clear()
@@ -236,7 +198,7 @@ def load_user():
         return
     terminal_id = session.get("terminal_id")
     g.terminal = db.execute(
-        "SELECT id,name,kind,active,session_token FROM terminals WHERE id=? AND active=1",
+        "SELECT id,name,kind,active,session_token FROM terminals WHERE id=%s AND active=1",
         (terminal_id,)).fetchone() if terminal_id else None
     g.user = None
     if not g.terminal:
@@ -260,7 +222,7 @@ def load_user():
         current = False
     if user_id and current:
         g.user = db.execute(
-            "SELECT id,username,display_name,role,permissions,active FROM users WHERE id=? AND active=1",
+            "SELECT id,username,display_name,permissions,active FROM users WHERE id=%s AND active=1",
             (user_id,)).fetchone()
     if not g.user:
         session.pop("authorized_user_id", None)
@@ -366,20 +328,18 @@ def setup():
             if len(matches) != 1 or "user_manage" not in user_permissions(matches[0]):
                 error = "请输入具备用户管理能力的启用用户密码"
         if not error:
-            if has_users:
-                _upgrade_password(db, matches[0], user_password, "user")
             if not has_users:
                 permissions = json.dumps(sorted(CAPABILITIES))
-                cur = db.execute("""INSERT INTO users(
-                    username,password_hash,display_name,role,permissions)
-                    VALUES('cxl',?,?,'custom',?)""",
-                    (hash_password(user_password), display_name, permissions))
-                audit_event(db, "setup", "user", cur.lastrowid,
+                user_id = db.execute("""INSERT INTO users(
+                    username,password_hash,display_name,permissions)
+                    VALUES('cxl',%s,%s,%s) RETURNING id""",
+                    (hash_password(user_password), display_name, permissions)).fetchone()["id"]
+                audit_event(db, "setup", "user", user_id,
                             after={"username": "cxl", "permissions": sorted(CAPABILITIES)},
-                            user={"id": cur.lastrowid, "username": "cxl"})
+                            user={"id": user_id, "username": "cxl"})
             if not has_terminals:
                 db.executemany("""INSERT INTO terminals(name,password_hash,kind,sort_order)
-                    VALUES(?,?,?,?)""", [
+                    VALUES(%s,%s,%s,%s)""", [
                     ("二组", hash_password(standard_password), "standard", 1),
                     ("管理终端", hash_password(admin_password), "admin", 2),
                 ])
@@ -411,16 +371,16 @@ def login():
         if login_kind == "personal":
             terminal = {"id": None, "name": "个人终端", "kind": "personal", "active": 1}
             username = request.form.get("username", "").strip()
-            user = db.execute("SELECT * FROM users WHERE username=? AND active=1",
+            user = db.execute("SELECT * FROM users WHERE username=%s AND active=1",
                               (username,)).fetchone()
-            if not user or not _check_password(db, user, password, "user"):
+            if not user or not _check_password(user, password):
                 error = "用户名或用户密码不正确"
         else:
             terminal = db.execute("""SELECT * FROM terminals
-                WHERE id=? AND active=1 AND kind IN ('standard','admin')""",
+                WHERE id=%s AND active=1 AND kind IN ('standard','admin')""",
                 (terminal_id,)).fetchone() if terminal_id else None
             if (not terminal or login_kind not in {"", terminal["kind"]} or
-                    not _check_password(db, terminal, password, "terminal")):
+                    not _check_password(terminal, password)):
                 error = "终端或密码不正确"
         if not error:
             session_token = secrets.token_hex(16)
@@ -430,14 +390,14 @@ def login():
                 previous_token = user["session_token"] or ""
                 session["personal_user_id"] = user["id"]
                 session["session_token"] = session_token
-                db.execute("UPDATE users SET session_token=? WHERE id=?",
+                db.execute("UPDATE users SET session_token=%s WHERE id=%s",
                            (session_token, user["id"]))
                 entity_id = user["id"]
             else:
                 previous_token = terminal["session_token"] or ""
                 session["terminal_id"] = terminal["id"]
                 session["session_token"] = session_token
-                db.execute("UPDATE terminals SET session_token=? WHERE id=?",
+                db.execute("UPDATE terminals SET session_token=%s WHERE id=%s",
                            (session_token, terminal["id"]))
                 entity_id = terminal["id"]
             if previous_token and previous_token != session_token:
@@ -463,10 +423,10 @@ def logout():
         token = session.get("session_token") or ""
         if token:
             if g.terminal["id"]:
-                db.execute("UPDATE terminals SET session_token='' WHERE id=? AND session_token=?",
+                db.execute("UPDATE terminals SET session_token='' WHERE id=%s AND session_token=%s",
                            (g.terminal["id"], token))
             elif g.user and g.user["id"]:
-                db.execute("UPDATE users SET session_token='' WHERE id=? AND session_token=?",
+                db.execute("UPDATE users SET session_token='' WHERE id=%s AND session_token=%s",
                            (g.user["id"], token))
         db.commit()
     session.clear()
@@ -494,7 +454,6 @@ def authorize():
     user = matches[0]
     if purpose and purpose not in user_permissions(user):
         return jsonify(ok=False, error=f"该用户没有“{CAPABILITIES[purpose]}”权限"), 403
-    _upgrade_password(get_db(), user, password, "user")
     session["authorized_user_id"] = user["id"]
     session["last_write"] = time.time()
     if purpose:
@@ -540,18 +499,18 @@ def add_user():
     if inheritance_error:
         return jsonify(ok=False, error=inheritance_error, code="permission_inheritance"), 403
     db = get_db()
-    if db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+    if db.execute("SELECT 1 FROM users WHERE username=%s", (username,)).fetchone():
         return jsonify(ok=False, error="用户名已存在"), 409
     if _password_in_use(db, password):
         return jsonify(ok=False, error="该密码已被其他启用用户使用，请设置唯一密码"), 409
-    cur = db.execute("""INSERT INTO users(username,password_hash,display_name,role,permissions)
-        VALUES(?,?,?,'custom',?)""", (username, hash_password(password),
-                              str(data.get("display_name", "")).strip() or username,
-                              json.dumps(sorted(permissions))))
-    audit_event(db, "create", "user", cur.lastrowid,
+    user_id = db.execute("""INSERT INTO users(username,password_hash,display_name,permissions)
+        VALUES(%s,%s,%s,%s) RETURNING id""", (username, hash_password(password),
+                               str(data.get("display_name", "")).strip() or username,
+                               json.dumps(sorted(permissions)))).fetchone()["id"]
+    audit_event(db, "create", "user", user_id,
                 after={"username": username, "permissions": sorted(permissions)})
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=user_id)
 
 
 @bp.put("/api/users/<int:user_id>")
@@ -559,7 +518,7 @@ def add_user():
 def update_user(user_id):
     data = request.json or {}
     db = get_db()
-    before = db.execute("SELECT id,username,display_name,role,permissions,active FROM users WHERE id=?",
+    before = db.execute("SELECT id,username,display_name,permissions,active FROM users WHERE id=%s",
                         (user_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="用户不存在"), 404
@@ -570,7 +529,7 @@ def update_user(user_id):
     username = str(data.get("username", before["username"])).strip()
     if len(username) < 3:
         return jsonify(ok=False, error="用户名至少 3 个字符"), 400
-    if get_db().execute("SELECT 1 FROM users WHERE username=? AND id<>?",
+    if get_db().execute("SELECT 1 FROM users WHERE username=%s AND id<>%s",
                         (username, user_id)).fetchone():
         return jsonify(ok=False, error="用户名已存在"), 409
     permissions = (_clean_permissions(data["permissions"])
@@ -586,7 +545,7 @@ def update_user(user_id):
     if "user_manage" in user_permissions(before) and before["active"] and (
             "user_manage" not in permissions or not active):
         managers = [row for row in db.execute(
-            "SELECT role,permissions FROM users WHERE active=1 AND id<>?", (user_id,))
+            "SELECT permissions FROM users WHERE active=1 AND id<>%s", (user_id,))
                     if "user_manage" in user_permissions(row)]
         if not managers:
             return jsonify(ok=False, error="系统必须至少保留一个具备用户管理能力的启用账号"), 400
@@ -596,12 +555,12 @@ def update_user(user_id):
     if password and _password_in_use(db, password, user_id):
         return jsonify(ok=False, error="该密码已被其他启用用户使用，请设置唯一密码"), 409
     display_name = str(data.get("display_name", before["display_name"])).strip()
-    db.execute("""UPDATE users SET username=?,display_name=?,role='custom',permissions=?,active=?
-        WHERE id=?""", (username, display_name, json.dumps(sorted(permissions)), active, user_id))
+    db.execute("""UPDATE users SET username=%s,display_name=%s,permissions=%s,active=%s
+        WHERE id=%s""", (username, display_name, json.dumps(sorted(permissions)), active, user_id))
     if password:
-        db.execute("UPDATE users SET password_hash=?,session_token='' WHERE id=?",
+        db.execute("UPDATE users SET password_hash=%s,session_token='' WHERE id=%s",
                    (hash_password(password), user_id))
-    after = db.execute("SELECT id,username,display_name,role,permissions,active FROM users WHERE id=?",
+    after = db.execute("SELECT id,username,display_name,permissions,active FROM users WHERE id=%s",
                        (user_id,)).fetchone()
     audit_event(db, "update", "user", user_id, before=before, after=after)
     db.commit()
@@ -628,17 +587,18 @@ def add_terminal():
     if password_error(password):
         return jsonify(ok=False, error=password_error(password)), 400
     db = get_db()
-    if db.execute("SELECT 1 FROM terminals WHERE name=?", (name,)).fetchone():
+    if db.execute("SELECT 1 FROM terminals WHERE name=%s", (name,)).fetchone():
         return jsonify(ok=False, error="终端名称已存在"), 409
     if _terminal_password_in_use(db, password):
         return jsonify(ok=False, error="该密码已被其他启用终端使用，请设置唯一密码"), 409
     sort_order = db.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM terminals").fetchone()[0]
-    cur = db.execute("""INSERT INTO terminals(name,password_hash,kind,sort_order)
-        VALUES(?,?,?,?)""", (name, hash_password(password), kind, sort_order))
-    audit_event(db, "create", "terminal", cur.lastrowid,
+    terminal_id = db.execute("""INSERT INTO terminals(name,password_hash,kind,sort_order)
+        VALUES(%s,%s,%s,%s) RETURNING id""",
+        (name, hash_password(password), kind, sort_order)).fetchone()["id"]
+    audit_event(db, "create", "terminal", terminal_id,
                 after={"name": name, "kind": kind, "active": 1})
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=terminal_id)
 
 
 @bp.put("/api/terminals/<int:terminal_id>")
@@ -646,7 +606,7 @@ def add_terminal():
 def update_terminal(terminal_id):
     data = request.json or {}
     db = get_db()
-    before = db.execute("SELECT id,name,kind,active FROM terminals WHERE id=?",
+    before = db.execute("SELECT id,name,kind,active FROM terminals WHERE id=%s",
                         (terminal_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="终端不存在"), 404
@@ -658,11 +618,9 @@ def update_terminal(terminal_id):
         return jsonify(ok=False, error="终端名称或类型无效"), 400
     if password and password_error(password):
         return jsonify(ok=False, error=password_error(password)), 400
-    if db.execute("SELECT 1 FROM terminals WHERE name=? AND id<>?",
+    if db.execute("SELECT 1 FROM terminals WHERE name=%s AND id<>%s",
                   (name, terminal_id)).fetchone():
         return jsonify(ok=False, error="终端名称已存在"), 409
-    if before["kind"] == "personal" and kind != "personal" and not password:
-        return jsonify(ok=False, error="个人终端切换为密码终端时必须设置终端密码"), 400
     if password and _terminal_password_in_use(db, password, terminal_id):
         return jsonify(ok=False, error="该密码已被其他启用终端使用，请设置唯一密码"), 409
     current_terminal_id = g.terminal["id"] if getattr(g, "terminal", None) else None
@@ -673,14 +631,14 @@ def update_terminal(terminal_id):
             "SELECT COUNT(*) FROM terminals WHERE kind='admin' AND active=1").fetchone()[0]
         if active_admins <= 1:
             return jsonify(ok=False, error="系统必须至少保留一个启用的管理终端"), 400
-    db.execute("""UPDATE terminals SET name=?,kind=?,active=?,
-        updated_at=datetime('now','localtime') WHERE id=?""",
+    db.execute("""UPDATE terminals SET name=%s,kind=%s,active=%s,
+        updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS') WHERE id=%s""",
         (name, kind, active, terminal_id))
     if password:
-        db.execute("""UPDATE terminals SET password_hash=?,session_token='',
-            updated_at=datetime('now','localtime') WHERE id=?""",
+        db.execute("""UPDATE terminals SET password_hash=%s,session_token='',
+            updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS') WHERE id=%s""",
             (hash_password(password), terminal_id))
-    after = db.execute("SELECT id,name,kind,active FROM terminals WHERE id=?",
+    after = db.execute("SELECT id,name,kind,active FROM terminals WHERE id=%s",
                        (terminal_id,)).fetchone()
     audit_event(db, "update", "terminal", terminal_id, before=before, after=after)
     db.commit()
@@ -706,10 +664,10 @@ def move_terminal(terminal_id):
     before = ordered[current_index]
     target = ordered[target_index]
     for index, item in enumerate(ordered, start=1):
-        db.execute("UPDATE terminals SET sort_order=? WHERE id=?", (index, item["id"]))
-    db.execute("UPDATE terminals SET sort_order=? WHERE id=?", (target_index + 1, terminal_id))
-    db.execute("UPDATE terminals SET sort_order=? WHERE id=?", (current_index + 1, target["id"]))
-    after = db.execute("SELECT id,name,kind,active,sort_order FROM terminals WHERE id=?",
+        db.execute("UPDATE terminals SET sort_order=%s WHERE id=%s", (index, item["id"]))
+    db.execute("UPDATE terminals SET sort_order=%s WHERE id=%s", (target_index + 1, terminal_id))
+    db.execute("UPDATE terminals SET sort_order=%s WHERE id=%s", (current_index + 1, target["id"]))
+    after = db.execute("SELECT id,name,kind,active,sort_order FROM terminals WHERE id=%s",
                        (terminal_id,)).fetchone()
     audit_event(db, "update", "terminal", terminal_id, before=before, after=after)
     db.commit()
@@ -721,7 +679,7 @@ def list_audit():
     limit = min(max(request.args.get("limit", 100, type=int), 1), 500)
     rows = get_db().execute("""SELECT id,user_id,username,terminal_id,terminal_name,action,
         entity_type,entity_id,reason,before_json,after_json,ip_address,created_at
-        FROM audit_logs ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+        FROM audit_logs ORDER BY id DESC LIMIT %s""", (limit,)).fetchall()
     result = []
     for row in rows:
         item = dict(row)

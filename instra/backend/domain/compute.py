@@ -70,11 +70,9 @@ def formula_variables(expression):
 
 
 def aux_coefficient(aux):
-    """回标系数：优先旧格式 coefficient，否则 expected/measured。"""
+    """Return the correction coefficient from the reference measurement."""
     if not aux.get("use"):
         return 1.0
-    if aux.get("coefficient"):
-        return float(aux["coefficient"])
     if aux.get("expected") and aux.get("measured"):
         return float(aux["expected"]) / float(aux["measured"])
     return 1.0
@@ -199,13 +197,6 @@ def calc_result(sa, is_liquid):
         aux = json.loads(aux or "{}")
     coeff = aux_coefficient(aux)
     readings = sa.get("readings") or []
-    if not readings:
-        # 兼容未被迁移的旧单值
-        if sa["raw"] is not None or sa.get("extra") not in (None, "", "{}"):
-            extra = sa.get("extra")
-            if isinstance(extra, str):
-                extra = json.loads(extra or "{}")
-            readings = [{"raw": sa["raw"], "extra": extra, "use_avg": 1, "is_final": 0}]
     if not readings:
         return (None, "未录入" if sa["itype"] else "未选仪器", [])
     details = []

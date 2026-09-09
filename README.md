@@ -2,7 +2,7 @@
 
 一个面向**无机分析实验室**的轻量级 LIMS（实验室信息管理系统），用于记录来样、管理检测流程、录入分析原始数据、自动换算质量分数并生成报告单。
 
-服务端使用 **Flask + PostgreSQL + Waitress**，SQLite 保留用于自动化测试和旧库迁移；浏览器端使用 **Vue 3 + TypeScript + Vite**（源码在 `frontend/`，构建产物由 Flask 托管），仪器侧提供 **.NET 10 WPF** 客户端。项目面向局域网内的小型实验室，优先保证部署简单、数据可追溯和仪器操作便捷。
+服务端使用 **Flask + PostgreSQL + Waitress**；浏览器端使用 **Vue 3 + TypeScript + Vite**（源码在 `frontend/`，构建产物由 Flask 托管），仪器侧提供 **.NET 10 WPF** 客户端。项目面向局域网内的小型实验室，优先保证部署简单、数据可追溯和仪器操作便捷。
 
 本系统由陈炫霖构思，由**Kimi K3**，**GLM 5.3 Flash**和**GPT 5.6 Sol**构建。
 代码项目仍命名为 **toy-lims**，网站面向用户显示为 **LabFlow · 化验室执行系统**。
@@ -64,7 +64,7 @@ python server.py
 - Waitress 3.x（正式 Web 服务）
 - psycopg 3.x（PostgreSQL 驱动）
 
-正式业务库位于 PostgreSQL，启动时会检查并补建当前 schema。旧 `server/lims.db` 作为迁移源和回退档案保留，不再由 Web 服务写入。SQLite 模式仍支持 `python server/backup_now.py`；PostgreSQL 正式库应由数据库服务器使用 `pg_dump`、计划任务或存储快照备份，应用不会把远程 PostgreSQL 伪装成 `.db` 文件。
+正式业务库位于 PostgreSQL，启动时会检查并补建当前 schema。备份应由数据库服务器使用 `pg_dump`、计划任务或存储快照完成。
 
 请求日志是可选功能。在 `server/app.py` 顶部将 `REQUEST_LOG_ENABLED` 设为 `True` 后，服务会把时间、来源 IP、请求方法、路径、状态码、耗时、用户和终端写入 `server/logs/requests.log`；日志每天午夜轮转为带日期的文件并永久保留，不写入数据库或网页，也不记录密码、令牌和请求正文。`LIMS_LOG_DIR` 可调整日志目录。
 
@@ -293,7 +293,7 @@ OXSAS 普通定量和已人工处理完成的 UniQuant 结果上传后均进入�
 
 `client/xrf/` 运行在 OXSAS 仪器电脑上，以只读方式查询普通定量结果、UniQuant 数据和仪器实时状态，不修改 OXSAS 数据库。客户端每 5 秒同步状态和 UQ 分析，普通定量结果由操作者确认上传；服务端按外部分析 ID 幂等保存。发布程序位于 `client/xrf/publish/win-x64-single/`。
 
-仪器客户端只通过 HTTP API 连接 LIMS，不直接访问 PostgreSQL 或旧 `server/lims.db`。跨机器访问时必须分别配置 `LIMS_STANDARD_CLIENT_TOKEN` 或 `LIMS_XRF_CLIENT_TOKEN`；用户密码和设备令牌承担不同职责。
+仪器客户端只通过 HTTP API 连接 LIMS，不直接访问 PostgreSQL。跨机器访问时必须分别配置 `LIMS_STANDARD_CLIENT_TOKEN` 或 `LIMS_XRF_CLIENT_TOKEN`；用户密码和设备令牌承担不同职责。
 
 ### 5.9 结果页
 
@@ -540,22 +540,18 @@ D:/文件/Projects/toy-lims/
 │   ├── app.py              # Flask、数据库地址、主要 API 和换算逻辑
 │   ├── security.py         # CSRF、限速、安全头与 HTTPS/Cookie 策略
 │   ├── mutation_guard.py   # 写入乐观锁与幂等创建
-│   ├── db_schema.py        # 表结构、SQLite 升级、种子数据和初始化
-│   ├── db_backend.py       # SQLite/PostgreSQL 连接、SQL 方言和行兼容层
-│   ├── migrate_to_postgres.py # 筛选并迁移旧 SQLite 数据
+│   ├── db_schema.py        # PostgreSQL 表结构、种子数据和初始化
+│   ├── db_backend.py       # psycopg 连接与行对象薄封装
 │   ├── lims_auth.py        # 终端认证、用户能力和安全约束
 │   ├── lims_workflow.py    # 样品状态、编号和审计
 │   ├── business_excel.py   # Excel 导入、导出和报告工作簿
 │   ├── result_report_excel.py # 结果页扁平结果报告导出
 │   ├── run.py              # Waitress 正式入口
-│   ├── backup_now.py       # 旧 SQLite 一次性备份命令
-│   ├── lims.db             # 旧 SQLite 迁移源/回退档案
 │   ├── instance/           # Flask 密钥
-│   ├── backups/            # 迁移前 SQLite 备份
 │   ├── logs/               # 可选的按日请求日志
-│   ├── templates/          # 旧版页面（过渡回退）与登录/初始化页
-│   ├── static/             # 旧版样式和交互、共享静态资源
-│   └── tests/              # 服务端测试
+│   ├── templates/          # 登录/初始化页（服务器渲染）
+│   ├── static/             # 登录页样式等静态资源
+│   └── tests/              # 服务端测试（连接 PostgreSQL 测试库）
 ├── client/                 # .NET 10 Windows 工具与仪器客户端
 │   ├── docs/               # 总体方案及 OXSAS 资料
 │   ├── xrf/                # XRF 自动下载/上传客户端
@@ -568,15 +564,12 @@ D:/文件/Projects/toy-lims/
 
 ## 10. 版本与迁移说明
 
-`toy-lims` 仍在持续迭代，数据库结构会随业务变化。正式运行现已切换到 PostgreSQL：
+`toy-lims` 仍在持续迭代，数据库结构会随业务变化。正式运行现已完全切换到 PostgreSQL，SQLite 兼容层与迁移工具已移除：
 
-- `server/db_schema.py` 集中保存表结构、旧 SQLite 升级、种子数据和初始化过程；`app.init_db()` 仅保留兼容包装。
-- `server/db_backend.py` 隔离连接、参数占位符、时间函数、自增 ID 和两种数据库的行对象差异。
-- 初始化过程在 PostgreSQL 中幂等创建当前 schema 和索引；SQLite 旧库迁移逻辑仍保留，供测试和旧档案使用。
-- `server/migrate_to_postgres.py` 迁移全部配置、用户和终端，同时按要求只保留指定样品及其关联数据；默认样品名为 `RY28888`。
-- 迁移工具先执行 SQLite 完整性检查并创建迁移前 `.db` 备份，再写入 PostgreSQL、校准 identity 序列并核对关键行数。
-
-迁移预演使用 `python server/migrate_to_postgres.py --dry-run`；明确替换目标库时使用 `python server/migrate_to_postgres.py --replace`。迁移完成后应保留原 `lims.db` 和迁移前备份，不要把旧库与 PostgreSQL 同时投入写入。
+- `server/db_schema.py` 集中保存 PostgreSQL 表结构、种子数据和初始化过程；初始化幂等创建当前 schema 和索引。
+- `server/db_backend.py` 是 psycopg 连接与行对象的薄封装，参数统一使用 `%s` 占位符。
+- 历史数据迁移已一次性完成；此后如需搬迁数据，使用 PostgreSQL 标准工具（`pg_dump`/`COPY`）。
+- 服务端测试通过 `LIMS_TEST_DATABASE_URL` 连接独立的 PostgreSQL 测试库，按 schema 隔离运行。
 
 ---
 
@@ -584,10 +577,11 @@ D:/文件/Projects/toy-lims/
 
 ### 11. 开发与验证
 
-服务端测试使用 Python 标准库 `unittest`：
+服务端测试使用 Python 标准库 `unittest`，需要通过 `LIMS_TEST_DATABASE_URL` 提供一个可用的 PostgreSQL 测试库（每个用例使用独立 schema，自动建删；未设置时数据库用例自动跳过）：
 
 ```powershell
 cd server
+$env:LIMS_TEST_DATABASE_URL = "postgresql://用户:密码@主机/toy_lims_test"
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

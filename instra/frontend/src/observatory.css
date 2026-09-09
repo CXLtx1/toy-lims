@@ -247,6 +247,27 @@
 .stratum-changes b { color: #ccd5dd; font-weight: 400; }.stratum-changes del { color: #b49e94; text-decoration-color: #8e7469; }.stratum-changes ins { color: #ded5bf; text-decoration: none; }.stratum-changes > div > span { color: #9baebd; }
 .stratum-note { font-size: 10px; margin-bottom: 0; color: #9eb0bf; }
 .stratum-card > .port-text-button { margin-top: 10px; }
+.scene-trigger { width: 100%; display: flex; align-items: center; gap: 10px; margin-top: 14px; padding: 10px 12px; border: 1px solid #76848d;
+  background: linear-gradient(180deg, #34424c, #222d35); color: #e3e7e9 !important; text-align: left; box-shadow: inset 0 1px #ffffff12, 0 3px #111920; }
+.scene-trigger > span { display: grid; place-items: center; width: 20px; height: 20px; border: 1px solid #c0a471; color: #d6aa69; }
+.scene-trigger > b { margin-left: auto; color: #cdb17f; font-size: 9px; font-weight: 400; letter-spacing: 1px; }
+.scene-trigger:hover { border-color: #d1b37e; background: linear-gradient(180deg, #3b4b56, #27343d); }
+.source-scene { margin-top: 15px; border: 1px solid #7a8993; background: #11191f; box-shadow: 0 7px #0a1014, 0 8px #45545f, 0 18px 30px #0007; }
+.source-scene > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid #52616b;
+  background: repeating-linear-gradient(0deg, #ffffff03 0 1px, transparent 1px 3px), linear-gradient(100deg, #3a4852, #202b33); }
+.source-scene > header div > span { display: block; color: #c2ad84; font: 7px "Consolas", monospace; letter-spacing: 1.5px; }
+.source-scene > header strong { font-size: 13px; font-weight: 500; letter-spacing: 1px; }.source-scene > header small { color: #9baab4; font: 8px "Consolas", "Microsoft YaHei", monospace; }
+.scene-modes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; padding: 10px 10px 0; background: #151e25; }
+.scene-modes button { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: baseline; padding: 8px 10px; border: 1px solid #45545f; background: #202b33; color: #b7c2ca; text-align: left; }
+.scene-modes button small { color: #8fa1ad; font: 7px "Consolas", monospace; }.scene-modes button b { color: #dce2e5; font: 10px "Consolas", monospace; overflow: hidden; text-overflow: ellipsis; }
+.scene-modes button.active { position: relative; border-color: #c6a76d; background: #34414a; color: #fff; box-shadow: inset 0 -2px #c6a76d; }
+.scene-frame { position: relative; margin: 10px; padding: 7px; border: 1px solid #65747e; background: linear-gradient(135deg, #3c4850, #1b242b); box-shadow: inset 0 0 0 2px #10171c, 0 5px 15px #0008; }
+.scene-frame::after { content: "读取现场…"; position: absolute; inset: 7px; display: grid; place-items: center; color: #bba477; background: #101820ee; font: 9px "Consolas", "Microsoft YaHei", monospace; letter-spacing: 2px; opacity: 0; pointer-events: none; transition: opacity .2s; }
+.scene-frame.loading::after { opacity: 1; }.scene-frame iframe { display: block; width: 100%; height: 315px; border: 0; background: #eef1f3; }
+.scene-frame-rivets { position: absolute; inset: 3px; pointer-events: none; z-index: 2; }.scene-frame-rivets i { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #aab1b5; box-shadow: 0 0 0 1px #0c1114; }
+.scene-frame-rivets i:nth-child(1){left:0;top:0}.scene-frame-rivets i:nth-child(2){right:0;top:0}.scene-frame-rivets i:nth-child(3){left:0;bottom:0}.scene-frame-rivets i:nth-child(4){right:0;bottom:0}
+.scene-disclaimer { margin: 4px 13px 13px; color: #9dabb4; font-size: 9px; line-height: 1.7; }.scene-state { margin: 0; padding: 24px 14px; color: #aebbc3; }.scene-state.error { color: #d8a795; }
+.scene-state button { margin-left: 10px; border: 1px solid #8d695c; background: #30231f; }
 .load-deeper { display: flex; width: calc(100% - 61px); margin-left: 61px; justify-content: space-between; border: 1px solid #687c8d; background: linear-gradient(#31414f, #202f3b); padding: 15px 20px; font-size: 11px; letter-spacing: 1px; }
 .history-end { text-align: center; color: #8ea5b7; font-size: 10px; padding: 20px 0; }.history-end span { display: block; font: 8px "Consolas", monospace; letter-spacing: 3px; margin-top: 9px; color: #778fa1; }
 .flight-transition { position: absolute; inset: 0; min-height: 600px; z-index: 10; pointer-events: none; overflow: hidden; background: #080d12;
@@ -304,6 +325,7 @@
   .timewell-view { padding: 16px 12px; }.timewell-top { align-items: flex-start; }.timewell-top > span { max-width: 115px; text-align: right; }.return-orbit { gap: 8px; padding: 6px 8px; }.return-orbit kbd { display: none; }.timewell-heading { padding: 28px 3px 22px; }.timewell-heading h2 { font-size: 30px; letter-spacing: 4px; }.well-depth-mark { font-size: 36px; }.well-depth-mark small { display: none; }
   .well-layout { gap: 24px; }.well-dossier { padding: 15px; column-gap: 12px; grid-template-columns: 80px minmax(0, 1fr); }.dossier-emblem { width: 78px; height: 78px; }.dossier-emblem > div { inset: 23px; }.dossier-emblem > span { font-size: 11px; }.well-dossier > .port-eyebrow { font-size: 7px; }.well-dossier h3 { font-size: 20px; }.dossier-number { font-size: 9px; }
   .well-history-header { font-size: 11px; }.well-history-header small { font-size: 7px; }.history-shaft::before { left: 15px; }.stratum-rail { width: 20px; }.stratum-rail > span { display: none; }.history-stratum { gap: 9px; }.stratum-card { padding: 14px 12px; }.stratum-card h3 { font-size: 15px; }.stratum-card h3 small { display: block; margin: 5px 0 0; font-size: 10px; }.stratum-card header { font-size: 8px; }.stratum-changes > div { grid-template-columns: minmax(0, 1fr) 12px minmax(0, 1fr); gap: 7px; }.stratum-changes b { grid-column: 1 / -1; }.load-deeper { margin-left: 29px; width: calc(100% - 29px); padding: 13px 12px; }
+  .source-scene > header { align-items: flex-start; }.source-scene > header small { max-width: 120px; text-align: right; }.scene-modes button { display: flex; flex-wrap: wrap; padding: 7px; gap: 3px 6px; }.scene-modes button small { width: 100%; }.scene-modes button b { width: 100%; }.scene-frame { margin: 7px; padding: 5px; }.scene-frame iframe { height: 350px; }.scene-disclaimer { margin: 3px 9px 10px; }.scene-trigger > b { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .observatory *, .observatory *::before, .observatory *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }

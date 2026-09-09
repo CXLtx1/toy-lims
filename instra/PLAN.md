@@ -164,7 +164,7 @@ instra/
    Windows 本机开发：`pip install weasyprint` 后还需装 GTK3 运行库
    （tschoonj/GTK-for-Windows-Runtime-Environment-Installer 静默安装 `/VERYSILENT`，
    装完新开的终端才能拿到更新后的 PATH；已装 3.24.31 验证通过，中文字体走 Microsoft YaHei）。
-   环境变量 `INSTA_DATABASE_URL`（或复用 `LIMS_DATABASE_URL`；缺省用 `backend/db.py` 写死的内网连接）、`INSTA_PORT`（默认 5100）。
+   环境变量 `INSTA_DATABASE_URL`（或复用 `LIMS_DATABASE_URL`，必须配置其一）、`INSTA_PORT`（默认 5100）。
 
 ## 12. 缓做清单（明确不在本阶段）
 
@@ -192,3 +192,5 @@ instra/
 - 点击样品进入「时间深井」，以穿越机械舱门的运镜衔接；展示当前结果及当前关联对象最近 300 条审计，支持旧值/新值对照，Esc 返回星港。
 - 全局时间深井使用 `/api/overview/audits` 的 ID 游标分页加载更早记录；不返回原始快照和 IP。单样品沿用现有审计接口，删除或重新关联的对象可能不在其轨迹中。
 - 适配窄屏及 `prefers-reduced-motion`，动画不影响键盘操作，全部请求保持只读。沿用现有内网访问控制边界，部署到公网前必须增加认证。
+- 审计反向现场第一阶段只支持普通数值型仪器的 `reading.raw` 修改：按审计 ID 解析当前样品/任务/读数，复用 toy-lims 的 `entry-renderer.js` 与原始样式，在隔离 iframe 中切换修改前、修改后和当前值。历史快照只覆盖目标原始值，周边行、仪器、方法及单位明确标注为当前上下文；不启动 toy-lims 完整应用及任何保存事件。
+- Windows 本机测试可直接运行 `instra/start.ps1`，设置数据库地址后启动 Waitress。

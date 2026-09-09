@@ -1,7 +1,7 @@
 """insta 正式运行入口：Waitress。
 
 环境变量：
-  INSTA_DATABASE_URL / LIMS_DATABASE_URL  PostgreSQL 连接串（缺省用 db.py 写死的内网配置）
+  INSTA_DATABASE_URL / LIMS_DATABASE_URL  PostgreSQL 连接串（必须配置其一）
   INSTA_HOST / INSTA_PORT                 监听地址（默认 127.0.0.1:5100）
   INSTA_THREADS                           Waitress 线程数（默认 16）
 """

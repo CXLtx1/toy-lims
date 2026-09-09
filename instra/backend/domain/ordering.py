@@ -38,7 +38,7 @@ def load_order_list(db, template_id=None):
     """读取顺序模板的项目列表；template_id 为空或无效时用系统默认模板。"""
     row = None
     if template_id:
-        row = db.execute("SELECT items_json FROM result_order_templates WHERE id=?",
+        row = db.execute("SELECT items_json FROM result_order_templates WHERE id=%s",
                          (template_id,)).fetchone()
     if row is None:
         row = db.execute("""SELECT items_json FROM result_order_templates
@@ -57,7 +57,7 @@ def load_order_list(db, template_id=None):
 
 def load_sample_report_order(db, sample_id):
     """样品级报告顺序覆盖；无覆盖返回 []。"""
-    row = db.execute("SELECT report_order FROM samples WHERE id=?",
+    row = db.execute("SELECT report_order FROM samples WHERE id=%s",
                      (sample_id,)).fetchone()
     if row is None:
         return []

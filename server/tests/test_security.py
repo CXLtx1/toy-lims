@@ -1,7 +1,6 @@
-"""Isolated security tests: never import app or connect to the configured DB."""
+"""Isolated security tests: the auth layer runs against a throwaway PostgreSQL schema."""
 
 import json
-import sqlite3
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -11,25 +10,17 @@ from flask import Flask, jsonify, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import lims_auth as auth
+from postgres_case import PostgresTestCase
 from security import RateLimiter, init_security
 
 
-class SecurityTest(unittest.TestCase):
+class SecurityTest(PostgresTestCase):
     PASSWORD = "correct-password-123"
 
     def setUp(self):
-        self.db = sqlite3.connect(":memory:")
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript("""
-            CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE,
-                password_hash TEXT, display_name TEXT, role TEXT DEFAULT 'custom',
-                permissions TEXT DEFAULT '[]', active INTEGER DEFAULT 1,
-                session_token TEXT DEFAULT '', created_at TEXT);
-            CREATE TABLE terminals (id INTEGER PRIMARY KEY, name TEXT UNIQUE,
-                password_hash TEXT, kind TEXT, active INTEGER DEFAULT 1,
-                session_token TEXT DEFAULT '', sort_order INTEGER DEFAULT 1,
-                created_at TEXT, updated_at TEXT);
-        """)
+        self.provision_database()
+        self.db = self.connect()
+        self.addCleanup(self.db.close)
         self.app = Flask(__name__, template_folder=str(Path(__file__).resolve().parents[1] / "templates"))
         self.app.config.update(TESTING=True, SECRET_KEY="isolated-test-secret",
                                SECURITY_REQUIRE_HTTPS=True, SECURITY_COOKIE_SECURE=None)
@@ -61,14 +52,13 @@ class SecurityTest(unittest.TestCase):
         self.app.add_url_rule("/api/broken", "broken", broken)
         self.audit = patch.object(auth, "audit_event").start()
         self.addCleanup(patch.stopall)
-        self.addCleanup(self.db.close)
         self.client = self.app.test_client()
 
     def seed(self, password=PASSWORD, kind="admin"):
         hashed = generate_password_hash(password, method="pbkdf2:sha256:20000")
-        self.db.execute("INSERT INTO users(id,username,password_hash,display_name,permissions) VALUES(1,?,?,?,?)",
+        self.db.execute("INSERT INTO users(id,username,password_hash,display_name,permissions) VALUES(1,%s,%s,%s,%s)",
                         ("admin", hashed, "Admin", json.dumps(sorted(auth.CAPABILITIES))))
-        self.db.execute("INSERT INTO terminals(id,name,password_hash,kind) VALUES(1,?,?,?)",
+        self.db.execute("INSERT INTO terminals(id,name,password_hash,kind) VALUES(1,%s,%s,%s)",
                         ("Terminal", hashed, kind))
         self.db.commit()
         return hashed
@@ -288,15 +278,15 @@ class SecurityTest(unittest.TestCase):
         self.assertNotIn("secret database", response.get_data(as_text=True))
         self.assertEqual("no-store", response.headers["Cache-Control"])
 
-    def test_new_short_passwords_rejected_but_old_short_login_upgraded(self):
+    def test_new_short_passwords_rejected_but_preexisting_hashes_still_authenticate(self):
         response = self.write("/setup", data={"password": "u", "normal_terminal_password": "s",
                                               "admin_terminal_password": "a"})
         self.assertEqual(200, response.status_code)
         self.assertFalse(self.db.execute("SELECT 1 FROM users").fetchone())
-        self.seed("short")
+        seeded = self.seed("short")
         self.assertEqual(302, self.login("short").status_code)
         hashed = self.db.execute("SELECT password_hash FROM terminals").fetchone()[0]
-        self.assertTrue(hashed.startswith(auth.PASSWORD_METHOD + "$"))
+        self.assertEqual(seeded, hashed)
         self.assertTrue(check_password_hash(hashed, "short"))
 
     def test_new_password_policy_on_user_and_terminal_create_update(self):
@@ -324,60 +314,43 @@ class SecurityTest(unittest.TestCase):
     def test_failed_or_ambiguous_password_search_has_no_hash_writes(self):
         original = self.seed(kind="standard")
         self.login()
-        self.db.execute("INSERT INTO users(username,password_hash,display_name) VALUES('duplicate',?,'Other')",
+        self.db.execute("INSERT INTO users(username,password_hash,display_name) VALUES('duplicate',%s,'Other')",
                         (original,))
         self.db.commit()
-        with patch.object(auth, "_upgrade_password") as upgrade:
-            self.assertEqual([], auth._matching_users(self.db, "wrong"))
-            self.assertEqual(2, len(auth._matching_users(self.db, self.PASSWORD)))
-            self.assertTrue(auth._password_in_use(self.db, self.PASSWORD))
-            self.assertEqual(401, self.write("/api/authorize", json={"password": self.PASSWORD}).status_code)
-            upgrade.assert_not_called()
+        self.assertEqual([], auth._matching_users(self.db, "wrong"))
+        self.assertEqual(2, len(auth._matching_users(self.db, self.PASSWORD)))
+        self.assertTrue(auth._password_in_use(self.db, self.PASSWORD))
+        self.assertEqual(401, self.write("/api/authorize", json={"password": self.PASSWORD}).status_code)
+        hashes = [row[0] for row in self.db.execute("SELECT password_hash FROM users ORDER BY id")]
+        self.assertEqual([original, original], hashes)
 
-    def test_authorization_upgrades_only_unique_capable_match(self):
+    def test_authorization_requires_unique_capable_match_and_keeps_hashes(self):
         original = self.seed(kind="standard")
         other = generate_password_hash("other-password", method="pbkdf2:sha256:20000")
-        self.db.execute("INSERT INTO users(username,password_hash,display_name) VALUES('other',?,'Other')", (other,))
+        self.db.execute("INSERT INTO users(username,password_hash,display_name) VALUES('other',%s,'Other')", (other,))
         self.db.commit()
         self.login()
         denied = self.write("/api/authorize", json={"password": "other-password", "purpose": "user_manage"})
         self.assertEqual(403, denied.status_code)
         self.assertEqual(200, self.write("/api/authorize", json={"password": self.PASSWORD}).status_code)
         hashes = [row[0] for row in self.db.execute("SELECT password_hash FROM users ORDER BY id")]
-        self.assertNotEqual(original, hashes[0])
-        self.assertEqual(other, hashes[1])
+        self.assertEqual([original, other], hashes)
 
-    def test_capable_instrument_auth_upgrades_only_on_success(self):
+    def test_capable_instrument_authentication_requires_capability(self):
         self.seed()
-        with self.app.app_context(), patch.object(auth, "_upgrade_password") as upgrade:
-            user, error = auth.authenticate_capable_user(self.db, "wrong", "result_edit")
-            self.assertIsNone(user)
-            upgrade.assert_not_called()
-            user, error = auth.authenticate_capable_user(self.db, self.PASSWORD, "result_edit")
-            self.assertIsNone(error)
-            upgrade.assert_called_once()
-
-    def test_stronger_and_unfamiliar_hashes_are_never_downgraded(self):
-        for method in (auth.PASSWORD_METHOD, "scrypt:65536:8:3", "scrypt:32768:8:4",
-                       "scrypt:65536:8:1", "pbkdf2:sha256:1000000", "pbkdf2:sha512:1000000"):
-            with self.subTest(method=method), patch.object(auth, "generate_password_hash") as generate:
-                auth._upgrade_password(self.db, {"id": 1, "password_hash": method + "$salt$hash"},
-                                       self.PASSWORD, "user")
-                generate.assert_not_called()
-
-    def test_weaker_scrypt_upgraded_and_current_hash_stable(self):
-        self.seed()
-        old = generate_password_hash(self.PASSWORD, method="scrypt:8192:8:1")
-        self.db.execute("UPDATE users SET password_hash=?", (old,))
-        row = self.db.execute("SELECT * FROM users").fetchone()
-        self.assertFalse(auth._check_password(self.db, row, "wrong", "user"))
-        self.assertEqual(old, self.db.execute("SELECT password_hash FROM users").fetchone()[0])
-        self.assertTrue(auth._check_password(self.db, row, self.PASSWORD, "user"))
-        row = self.db.execute("SELECT * FROM users").fetchone()
-        self.assertTrue(row["password_hash"].startswith(auth.PASSWORD_METHOD + "$"))
-        with patch.object(auth, "generate_password_hash") as generate:
-            self.assertTrue(auth._check_password(self.db, row, self.PASSWORD, "user"))
-            generate.assert_not_called()
+        user, error = auth.authenticate_capable_user(self.db, "wrong", "result_edit")
+        self.assertIsNone(user)
+        self.assertIsNotNone(error)
+        user, error = auth.authenticate_capable_user(self.db, self.PASSWORD, "result_edit")
+        self.assertIsNone(error)
+        self.assertIsNotNone(user)
+        limited = generate_password_hash("limited-password", method="pbkdf2:sha256:20000")
+        self.db.execute("INSERT INTO users(username,password_hash,display_name,permissions) "
+                        "VALUES('limited',%s,'Limited','[]')", (limited,))
+        self.db.commit()
+        user, error = auth.authenticate_capable_user(self.db, "limited-password", "result_edit")
+        self.assertIsNone(user)
+        self.assertIn("权限", error)
 
     def test_password_hash_helper_enforces_policy(self):
         for password in ("", "short", "x" * 1025):

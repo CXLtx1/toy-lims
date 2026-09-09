@@ -31,6 +31,9 @@ coverage/
 .vs/
 server/logs/
 
+# Local launchers with development credentials
+instra/start.ps1
+
 # OS
 Thumbs.db
 Desktop.ini

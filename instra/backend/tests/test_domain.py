@@ -207,7 +207,7 @@ class TestCalcResult(unittest.TestCase):
     def test_aux_coefficient_applied_once(self):
         sa = {"itype": "percent", "prep_factor": 1, "formula": "",
               "method_constants": "{}", "prep_mass": 1, "prep_vol": 250,
-              "raw": None, "extra": "{}", "aux": '{"use": 1, "coefficient": 2}',
+              "raw": None, "extra": "{}", "aux": '{"use": true, "expected": 10, "measured": 5}',
               "readings": [{"raw": 1.0, "extra": {}, "use_avg": 1, "is_final": 0}]}
         value, unit, _ = calc_result(sa, False)
         self.assertEqual(value, 2.0)

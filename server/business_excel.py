@@ -152,7 +152,7 @@ def build_overview(db, date_from, date_to, sample_type="", query="", include_can
         raise BusinessExcelError("请选择有效的开始和结束日期（YYYY-MM-DD）") from exc
     if start > end:
         raise BusinessExcelError("开始日期不能晚于结束日期")
-    conditions = ["s.created_at>=?", "s.created_at<?"]
+    conditions = ["s.created_at>=%s", "s.created_at<%s"]
     args = [start.isoformat(), date.fromordinal(end.toordinal() + 1).isoformat()]
     if not include_cancelled:
         conditions.append("COALESCE(s.status,'received')!='cancelled'")
@@ -167,15 +167,16 @@ def build_overview(db, date_from, date_to, sample_type="", query="", include_can
     elif sample_type not in ("", "all"):
         raise BusinessExcelError("样品类型筛选无效")
     if query:
-        conditions.append("""(s.name LIKE ? OR s.lims_no LIKE ? OR s.category LIKE ? OR EXISTS(
+        conditions.append("""(s.name LIKE %s OR s.lims_no LIKE %s OR s.category LIKE %s OR EXISTS(
             SELECT 1 FROM sample_analytes sx JOIN analytes ax ON ax.id=sx.analyte_id
-            WHERE sx.sample_id=s.id AND ax.name LIKE ?) OR EXISTS(
+            WHERE sx.sample_id=s.id AND ax.name LIKE %s) OR EXISTS(
             SELECT 1 FROM special_methods smx WHERE smx.id=s.special_method_id
-            AND (smx.name LIKE ? OR smx.instrument LIKE ?)))""")
+            AND (smx.name LIKE %s OR smx.instrument LIKE %s)))""")
         args.extend([f"%{query}%"] * 6)
     records = db.execute(f"""SELECT s.*,sm.name special_method_name,
-        (SELECT group_concat(name, ', ') FROM (SELECT DISTINCT a.name,a.sort_order,a.id FROM sample_analytes sa
-         JOIN analytes a ON a.id=sa.analyte_id WHERE sa.sample_id=s.id ORDER BY a.sort_order,a.id)) analytes
+        (SELECT string_agg(name, ', ' ORDER BY sort_order,id) FROM (
+         SELECT DISTINCT a.name,a.sort_order,a.id FROM sample_analytes sa
+         JOIN analytes a ON a.id=sa.analyte_id WHERE sa.sample_id=s.id) AS sample_analytes) analytes
         FROM samples s LEFT JOIN special_methods sm ON sm.id=s.special_method_id
         WHERE {' AND '.join(conditions)} ORDER BY s.created_at,s.id""", args).fetchall()
     wb = _new("sample-overview", "样品业务总览", [
@@ -192,12 +193,12 @@ def build_overview(db, date_from, date_to, sample_type="", query="", include_can
         _append(ws, [s["lims_no"], s["name"], s["category"], sample_kind,
                      "专项" if special else "常规", s["status"], s["created_at"], s["updated_at"],
                      s["special_method_name"] or "", "是" if s["xrf"] else "否",
-                     _count(db, "SELECT COUNT(*) FROM preparations WHERE sample_id=?", sid),
-                     _count(db, "SELECT COUNT(*) FROM sample_analytes WHERE sample_id=?", sid) + (1 if special else 0),
-                     _count(db, "SELECT COUNT(*) FROM sample_analytes WHERE sample_id=? AND status='completed'", sid) +
-                     (_count(db, "SELECT COUNT(*) FROM special_results WHERE sample_id=? AND status='completed'", sid) if special else 0),
-                     _count(db, "SELECT COUNT(*) FROM readings r JOIN sample_analytes sa ON sa.id=r.sample_analyte_id WHERE sa.sample_id=?", sid),
-                     _count(db, "SELECT COUNT(*) FROM xrf_values xv JOIN xrf_analyses xa ON xa.id=xv.analysis_id WHERE xa.sample_id=?", sid),
+                     _count(db, "SELECT COUNT(*) FROM preparations WHERE sample_id=%s", sid),
+                     _count(db, "SELECT COUNT(*) FROM sample_analytes WHERE sample_id=%s", sid) + (1 if special else 0),
+                     _count(db, "SELECT COUNT(*) FROM sample_analytes WHERE sample_id=%s AND status='completed'", sid) +
+                     (_count(db, "SELECT COUNT(*) FROM special_results WHERE sample_id=%s AND status='completed'", sid) if special else 0),
+                     _count(db, "SELECT COUNT(*) FROM readings r JOIN sample_analytes sa ON sa.id=r.sample_analyte_id WHERE sa.sample_id=%s", sid),
+                     _count(db, "SELECT COUNT(*) FROM xrf_values xv JOIN xrf_analyses xa ON xa.id=xv.analysis_id WHERE xa.sample_id=%s", sid),
                      s["analytes"] or s["special_method_name"] or "", s["customer"], s["report_no"], s["analysis_date"],
                      s["analyst"], s["reviewer"]])
     _finish_table(ws, "SampleOverview")
@@ -213,7 +214,7 @@ INFO_FIELDS = [("样品ID", "id"), ("LIMS编号", "lims_no"), ("更新标记", "
 
 
 def build_plan(db, sid):
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         raise BusinessExcelError("样品不存在")
     sample = dict(sample)
@@ -231,7 +232,7 @@ def build_plan(db, sid):
             value = value or "[]"
         _append(info, [label, value])
     if sample["workflow_type"] == "special":
-        method = db.execute("SELECT * FROM special_methods WHERE id=?", (sample["special_method_id"],)).fetchone()
+        method = db.execute("SELECT * FROM special_methods WHERE id=%s", (sample["special_method_id"],)).fetchone()
         if not method:
             raise BusinessExcelError("专项样品的专项方法不存在，请先修复样品方案")
         prep = _sheet(wb, "溶样方案", "专项样品（无需溶样）", ["溶样ID", "溶样名称", "称样量(g)", "定容体积(mL)", "稀释ID", "稀释名称"])
@@ -239,7 +240,7 @@ def build_plan(db, sid):
         _append(detect, ["", "", "原样", "", "专项", "", method["instrument"], method["id"], method["name"], ""])
     else:
         prep = _sheet(wb, "溶样方案", "溶样方案", ["溶样ID", "溶样名称", "称样量(g)", "定容体积(mL)", "稀释ID", "稀释名称"])
-        for row in db.execute("SELECT * FROM preparations WHERE sample_id=? ORDER BY id", (sid,)):
+        for row in db.execute("SELECT * FROM preparations WHERE sample_id=%s ORDER BY id", (sid,)):
             try:
                 dilution_ids = json.loads(row["dilution_steps"] or "[]")
             except json.JSONDecodeError:
@@ -252,7 +253,7 @@ def build_plan(db, sid):
         for row in db.execute("""SELECT sa.*,p.name prep,a.name analyte,i.name instrument,m.name method
             FROM sample_analytes sa LEFT JOIN preparations p ON p.id=sa.preparation_id JOIN analytes a ON a.id=sa.analyte_id
             LEFT JOIN instruments i ON i.id=sa.instrument_id LEFT JOIN methods m ON m.id=sa.method_id
-            WHERE sa.sample_id=? ORDER BY sa.id""", (sid,)):
+            WHERE sa.sample_id=%s ORDER BY sa.id""", (sid,)):
             _append(detect, [row["id"], row["preparation_id"], row["prep"] or "原样", row["analyte_id"], row["analyte"],
                               row["instrument_id"], row["instrument"], row["method_id"], row["method"], row["selection"]])
     _finish_table(prep, "PreparationPlan")
@@ -335,7 +336,7 @@ def _resolve(db, table, value_id, name, label, extra=""):
     value_id = _integer(value_id, f"{label}ID")
     name = str(name or "").strip()
     if value_id is not None:
-        row = db.execute(f"SELECT * FROM {table} WHERE id=? {extra}", (value_id,)).fetchone()
+        row = db.execute(f"SELECT * FROM {table} WHERE id=%s {extra}", (value_id,)).fetchone()
         if not row:
             raise BusinessExcelError(f"{label}ID {value_id} 不存在或不可用")
         display = row["label"] if table == "dilutions" else row["name"]
@@ -345,7 +346,7 @@ def _resolve(db, table, value_id, name, label, extra=""):
     if not name:
         return None
     column = "label" if table == "dilutions" else "name"
-    found = db.execute(f"SELECT id FROM {table} WHERE {column}=? {extra}", (name,)).fetchall()
+    found = db.execute(f"SELECT id FROM {table} WHERE {column}=%s {extra}", (name,)).fetchall()
     if not found:
         raise BusinessExcelError(f"找不到{label}“{name}”")
     if len(found) > 1:
@@ -435,12 +436,12 @@ def parse_plan(stream, db):
             aid = _resolve(db, "analytes", row["项目ID"], row["分析项目"], "分析项目")
             iid = _resolve(db, "instruments", row["仪器ID"], row["仪器"], "仪器")
             mid = _resolve(db, "methods", row["方法ID"], row["方法"], "方法")
-            instrument = db.execute("SELECT itype FROM instruments WHERE id=?", (iid,)).fetchone() if iid else None
-            if iid and not db.execute("SELECT 1 FROM instr_analytes WHERE instrument_id=? AND analyte_id=?", (iid, aid)).fetchone():
+            instrument = db.execute("SELECT itype FROM instruments WHERE id=%s", (iid,)).fetchone() if iid else None
+            if iid and not db.execute("SELECT 1 FROM instr_analytes WHERE instrument_id=%s AND analyte_id=%s", (iid, aid)).fetchone():
                 raise BusinessExcelError(f"仪器“{row['仪器']}”不能检测项目“{row['分析项目']}”")
             if mid and (not instrument or instrument["itype"] not in {"function", "xrf"}):
                 raise BusinessExcelError("只有公式仪器或XRF仪器可以配置方法")
-            if mid and not db.execute("SELECT 1 FROM methods WHERE id=? AND itype=?", (mid, instrument["itype"])).fetchone():
+            if mid and not db.execute("SELECT 1 FROM methods WHERE id=%s AND itype=%s", (mid, instrument["itype"])).fetchone():
                 raise BusinessExcelError(f"方法“{row['方法']}”与仪器类型不匹配")
             tasks.append({"id": task_id, "preparation_id": _integer(row["溶样ID"], "溶样ID"),
                           "prep_name": str(row["溶样名称"] or "").strip(), "analyte_id": aid,
@@ -458,7 +459,7 @@ DATA_HEADERS = ["任务ID", "溶样", "分析项目", "仪器", "方法", "读�
 
 
 def build_data(db, sid):
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         raise BusinessExcelError("样品不存在")
     sample = dict(sample)
@@ -478,9 +479,9 @@ def build_data(db, sid):
             FROM sample_analytes sa LEFT JOIN preparations p ON p.id=sa.preparation_id JOIN analytes a ON a.id=sa.analyte_id
             LEFT JOIN instruments i ON i.id=sa.instrument_id LEFT JOIN methods m ON m.id=sa.method_id
             LEFT JOIN results r ON r.sample_analyte_id=sa.id
-            WHERE sa.sample_id=? AND COALESCE(i.itype,'')!='xrf' ORDER BY sa.id""", (sid,)).fetchall()
+            WHERE sa.sample_id=%s AND COALESCE(i.itype,'')!='xrf' ORDER BY sa.id""", (sid,)).fetchall()
         for task in tasks:
-            readings = db.execute("SELECT * FROM readings WHERE sample_analyte_id=? ORDER BY id", (task["id"],)).fetchall()
+            readings = db.execute("SELECT * FROM readings WHERE sample_analyte_id=%s ORDER BY id", (task["id"],)).fetchall()
             if not readings:
                 _append(data_ws, [task["id"], task["prep"] or "原样", task["analyte"], task["instrument"], task["method"],
                                   "", 1, "", 1, 0, "{}", task["aux"] or "{}", task["selection"]])
@@ -490,7 +491,7 @@ def build_data(db, sid):
                                   reading["extra"] or "{}", task["aux"] or "{}", task["selection"]])
     else:
         result = db.execute("""SELECT sr.*,sm.schema_json FROM special_results sr JOIN special_methods sm ON sm.id=sr.method_id
-                               WHERE sr.sample_id=?""", (sid,)).fetchone()
+                               WHERE sr.sample_id=%s""", (sid,)).fetchone()
         if result:
             schema = json.loads(result["schema_json"] or "{}")
             raw = json.loads(result["raw_data"] or "{}")
@@ -502,7 +503,7 @@ def build_data(db, sid):
             _append(special_ws, ["note", "备注", "备注", "", raw.get("note"), "", "否"])
     xrf = _sheet(wb, "XRF结果", "仪器来源XRF结果（只读）", ["分析ID", "外部编号", "分析时间", "方法", "项目", "结果(%)", "用于报告"], editable=False)
     for row in db.execute("""SELECT xa.id,xa.external_id,xa.analyzed_at,xa.method,xv.name,xv.value,xv.use_report
-        FROM xrf_analyses xa JOIN xrf_values xv ON xv.analysis_id=xa.id WHERE xa.sample_id=? ORDER BY xa.id,xv.id""", (sid,)):
+        FROM xrf_analyses xa JOIN xrf_values xv ON xv.analysis_id=xa.id WHERE xa.sample_id=%s ORDER BY xa.id,xv.id""", (sid,)):
         _append(xrf, list(row))
     _finish_table(data_ws, "RegularData")
     _finish_table(special_ws, "SpecialData")

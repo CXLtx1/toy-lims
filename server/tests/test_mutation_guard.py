@@ -1,8 +1,6 @@
-"""Reliable-write contracts against an isolated SQLite schema, never app.init_db."""
+"""Reliable-write contracts against an isolated PostgreSQL schema, never app.init_db."""
 
 import json
-import os
-import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -12,37 +10,29 @@ from uuid import uuid4
 
 import app as lims
 from client_helpers import BrowserClient, browser_client
-from db_backend import connect_database, postgres_schema
-from db_schema import SCHEMA
-from mutation_guard import begin_mutation, lock_reading, next_updated_at, reading_version
+from db_schema import SCHEMA, initialize_database
+from mutation_guard import lock_reading, next_updated_at, reading_version
+from postgres_case import PostgresTestCase
 
 
-class MutationGuardTest(unittest.TestCase):
+class MutationGuardTest(PostgresTestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.database = os.path.join(temporary.name, "mutations.db")
-        config = patch.dict(lims.app.config, {
-            "TESTING": True, "AUTH_DISABLED": False,
-            "LIMS_DATABASE_URL": self.database, "DATABASE_URL": None,
-        })
-        config.start()
-        self.addCleanup(config.stop)
-        db = connect_database(self.database)
-        db.executescript(SCHEMA)
-        db.executescript("""
-            ALTER TABLE users ADD COLUMN session_token TEXT DEFAULT '';
-            ALTER TABLE terminals ADD COLUMN session_token TEXT DEFAULT '';
-            INSERT INTO users(id,username,password_hash,display_name,role,permissions)
-                VALUES(1,'reader','unused','Reader','custom','[]');
-            INSERT INTO terminals(id,name,password_hash,kind) VALUES(1,'browser-a','unused','admin');
-            INSERT INTO terminals(id,name,password_hash,kind) VALUES(2,'browser-b','unused','admin');
-            INSERT INTO analytes(id,name) VALUES(1,'Ag');
-            INSERT INTO instruments(id,name,itype) VALUES(1,'ICP','ppm');
-            INSERT INTO samples(id,name,status,updated_at) VALUES(1,'Sample','measuring','2026-01-01 00:00:00');
-            INSERT INTO sample_analytes(id,sample_id,analyte_id,instrument_id) VALUES(1,1,1,1);
-        """)
-        db.close()
+        self.provision_database(lims)
+        lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
+        db = self.connect()
+        try:
+            db.execute("INSERT INTO users(id,username,password_hash,display_name,permissions) "
+                       "VALUES(1,'reader','unused','Reader','[]')")
+            db.execute("INSERT INTO terminals(id,name,password_hash,kind) VALUES(1,'browser-a','unused','admin')")
+            db.execute("INSERT INTO terminals(id,name,password_hash,kind) VALUES(2,'browser-b','unused','admin')")
+            db.execute("INSERT INTO analytes(id,name) VALUES(1,'Ag')")
+            db.execute("INSERT INTO instruments(id,name,itype) VALUES(1,'ICP','ppm')")
+            db.execute("INSERT INTO samples(id,name,status,updated_at) "
+                       "VALUES(1,'Sample','measuring','2026-01-01 00:00:00')")
+            db.execute("INSERT INTO sample_analytes(id,sample_id,analyte_id,instrument_id) VALUES(1,1,1,1)")
+            db.commit()
+        finally:
+            db.close()
         self.client = browser_client(self, lims.app)
         self.other = BrowserClient(lims.app, lims.app.response_class)
         for terminal_id, client in enumerate((self.client, self.other), 1):
@@ -51,7 +41,7 @@ class MutationGuardTest(unittest.TestCase):
                 session["session_token"] = ""
 
     def query(self, sql, params=()):
-        db = connect_database(self.database)
+        db = self.connect()
         try:
             result = [dict(row) for row in db.execute(sql, params).fetchall()]
             db.commit()
@@ -151,7 +141,7 @@ class MutationGuardTest(unittest.TestCase):
         self.assert_conflict_unchanged(lambda: self.other.put(url, json={
             "raw": 3, "is_final": True, "expected_version": second["version"]}))
         self.assert_conflict_unchanged(lambda: self.other.delete(url, json={"expected_version": second["version"]}))
-        self.assertEqual(1, self.query("SELECT is_final FROM readings WHERE id=?", (first["id"],))[0]["is_final"])
+        self.assertEqual(1, self.query("SELECT is_final FROM readings WHERE id=%s", (first["id"],))[0]["is_final"])
         deleted = self.other.delete(url, json={"expected_version": updated.json["version"]})
         self.assertEqual(200, deleted.status_code)
         self.assert_conflict_unchanged(lambda: self.other.delete(url, json={"expected_version": updated.json["version"]}))
@@ -160,13 +150,13 @@ class MutationGuardTest(unittest.TestCase):
     def test_final_selection_invalidates_displaced_sibling_version(self):
         _, first = self.create(is_final=True)
         self.create(is_final=True)
-        row = self.query("SELECT * FROM readings WHERE id=?", (first["id"],))[0]
+        row = self.query("SELECT * FROM readings WHERE id=%s", (first["id"],))[0]
         self.assertEqual(0, row["is_final"])
         self.assertNotEqual(first["version"], reading_version(row))
         self.assert_conflict_unchanged(lambda: self.client.put(f"/api/readings/{first['id']}", json={
             "is_final": True, "expected_version": first["version"]}))
 
-    def test_legacy_create_put_delete_without_optional_tokens_remain_supported(self):
+    def test_create_put_delete_with_defaults_remains_supported(self):
         created = self.client.post("/api/readings", json={"sample_analyte_id": 1})
         self.assertEqual(200, created.status_code)
         row = self.query("SELECT * FROM readings")[0]
@@ -220,7 +210,7 @@ class MutationGuardTest(unittest.TestCase):
         self.assertEqual(before, self.snapshot())
 
     def test_sample_report_meta_and_results_share_optional_timestamp_precondition(self):
-        for url, method, payload in (("/api/results", "post", {"sample_analyte_id": 1, "raw": 1, "aux": {"use": True}}),
+        for url, method, payload in (("/api/results", "post", {"sample_analyte_id": 1, "aux": {"use": True}}),
                                      ("/api/samples/1/report-meta", "put", {"customer": "A"}),
                                      ("/api/samples/1", "put", {"name": "Renamed", "preps": []})):
             old = self.detail()["sample"]["updated_at"]
@@ -267,38 +257,30 @@ class MutationGuardTest(unittest.TestCase):
         self.assertEqual([200, 409], sorted(response.status_code for response in responses))
         self.assertEqual(1, len(self.query("SELECT * FROM audit_logs")))
 
-    def test_schema_upgrade_is_additive_and_postgres_contains_unique_key(self):
+    def test_schema_reinitialization_is_idempotent_and_keeps_unique_key(self):
         payload, created = self.create()
-        db = connect_database(self.database)
-        try:
-            db.executescript(SCHEMA)
-        finally:
-            db.close()
+        initialize_database(self.database)
         self.assertEqual(created["id"], self.other.post("/api/readings", json=payload).json["id"])
-        ddl = postgres_schema(SCHEMA)
-        self.assertIn("CREATE TABLE IF NOT EXISTS reading_create_requests(", ddl)
-        self.assertIn("client_reading_id TEXT PRIMARY KEY", ddl)
+        self.assertIn("CREATE TABLE IF NOT EXISTS reading_create_requests(", SCHEMA)
+        self.assertIn("client_reading_id TEXT PRIMARY KEY", SCHEMA)
 
-    def test_postgres_lock_sql_orders_sample_task_reading_without_live_database(self):
+    def test_lock_reading_orders_sample_task_reading_locks(self):
         _, created = self.create()
-        db = connect_database(self.database)
+        db = self.connect()
         statements = []
 
-        class RecordingPostgres:
-            is_postgres = True
-
-            def execute(self, sql, params=()):
+        class RecordingConnection:
+            def execute(self, sql, params=None):
                 statements.append(sql)
                 return db.execute(sql.removesuffix(" FOR UPDATE"), params)
 
         try:
-            connection = RecordingPostgres()
-            begin_mutation(connection)
-            self.assertEqual(created["id"], lock_reading(connection, created["id"])["id"])
-            locks = [sql for sql in statements if sql.endswith(" FOR UPDATE")]
-            self.assertEqual(["SELECT * FROM samples WHERE id=? FOR UPDATE",
-                              "SELECT * FROM sample_analytes WHERE id=? FOR UPDATE",
-                              "SELECT * FROM readings WHERE id=? FOR UPDATE"], locks)
+            row = lock_reading(RecordingConnection(), created["id"])
+            self.assertEqual(created["id"], row["id"])
+            self.assertEqual(["SELECT * FROM samples WHERE id=%s FOR UPDATE",
+                              "SELECT * FROM sample_analytes WHERE id=%s FOR UPDATE",
+                              "SELECT * FROM readings WHERE id=%s FOR UPDATE"],
+                             [sql for sql in statements if sql.endswith(" FOR UPDATE")])
         finally:
             db.close()
 
@@ -311,7 +293,7 @@ class MutationGuardTest(unittest.TestCase):
 
     def test_reading_writes_advance_sample_token_and_invalidate_metadata_drafts(self):
         token = "2099-01-01 00:00:00.123456"
-        self.query("UPDATE samples SET updated_at=? WHERE id=1", (token,))
+        self.query("UPDATE samples SET updated_at=%s WHERE id=1", (token,))
         _, created = self.create()
         url = f"/api/readings/{created['id']}"
         for write in (lambda: None,

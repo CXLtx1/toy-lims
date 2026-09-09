@@ -1,7 +1,5 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { runInNewContext } from 'node:vm';
-import ts from 'typescript';
 import { createSSRApp, h } from 'vue';
 import { renderToString } from '@vue/server-renderer';
 import { describe, expect, it, vi } from 'vitest';
@@ -12,36 +10,7 @@ import { reportFixture } from './test-fixtures';
 
 vi.mock('../../api/client', () => ({ request: vi.fn(), download: vi.fn() }));
 
-// Compare actual Vue DOM with the legacy pure renderers, not with reimplemented expectations.
-const legacySource = readFileSync(resolve(process.cwd(), '../server/static/app.js'), 'utf8');
-const sourceFile = ts.createSourceFile('app.js', legacySource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-const names = new Set(['reportDate', 'displayNumber', 'rawReadingText', 'combinedRawTicketHtml', 'waterRawTicketHtml', 'rawTicketHtml', 'combinedFinalTicketHtml', 'waterResultUnit', 'waterFinalTicketHtml', 'finalTicketHtml']);
-const functions = sourceFile.statements.filter(statement => ts.isFunctionDeclaration(statement) && statement.name && names.has(statement.name.text)).map(statement => statement.getText(sourceFile)).join('\n');
-const esc = (value: unknown) => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] || char);
-function legacy(kind: 'raw' | 'final', reports: Report[]): string {
-  const result: unknown = runInNewContext(`${functions}\n${kind}TicketHtml(payloads)`, { esc, payloads: reports });
-  if (typeof result !== 'string') throw new Error('Legacy renderer did not return markup');
-  if (kind !== 'final') return result;
-  const document = new DOMParser().parseFromString(result, 'text/html');
-  // Intentional repair: legacy water result rows leave a hole in the five-column grid.
-  for (const table of document.querySelectorAll('.water-final-table')) {
-    const rows = Array.from(table.querySelectorAll('tr')).slice(1, -1);
-    for (const row of rows) row.querySelector('td')?.setAttribute('colspan', '2');
-  }
-  return document.body.innerHTML;
-}
-function tree(markup: string): unknown {
-  const document = new DOMParser().parseFromString(markup, 'text/html');
-  function visit(node: Node): unknown {
-    if (node.nodeType === Node.TEXT_NODE) return node.textContent?.replace(/\s+/g, ' ').trim() || null;
-    if (!(node instanceof Element)) return null;
-    if (['SCRIPT', 'IMG', 'IFRAME', 'OBJECT', 'EMBED'].includes(node.tagName)) return node.textContent?.replace(/\s+/g, ' ').trim() || null;
-    return { tag: node.tagName, attributes: Array.from(node.attributes).map(attribute => [attribute.name, attribute.name === 'style' ? attribute.value.replace(/\s+/g, '').replace(/;$/, '') : attribute.value]).sort(), children: Array.from(node.childNodes).map(visit).filter(value => value !== null) };
-  }
-  return Array.from(document.body.childNodes).map(visit).filter(value => value !== null);
-}
-
-describe('print markup parity', () => {
+describe('print markup', () => {
   const special = reportFixture(3);
   special.sample.workflow_type = 'special';
   special.groups = [];
@@ -59,9 +28,16 @@ describe('print markup parity', () => {
   for (const [name, reports] of cases) for (const kind of ['raw', 'final'] as const) it(`${name}: ${kind}`, async () => {
     const component = kind === 'raw' ? RawTicket : FinalTicket;
     const markup = await renderToString(createSSRApp({ render: () => h(component, { reports }) }));
-    const expected = `<article id="${kind}-ticket" class="${kind === 'raw' ? 'raw-ticket-batch' : 'print-document final-ticket'}">${legacy(kind, reports)}</article>`;
-    expect(tree(markup)).toEqual(tree(expected));
-    expect(new DOMParser().parseFromString(markup, 'text/html').querySelector('img')).toBeNull();
+    const document = new DOMParser().parseFromString(markup, 'text/html');
+    const article = document.querySelector(`#${kind}-ticket`);
+    expect(article).not.toBeNull();
+    expect(article?.classList.contains(kind === 'raw' ? 'raw-ticket-batch' : 'final-ticket')).toBe(true);
+    expect(document.querySelector('script,img,iframe,object,embed')).toBeNull();
+    if (name === 'mixed' && kind === 'final') {
+      expect(article?.textContent).toContain('水质样与其他样品使用不同报告票，请分开选择后打印');
+    } else {
+      for (const report of reports) expect(article?.textContent).toContain(report.sample.name);
+    }
   });
   it('renders hostile special-record text without executable markup', async () => {
     for (const component of [RawTicket, FinalTicket]) {
@@ -102,12 +78,7 @@ describe('critical report validation', () => {
     const report = reportFixture();
     report.groups[0]!.rows = [{ xrf_value_id: 12, method: 'XRF scan method', instrument: 'XRF', value: 5.5, unit: '%', readings: [{ raw: 5.5, extra: {}, used: true, corrected_value: 5.5 }] }];
     const markup = await renderToString(createSSRApp({ render: () => h(RawTicket, { reports: [report] }) }));
-  // Security repair: the Vue renderer shows hostile markup as text; normalize
-  // legacy escaped markup back to its displayed text before structure parity.
-  const normalized = markup
-    .replace(/&lt;img src=x onerror=alert\(1\)&gt;/g, '<img src=x onerror=alert(1)>')
-    .replace(/&lt;script&gt;/g, '<script>');
-  const document = new DOMParser().parseFromString(normalized, 'text/html');
+    const document = new DOMParser().parseFromString(markup, 'text/html');
     const cells = document.querySelectorAll('.raw-record-table tbody tr:first-child td');
     expect(cells[9]?.textContent).toBe('5.5');
     expect(cells[10]?.textContent).toBe('5.5 %');

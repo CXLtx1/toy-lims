@@ -1,26 +1,19 @@
-import os
 import json
-import sqlite3
-import tempfile
 import time
 import unittest
 
 import app as lims
 from client_helpers import browser_client
+from postgres_case import PostgresTestCase
 from werkzeug.security import generate_password_hash
 
 
-class StandardInstrumentClientTest(unittest.TestCase):
+class StandardInstrumentClientTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=True)
         self.client = browser_client(self, lims.app)
         self.meta = self.client.get("/api/meta").get_json()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def create_queued_sample(self):
         analytes = [next(item["id"] for item in self.meta["analytes"] if item["name"] == name)
@@ -68,7 +61,7 @@ class StandardInstrumentClientTest(unittest.TestCase):
 
         retried = self.client.post("/api/instrument/standard/submit", json=submission)
         self.assertTrue(retried.get_json()["duplicate"])
-        connection = sqlite3.connect(lims.DB)
+        connection = self.connect()
         try:
             self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM readings").fetchone()[0])
         finally:
@@ -80,7 +73,7 @@ class StandardInstrumentClientTest(unittest.TestCase):
                                {"task_id": -1, "value": 8.8}]
         rejected = self.client.post("/api/instrument/standard/submit", json=invalid)
         self.assertEqual(409, rejected.status_code)
-        connection = sqlite3.connect(lims.DB)
+        connection = self.connect()
         try:
             self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM readings").fetchone()[0])
         finally:
@@ -100,11 +93,11 @@ class StandardInstrumentClientTest(unittest.TestCase):
 
     def test_user_login_start_measurement_and_expiry(self):
         sid, instrument = self.create_queued_sample()
-        connection = sqlite3.connect(lims.DB)
+        connection = self.connect()
         try:
             connection.execute("""INSERT INTO users(
-                username,password_hash,display_name,role,permissions)
-                VALUES(?,?,?,'custom',?)""", (
+                username,password_hash,display_name,permissions)
+                VALUES(%s,%s,%s,%s)""", (
                     "standard-analyst", generate_password_hash("standard-user-password"),
                     "标准分析员", json.dumps(["result_edit"])))
             connection.commit()
@@ -147,19 +140,19 @@ class StandardInstrumentClientTest(unittest.TestCase):
         self.assertEqual(200, submitted.status_code, submitted.get_data(as_text=True))
         touched = self.client.post("/api/instrument/standard/session/touch", json={}, headers=headers)
         self.assertEqual(200, touched.status_code)
-        connection = sqlite3.connect(lims.DB)
+        connection = self.connect()
         try:
             sample = connection.execute(
-                "SELECT status,analyst,status_operator FROM samples WHERE id=?", (sid,)).fetchone()
-            self.assertEqual(("partially_done", "标准分析员", "标准分析员"), sample)
+                "SELECT status,analyst,status_operator FROM samples WHERE id=%s", (sid,)).fetchone()
+            self.assertEqual(("partially_done", "标准分析员", "标准分析员"), sample[:])
             audit = connection.execute("""SELECT username FROM audit_logs
-                WHERE action='status_change' AND entity_type='sample' AND entity_id=?
+                WHERE action='status_change' AND entity_type='sample' AND entity_id=%s
                 ORDER BY id DESC LIMIT 1""", (str(sid),)).fetchone()
             self.assertEqual("standard-analyst", audit[0])
             reading_audit = connection.execute("""SELECT username FROM audit_logs
                 WHERE action='instrument_reading' ORDER BY id DESC LIMIT 1""").fetchone()
             self.assertEqual("standard-analyst", reading_audit[0])
-            connection.execute("UPDATE standard_client_sessions SET last_activity=?",
+            connection.execute("UPDATE standard_client_sessions SET last_activity=%s",
                                (time.time() - 601,))
             connection.commit()
         finally:

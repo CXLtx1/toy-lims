@@ -6,12 +6,13 @@
 import json
 from pathlib import Path
 
-from flask import Flask, g, jsonify, send_from_directory
+from flask import Flask, abort, g, jsonify, send_from_directory
 
 import db as db_module
-from api import exports, overview, samples, xrf
+from api import audit_context, exports, overview, samples, xrf
 
 DIST_DIR = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+AUDIT_SCENE_STATIC_DIR = Path(__file__).resolve().parents[1] / "backend" / "static"
 
 
 def create_app():
@@ -39,6 +40,7 @@ def create_app():
         return jsonify(ok=False, error=f"服务端错误：{exc}"), 500
 
     app.register_blueprint(samples.bp, url_prefix="/api")
+    app.register_blueprint(audit_context.bp, url_prefix="/api")
     app.register_blueprint(overview.bp, url_prefix="/api")
     app.register_blueprint(xrf.bp, url_prefix="/api")
     app.register_blueprint(exports.bp, url_prefix="/api")
@@ -56,6 +58,17 @@ def create_app():
             "id": row["id"], "name": row["name"], "is_default": bool(row["is_default"]),
             "items": json.loads(row["items_json"] or "[]"),
         } for row in rows])
+
+    @app.get("/labflow-preview/<asset>")
+    def labflow_preview_asset(asset):
+        """Only expose the two immutable assets used by the read-only audit scene."""
+        if asset not in {"entry-renderer.js", "style.css"}:
+            abort(404)
+        response = send_from_directory(AUDIT_SCENE_STATIC_DIR, asset)
+        response.cache_control.public = True
+        response.cache_control.max_age = 3600
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     # ---- 前端静态托管（生产：已构建的 dist 存在时）----
     @app.get("/", defaults={"path": ""})

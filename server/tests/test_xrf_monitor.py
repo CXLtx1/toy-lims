@@ -1,23 +1,16 @@
-import os
-import sqlite3
-import tempfile
 import unittest
 
 import app as lims
 from client_helpers import browser_client
+from postgres_case import PostgresTestCase
 
 
-class XrfMonitorTest(unittest.TestCase):
+class XrfMonitorTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=True)
         self.client = browser_client(self, lims.app)
         self.meta = self.client.get("/api/meta").get_json()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def create_xrf_sample(self, name="矿石-XRF"):
         method_id = next(m["id"] for m in self.meta["methods"] if m["name"] == "WUNI0820")
@@ -247,10 +240,12 @@ class XrfMonitorTest(unittest.TestCase):
         conflict = self.client.put(f"/api/xrf/analyses/{imported['analysis_id']}/sample",
                                    json={"sample_id": other_sid})
         self.assertEqual(409, conflict.status_code)
-        connection = sqlite3.connect(lims.DB)
-        connection.execute("UPDATE samples SET status='reviewed' WHERE id=?", (other_sid,))
-        connection.commit()
-        connection.close()
+        db = self.connect()
+        try:
+            db.execute("UPDATE samples SET status='reviewed' WHERE id=%s", (other_sid,))
+            db.commit()
+        finally:
+            db.close()
         second = self.import_analysis(analysis_id="9002", sample_name="MANUAL-XRF-2").get_json()
         locked = self.client.put(f"/api/xrf/analyses/{second['analysis_id']}/sample",
                                  json={"sample_id": other_sid})
@@ -283,81 +278,6 @@ class XrfMonitorTest(unittest.TestCase):
         self.assertEqual([second["analysis_id"]], [analysis["id"] for analysis in analyses])
         audits = self.client.get("/api/audit?limit=50").get_json()
         self.assertTrue(any(item["action"] == "xrf_unassign" for item in audits))
-
-    def test_startup_keeps_newest_duplicate_xrf_assignment(self):
-        sid = self.create_xrf_sample("DUPLICATE-XRF")
-        connection = sqlite3.connect(lims.DB)
-        connection.execute("DROP INDEX uq_xrf_analysis_sample")
-        first_id = connection.execute(
-            "INSERT INTO xrf_analyses(sample_id,external_id) VALUES(?,?)", (sid, "OLD-XRF")).lastrowid
-        second_id = connection.execute(
-            "INSERT INTO xrf_analyses(sample_id,external_id) VALUES(?,?)", (sid, "NEW-XRF")).lastrowid
-        connection.execute("INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(?,?,?,1)",
-                           (first_id, "Fe", 1.0))
-        connection.commit()
-        connection.close()
-
-        lims.init_db()
-        connection = sqlite3.connect(lims.DB)
-        assignments = dict(connection.execute(
-            "SELECT id,sample_id FROM xrf_analyses WHERE id IN (?,?)", (first_id, second_id)))
-        old_use = connection.execute(
-            "SELECT use_report FROM xrf_values WHERE analysis_id=?", (first_id,)).fetchone()[0]
-        indexes = {row[1] for row in connection.execute("PRAGMA index_list(xrf_analyses)")}
-        connection.close()
-        self.assertIsNone(assignments[first_id])
-        self.assertEqual(sid, assignments[second_id])
-        self.assertEqual(0, old_use)
-        self.assertIn("uq_xrf_analysis_sample", indexes)
-
-    def test_legacy_sqlite_xrf_table_migrates_to_nullable_sample(self):
-        connection = sqlite3.connect(lims.DB)
-        connection.execute("PRAGMA foreign_keys=OFF")
-        connection.execute("PRAGMA legacy_alter_table=ON")
-        connection.executescript("""ALTER TABLE xrf_analyses RENAME TO xrf_analyses_current;
-            CREATE TABLE xrf_analyses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
-                external_id TEXT NOT NULL,method TEXT DEFAULT '',batch TEXT DEFAULT '',
-                analyzed_at TEXT,source TEXT DEFAULT 'OXSAS',kind TEXT DEFAULT '',
-                remark TEXT DEFAULT '',options_json TEXT DEFAULT '{}',
-                created_at TEXT DEFAULT (datetime('now','localtime')),
-                UNIQUE(source,external_id));
-            DROP TABLE xrf_analyses_current;""")
-        connection.close()
-        lims.init_db()
-        connection = sqlite3.connect(lims.DB)
-        sample_id = next(row for row in connection.execute("PRAGMA table_info(xrf_analyses)")
-                         if row[1] == "sample_id")
-        self.assertEqual(0, sample_id[3])
-        self.assertEqual([], list(connection.execute("PRAGMA foreign_key_check")))
-        connection.close()
-
-    def test_historical_xrf_values_cleanup_and_rounding(self):
-        sid = self.create_xrf_sample("HIST-1")
-        response = self.import_analysis(sid)
-        self.assertTrue(response.get_json()["ok"])
-        self.assign_analysis(response.get_json()["analysis_id"], sid)
-        connection = sqlite3.connect(lims.DB)
-        analysis_id = connection.execute(
-            "SELECT id FROM xrf_analyses WHERE external_id='9001'").fetchone()[0]
-        connection.execute("INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(?,?,?,1)",
-                           (analysis_id, "BgNoise", 3696.964111328125))
-        connection.execute("UPDATE xrf_values SET value=? WHERE analysis_id=? AND name='Fe'",
-                           (35.20061785459892, analysis_id))
-        connection.commit()
-        connection.close()
-        lims.init_db()
-        monitor = self.client.get("/api/xrf/monitor").get_json()
-        scan = monitor["scans"][0]
-        self.assertEqual(3, scan["value_count"])
-        self.assertEqual(["Fe", "Al", "Si"], [v["name"] for v in scan["values"]])
-        self.assertEqual([35.201, 8.1, 3.2], [v["value"] for v in scan["values"]])
-        self.assertEqual(["Fe 35.201%", "Al 8.1%", "Si 3.2%"], scan["top_values"])
-        report = self.client.get(f"/api/report/{sid}").get_json()
-        iron = next(group for group in report["groups"] if group["analyte"] == "Fe")
-        self.assertEqual(35.201, iron["rows"][0]["value"])
-        self.assertEqual(35.201, iron["final"]["value"])
 
     def test_targets_derive_from_report_items_and_convert_missing_oxide(self):
         method_id = next(m["id"] for m in self.meta["methods"] if m["name"] == "WUNI0820")
@@ -421,16 +341,18 @@ class XrfMonitorTest(unittest.TestCase):
 
     def test_consistency_warning_for_independent_oxide_and_element(self):
         sid = self.create_xrf_sample("CONSIST-1")
-        connection = sqlite3.connect(lims.DB)
-        analysis_id = connection.execute(
-            "INSERT INTO xrf_analyses(sample_id,external_id,method) VALUES(?,?, 'WUNI0820')",
-            (sid, "CONSIST-SCAN")).lastrowid
-        for name, value in (("Fe", 40.0), ("Fe2O3", 50.0)):
-            connection.execute(
-                "INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(?,?,?,1)",
-                (analysis_id, name, value))
-        connection.commit()
-        connection.close()
+        db = self.connect()
+        try:
+            analysis_id = db.execute(
+                "INSERT INTO xrf_analyses(sample_id,external_id,method) VALUES(%s,%s,%s) RETURNING id",
+                (sid, "CONSIST-SCAN", "WUNI0820")).fetchone()[0]
+            for name, value in (("Fe", 40.0), ("Fe2O3", 50.0)):
+                db.execute(
+                    "INSERT INTO xrf_values(analysis_id,name,value,use_report) VALUES(%s,%s,%s,1)",
+                    (analysis_id, name, value))
+            db.commit()
+        finally:
+            db.close()
         self.set_targets(sid, [{"family": "fe", "target": "Fe2O3", "include": True}])
         report = self.client.get(f"/api/report/{sid}").get_json()
         iron = next(group for group in report["groups"] if group["analyte"] == "Fe2O3")

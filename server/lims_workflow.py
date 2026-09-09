@@ -55,8 +55,8 @@ _AUDIT_FIELD_LABELS = {
     "instrument_id": "仪器", "method_id": "方法",
     "selection": "结果参与计算", "raw": "原始值", "extra": "滴定变量",
     "aux": "辅助数据", "expected": "标称", "measured": "回读", "use": "带标",
-    "use_avg": "参与计算", "is_final": "旧终值标记", "active": "启用状态",
-    "role": "旧角色", "permissions": "能力", "display_name": "显示名称", "formula": "公式", "constants": "固定常数",
+    "use_avg": "参与计算", "is_final": "终值标记", "active": "启用状态",
+    "permissions": "能力", "display_name": "显示名称", "formula": "公式", "constants": "固定常数",
     "output_unit": "输出单位", "default_unit": "默认单位",
     "note": "备注", "factor": "倍数", "aliquot_ml": "移取体积(mL)",
     "final_volume_ml": "再次定容(mL)", "analyte_ids": "测定项目",
@@ -257,7 +257,7 @@ def audit_event(db, action, entity_type, entity_id=None, before=None, after=None
         terminal_id, terminal_name = None, None
     db.execute("""INSERT INTO audit_logs(
         user_id,username,terminal_id,terminal_name,action,entity_type,entity_id,
-        before_json,after_json,reason,ip_address) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+        before_json,after_json,reason,ip_address) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
         user_id, username or "system", terminal_id, terminal_name, action, entity_type,
         str(entity_id) if entity_id is not None else None,
         json.dumps(before_value, ensure_ascii=False, default=str) if before is not None else None,
@@ -269,40 +269,10 @@ def audit_event(db, action, entity_type, entity_id=None, before=None, after=None
 
 def next_lims_no(db, business_date=None):
     day = (business_date or datetime.now()).strftime("%Y%m%d")
-    number = db.execute("""INSERT INTO number_sequences(day,last_number) VALUES(?,1)
+    number = db.execute("""INSERT INTO number_sequences(day,last_number) VALUES(%s,1)
         ON CONFLICT(day) DO UPDATE SET last_number=number_sequences.last_number+1
         RETURNING last_number""", (day,)).fetchone()[0]
     return f"{day}-{number:03d}"
-
-
-def ensure_sample_numbers(db):
-    """同步已存在编号的序列，并为旧数据补发编号。"""
-    pattern = ("SELECT lims_no FROM samples WHERE lims_no ~ '^[0-9]+-[0-9]+$'"
-               if getattr(db, "is_postgres", False)
-               else "SELECT lims_no FROM samples WHERE lims_no GLOB '[0-9]*-[0-9]*'")
-    for (lims_no,) in db.execute(pattern).fetchall():
-        try:
-            day, number = lims_no.split("-", 1)
-            if len(day) != 8:
-                continue
-            number = int(number)
-        except (AttributeError, TypeError, ValueError):
-            continue
-        db.execute("""INSERT INTO number_sequences(day,last_number) VALUES(?,?)
-            ON CONFLICT(day) DO UPDATE SET last_number=CASE
-                WHEN number_sequences.last_number < excluded.last_number THEN excluded.last_number
-                ELSE number_sequences.last_number END""",
-            (day, number))
-    missing = db.execute(
-        "SELECT id,created_at FROM samples WHERE lims_no IS NULL OR lims_no='' ORDER BY id").fetchall()
-    for sample_id, created_at in missing:
-        try:
-            business_date = datetime.strptime(str(created_at)[:10], "%Y-%m-%d")
-        except (TypeError, ValueError):
-            business_date = datetime.now()
-        db.execute("""UPDATE samples SET lims_no=?,status=COALESCE(status,'received'),
-            updated_at=COALESCE(updated_at,created_at) WHERE id=?""",
-            (next_lims_no(db, business_date), sample_id))
 
 
 def can_transition(permissions, current, target):
@@ -314,7 +284,7 @@ def can_transition(permissions, current, target):
 
 def recompute_sample_progress(db, sample_id):
     """根据任务完成度更新检测阶段，不覆盖审核、报告、作废状态。"""
-    sample = db.execute("SELECT status,xrf FROM samples WHERE id=?", (sample_id,)).fetchone()
+    sample = db.execute("SELECT status,xrf FROM samples WHERE id=%s", (sample_id,)).fetchone()
     if not sample or sample[0] not in {
             "received", "queued", "measuring", "partially_done", "completed"}:
         return
@@ -322,12 +292,12 @@ def recompute_sample_progress(db, sample_id):
         SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),
         SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END)
         FROM sample_analytes sa LEFT JOIN instruments i ON i.id=sa.instrument_id
-        WHERE sa.sample_id=? AND sa.status!='cancelled' AND COALESCE(i.itype,'')!='xrf'""",
+        WHERE sa.sample_id=%s AND sa.status!='cancelled' AND COALESCE(i.itype,'')!='xrf'""",
         (sample_id,)).fetchone()
     total, completed, in_progress = counts[0] or 0, counts[1] or 0, counts[2] or 0
     if sample[1]:
         total += 1
-        if db.execute("SELECT 1 FROM xrf_analyses WHERE sample_id=? LIMIT 1",
+        if db.execute("SELECT 1 FROM xrf_analyses WHERE sample_id=%s LIMIT 1",
                       (sample_id,)).fetchone():
             completed += 1
     if sample[0] in {"received", "queued"}:
@@ -340,20 +310,20 @@ def recompute_sample_progress(db, sample_id):
         status = "measuring"
     else:
         status = sample[0] if sample[0] == "received" else "queued"
-    db.execute("UPDATE samples SET status=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?",
+    db.execute("UPDATE samples SET status=%s,updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s",
                (status, sample_id))
 
 
 def recompute_task_progress(db, task_id):
-    task = db.execute("SELECT sample_id,instrument_id FROM sample_analytes WHERE id=?",
+    task = db.execute("SELECT sample_id,instrument_id FROM sample_analytes WHERE id=%s",
                       (task_id,)).fetchone()
     if not task:
         return
-    has_value = db.execute("""SELECT 1 FROM readings WHERE sample_analyte_id=?
+    has_value = db.execute("""SELECT 1 FROM readings WHERE sample_analyte_id=%s
             AND (raw IS NOT NULL OR (extra IS NOT NULL AND extra NOT IN ('', '{}', 'null')))
-        UNION ALL SELECT 1 FROM results WHERE sample_analyte_id=?
+        UNION ALL SELECT 1 FROM results WHERE sample_analyte_id=%s
             AND (raw IS NOT NULL OR (extra IS NOT NULL AND extra NOT IN ('', '{}', 'null'))) LIMIT 1""",
         (task_id, task_id)).fetchone()
     status = "completed" if has_value else ("in_progress" if task["instrument_id"] else "pending")
-    db.execute("UPDATE sample_analytes SET status=? WHERE id=?", (status, task_id))
+    db.execute("UPDATE sample_analytes SET status=%s WHERE id=%s", (status, task_id))
     recompute_sample_progress(db, task["sample_id"])

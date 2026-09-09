@@ -1,22 +1,16 @@
-import os
-import tempfile
 import unittest
 
 import app as lims
 from client_helpers import browser_client
+from postgres_case import PostgresTestCase
 
 
-class SampleApiTest(unittest.TestCase):
+class SampleApiTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=True)
         self.client = browser_client(self, lims.app)
         self.meta = self.client.get("/api/meta").get_json()
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def create_sample(self):
         aid = next(a["id"] for a in self.meta["analytes"] if a["name"] == "Ag")
@@ -61,12 +55,15 @@ class SampleApiTest(unittest.TestCase):
         task = detail["items"][0]
         added_aid = next(a["id"] for a in self.meta["analytes"] if a["name"] == "Cu")
         instrument = next(i for i in self.meta["instruments"] if aid in i["analytes"])
+        self.client.put(f"/api/samples/{sid}/status", json={"status": "queued"})
+        self.client.put(f"/api/samples/{sid}/status", json={"status": "measuring"})
         self.client.post("/api/results", json={
             "sample_analyte_id": task["id"], "instrument_id": instrument["id"],
         })
-        self.client.post("/api/results", json={
-            "sample_analyte_id": task["id"], "raw": 12.5, "extra": {},
+        reading = self.client.post("/api/readings", json={
+            "sample_analyte_id": task["id"], "raw": 12.5,
         })
+        self.assertEqual(200, reading.status_code, reading.get_data(as_text=True))
 
         response = self.client.put(f"/api/samples/{sid}", json={
             "name": "Batch-001-revised", "is_liquid": 0, "xrf": 0,
@@ -81,7 +78,7 @@ class SampleApiTest(unittest.TestCase):
         self.assertEqual("Batch-001-revised", updated["sample"]["name"])
         updated_task = next(item for item in updated["items"] if item["analyte_id"] == aid)
         self.assertEqual(task["id"], updated_task["id"])
-        self.assertEqual(12.5, updated_task["raw"])
+        self.assertEqual(12.5, updated_task["readings"][0]["raw"])
         self.assertEqual({aid, added_aid}, {item["analyte_id"] for item in updated["items"]})
 
     def test_ratio_dilution_and_report_metadata(self):

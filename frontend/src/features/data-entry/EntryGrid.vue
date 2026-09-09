@@ -37,7 +37,7 @@ function stateText(task: TaskDraft) {
   return time ? `✓ 已存 ${time}` : '';
 }
 function hasValue(task: TaskDraft) { return task.readings.some(rd => rd.raw !== '' || Object.values(rd.extra).some(value => value !== '')); }
-function coeff(task: TaskDraft) { return task.use && Number(task.expected) && Number(task.measured) ? `×${(Number(task.expected) / Number(task.measured)).toFixed(4)}` : task.use && fields(task.task.aux).coefficient ? `×${fields(task.task.aux).coefficient}` : ''; }
+function coeff(task: TaskDraft) { return task.use && Number(task.expected) && Number(task.measured) ? `×${(Number(task.expected) / Number(task.measured)).toFixed(4)}` : ''; }
 function readingInput(row: TaskDraft, rd: ReadingDraft, event: Event, key?: string) {
   if (props.readonly || !(event.target instanceof HTMLInputElement)) return;
   if (key) rd.extra[key] = event.target.value; else rd.raw = event.target.value;

@@ -29,7 +29,7 @@ def _value_with_key(name, value, elements, oxides):
 
 
 def _fetch_quant_rows(db, ids, elements, oxides):
-    marks = ",".join("?" for _ in ids)
+    marks = ",".join("%s" for _ in ids)
     rows = db.execute(f"""SELECT xa.id,xa.external_id,xa.sample_name,xa.method,xa.batch,
         xa.analyzed_at,s.name AS lims_name
         FROM xrf_analyses xa LEFT JOIN samples s ON s.id=xa.sample_id
@@ -38,7 +38,7 @@ def _fetch_quant_rows(db, ids, elements, oxides):
     for row in rows:
         values = {}
         for value in db.execute(
-                "SELECT name,value FROM xrf_values WHERE analysis_id=?", (row["id"],)):
+                "SELECT name,value FROM xrf_values WHERE analysis_id=%s", (row["id"],)):
             percent = float(value["value"])
             values[value["name"]] = _value_with_key(
                 value["name"], percent, elements, oxides)
@@ -51,7 +51,7 @@ def _uq_values_for_basis(db, analysis_id, basis, elements, oxides):
 
     basis 与数据原生口径不一致时按 common_oxides 系数换算；未知名字原样保留。
     """
-    values = db.execute("SELECT name,value,alt_name FROM xrf_values WHERE analysis_id=?",
+    values = db.execute("SELECT name,value,alt_name FROM xrf_values WHERE analysis_id=%s",
                         (analysis_id,)).fetchall()
     out = {}
     for value in values:
@@ -115,10 +115,10 @@ def load_unit_fields(db, ids, kind, order_template_id=None, order_mode="template
     if not ids:
         return []
     elements, oxides = conversion.load_reference(db)
-    marks = ",".join("?" for _ in ids)
+    marks = ",".join("%s" for _ in ids)
     rows = db.execute(f"""SELECT xv.name,xv.value FROM xrf_values xv
         JOIN xrf_analyses xa ON xa.id=xv.analysis_id
-        WHERE xa.id IN ({marks}) AND COALESCE(xa.kind,'quant')=?""",
+        WHERE xa.id IN ({marks}) AND COALESCE(xa.kind,'quant')=%s""",
         [*ids, kind]).fetchall()
     fields = {}
     for row in rows:
@@ -211,7 +211,7 @@ def build_uq_xlsx(db, ids, basis, order_template_id=None, units=None,
     for aid in ids:
         meta = db.execute("""SELECT xa.id,xa.sample_name,s.name AS lims_name
             FROM xrf_analyses xa LEFT JOIN samples s ON s.id=xa.sample_id
-            WHERE xa.id=? AND COALESCE(xa.kind,'quant')='uq'""", (aid,)).fetchone()
+            WHERE xa.id=%s AND COALESCE(xa.kind,'quant')='uq'""", (aid,)).fetchone()
         if meta is None:
             continue
         values = _uq_values_for_basis(db, aid, basis, elements, oxides)

@@ -1,25 +1,15 @@
-import os
-import tempfile
 import unittest
 
 import app as lims
 from client_helpers import browser_client
+from postgres_case import PostgresTestCase
 
 
-class ResultUnitApiTest(unittest.TestCase):
+class ResultUnitApiTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=True)
         self.client = browser_client(self, lims.app)
-        self.meta = self.client.get("/api/meta").get_json()
-        self.aid = next(a["id"] for a in self.meta["analytes"] if a["name"] == "Ag")
-        self.instrument = next(i for i in self.meta["instruments"]
-                               if self.aid in i["analytes"] and i["itype"] == "ppm")
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def create_sample(self, *, liquid=False, density=None, raw=100):
         payload = {
@@ -40,8 +30,8 @@ class ResultUnitApiTest(unittest.TestCase):
         self.client.put(f"/api/samples/{sid}/status", json={"status": "queued"})
         self.client.put(f"/api/samples/{sid}/status", json={"status": "measuring"})
         task = self.client.get(f"/api/samples/{sid}").get_json()["items"][0]
-        result = self.client.post("/api/results", json={"sample_analyte_id": task["id"], "raw": raw})
-        self.assertEqual(200, result.status_code, result.get_data(as_text=True))
+        reading = self.client.post("/api/readings", json={"sample_analyte_id": task["id"], "raw": raw})
+        self.assertEqual(200, reading.status_code, reading.get_data(as_text=True))
         return sid
 
     def group(self, sid):

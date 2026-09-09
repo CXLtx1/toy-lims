@@ -21,8 +21,19 @@ export interface PortAudit {
 export interface SampleAudit extends Omit<PortAudit, "entity_type" | "entity_id"> {
   entity_type?: string;
   entity_id?: string;
-  changes: { label: string; before: unknown; after: unknown }[];
+  changes: { field: string; label: string; before: unknown; after: unknown }[];
   has_snapshot: boolean;
+}
+
+export interface AuditSceneContext {
+  ok: boolean;
+  supported: boolean;
+  reason?: string;
+  audit: { id: number; created_at: string | null; username: string; action_label: string };
+  sample?: { id: number; name: string; lims_no: string | null; status: string };
+  locator?: { sample_id: number; sample_analyte_id: number; reading_id: number; field: "raw" };
+  values?: Record<"before" | "after" | "current", { available: boolean; value: number | null }>;
+  warnings?: string[];
 }
 
 export interface AuditPage {

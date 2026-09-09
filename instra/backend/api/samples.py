@@ -18,7 +18,7 @@ bp = Blueprint("samples", __name__)
 
 
 def _placeholders(count):
-    return ",".join("?" for _ in range(count))
+    return ",".join("%s" for _ in range(count))
 
 
 def _positive_int_arg(name, default=None):
@@ -60,27 +60,27 @@ def list_samples():
     conditions, params = [], []
     if instrument_id is not None:
         conditions.append("""EXISTS(SELECT 1 FROM sample_analytes sa
-            WHERE sa.sample_id=s.id AND sa.instrument_id=?)""")
+            WHERE sa.sample_id=s.id AND sa.instrument_id=%s)""")
         params.append(instrument_id)
     if keyword:
         like = f"%{keyword}%"
-        conditions.append("""(s.name ILIKE ? OR s.lims_no ILIKE ? OR s.category ILIKE ?
-            OR EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag ILIKE ?))""")
+        conditions.append("""(s.name ILIKE %s OR s.lims_no ILIKE %s OR s.category ILIKE %s
+            OR EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag ILIKE %s))""")
         params.extend([like, like, like, like])
     # 标签筛选：选中的每个标签都必须存在于样品上（AND 语义）
     for tag in request.args.getlist("tag"):
         tag = tag.strip()
         if tag:
-            conditions.append("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag=?)")
+            conditions.append("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag=%s)")
             params.append(tag)
     if status:
-        conditions.append("COALESCE(s.status,'received')=?")
+        conditions.append("COALESCE(s.status,'received')=%s")
         params.append(status)
     if date_from:
-        conditions.append("s.created_at >= ?")
+        conditions.append("s.created_at >= %s")
         params.append(date_from + " 00:00:00")
     if date_to:
-        conditions.append("s.created_at <= ?")
+        conditions.append("s.created_at <= %s")
         params.append(date_to + " 23:59:59")
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -88,7 +88,7 @@ def list_samples():
     total = db.execute(f"SELECT COUNT(*) AS c FROM samples s {where}", params).fetchone()["c"]
     rows = db.execute(f"""SELECT s.id,s.lims_no,s.name,s.category,s.is_liquid,s.is_water_quality,
         s.workflow_type,s.xrf,s.status,s.created_at,s.customer,s.analysis_date,s.analyst,s.reviewer
-        FROM samples s {where} ORDER BY s.id DESC LIMIT ? OFFSET ?""",
+        FROM samples s {where} ORDER BY s.id DESC LIMIT %s OFFSET %s""",
         params + [per_page, (page - 1) * per_page]).fetchall()
 
     ids = [row["id"] for row in rows]
@@ -149,12 +149,12 @@ def list_tags():
 @bp.get("/samples/<int:sid>/aggregate")
 def sample_aggregate(sid):
     db = g.db
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if sample is None:
         return jsonify(ok=False, error="样品不存在"), 404
 
     tags = [row["tag"] for row in db.execute(
-        "SELECT tag FROM sample_tags WHERE sample_id=? ORDER BY tag", (sid,))]
+        "SELECT tag FROM sample_tags WHERE sample_id=%s ORDER BY tag", (sid,))]
 
     sa_rows = db.execute("""SELECT sa.id,sa.preparation_id,sa.analyte_id,a.name AS analyte,
         a.default_unit AS analyte_default_unit,
@@ -162,7 +162,7 @@ def sample_aggregate(sid):
         sa.method_id,m.name AS method_name,m.formula,m.constants AS method_constants,
         m.output_unit AS method_output_unit,
         sa.selection,sa.status AS task_status,
-        r.raw,r.extra,r.aux,
+        r.aux,
         p.name AS prep,p.mass_g AS prep_mass,p.volume_ml AS prep_vol,
         p.dilution_factor AS prep_factor,p.dilution_label
         FROM sample_analytes sa
@@ -171,7 +171,7 @@ def sample_aggregate(sid):
         LEFT JOIN methods m ON m.id=sa.method_id
         LEFT JOIN preparations p ON p.id=sa.preparation_id
         LEFT JOIN results r ON r.sample_analyte_id=sa.id
-        WHERE sa.sample_id=? ORDER BY sa.id""", (sid,)).fetchall()
+        WHERE sa.sample_id=%s ORDER BY sa.id""", (sid,)).fetchall()
 
     readings_by_sa = {}
     sa_ids = [row["id"] for row in sa_rows]
@@ -229,16 +229,16 @@ def sample_aggregate(sid):
     analyses = []
     for xa in db.execute("""SELECT id,external_id,sample_name,method,batch,analyzed_at,
         COALESCE(kind,'quant') AS kind,remark FROM xrf_analyses
-        WHERE sample_id=? ORDER BY analyzed_at DESC NULLS LAST, id DESC""", (sid,)):
+        WHERE sample_id=%s ORDER BY analyzed_at DESC NULLS LAST, id DESC""", (sid,)):
         values = [dict(v) for v in db.execute(
-            "SELECT id,name,value,use_report,alt_name FROM xrf_values WHERE analysis_id=?",
+            "SELECT id,name,value,use_report,alt_name FROM xrf_values WHERE analysis_id=%s",
             (xa["id"],))]
         analyses.append({**dict(xa), "values": values})
 
     # 溶样方案：每路的称样/定容/稀释 + 测定项目与仪器分配
     preps = []
     prep_rows = db.execute("""SELECT id,name,mass_g,volume_ml,dilution_label,dilution_factor,
-        dilution_steps FROM preparations WHERE sample_id=? ORDER BY id""", (sid,)).fetchall()
+        dilution_steps FROM preparations WHERE sample_id=%s ORDER BY id""", (sid,)).fetchall()
     tasks_by_prep = {}
     for row in sa_rows:
         if row["preparation_id"]:
@@ -275,7 +275,7 @@ _AUDIT_ACTION_LABELS = {
     "restore": "恢复", "status_change": "修改状态", "cancel": "作废",
     "result_update": "修改结果", "report_use": "修改结果参与计算",
     "report_meta": "修改报告信息", "report_order": "修改报告顺序",
-    "report_print": "修改报告打印项", "report_override": "旧版手工修改报告",
+    "report_print": "修改报告打印项",
     "result_override": "特权补录结果", "instrument_import": "导入仪器结果",
     "instrument_reading": "仪器录入读数", "instrument_submit": "仪器批量提交",
     "xrf_assign": "关联 XRF 扫描", "xrf_unassign": "解绑 XRF 扫描",
@@ -302,18 +302,18 @@ def sample_audit(sid):
     rows = db.execute("""SELECT al.id,al.username,al.terminal_name,al.action,al.entity_type,
         al.entity_id,al.before_json,al.after_json,al.reason,al.ip_address,al.created_at
         FROM audit_logs al WHERE
-          (al.entity_type='sample' AND al.entity_id=?)
-          OR (al.entity_type='instrument_import' AND al.entity_id=?)
+          (al.entity_type='sample' AND al.entity_id=%s)
+          OR (al.entity_type='instrument_import' AND al.entity_id=%s)
           OR (al.entity_type='sample_analyte' AND al.entity_id IN (
-                SELECT CAST(id AS TEXT) FROM sample_analytes WHERE sample_id=?))
+                SELECT CAST(id AS TEXT) FROM sample_analytes WHERE sample_id=%s))
           OR (al.entity_type='reading' AND al.entity_id IN (
                 SELECT CAST(r.id AS TEXT) FROM readings r JOIN sample_analytes sa
-                  ON sa.id=r.sample_analyte_id WHERE sa.sample_id=?))
+                  ON sa.id=r.sample_analyte_id WHERE sa.sample_id=%s))
           OR (al.entity_type='xrf_analysis' AND al.entity_id IN (
-                SELECT CAST(id AS TEXT) FROM xrf_analyses WHERE sample_id=?))
+                SELECT CAST(id AS TEXT) FROM xrf_analyses WHERE sample_id=%s))
           OR (al.entity_type='xrf_value' AND al.entity_id IN (
                 SELECT CAST(xv.id AS TEXT) FROM xrf_values xv JOIN xrf_analyses xa
-                  ON xa.id=xv.analysis_id WHERE xa.sample_id=?))
+                  ON xa.id=xv.analysis_id WHERE xa.sample_id=%s))
         ORDER BY al.id DESC LIMIT 300""",
         (str(sid), str(sid), sid, sid, sid, sid)).fetchall()
 

@@ -1,22 +1,15 @@
-import os
-import sqlite3
-import tempfile
 import unittest
 
 import app as lims
 from client_helpers import browser_client
+from postgres_case import PostgresTestCase
 
 
-class UniversalOrderTemplateTest(unittest.TestCase):
+class UniversalOrderTemplateTest(PostgresTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        lims.DB = os.path.join(self.tmp.name, "test.db")
-        lims.init_db()
+        self.provision_database(lims)
         lims.app.config.update(TESTING=True, AUTH_DISABLED=False)
         self.client = browser_client(self, lims.app)
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def setup_admin(self):
         response = self.client.post("/setup", data={
@@ -25,7 +18,7 @@ class UniversalOrderTemplateTest(unittest.TestCase):
             "admin_password": "terminal-admin-123",
         })
         self.assertEqual(302, response.status_code)
-        db = sqlite3.connect(lims.DB)
+        db = self.connect()
         try:
             terminal_id = db.execute(
                 "SELECT id FROM terminals WHERE kind='admin'").fetchone()[0]

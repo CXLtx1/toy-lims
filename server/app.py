@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""toy-lims —— 无机分析实验室轻量级 LIMS
-Flask + PostgreSQL（SQLite 测试兼容）+ Vue 3 工程化前端
-"""
+"""LabFlow: Flask, PostgreSQL, and the built Vue frontend."""
 import gzip
 import json
 import ast
@@ -19,14 +17,13 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from uuid import UUID
-from flask import Flask, Response, g, jsonify, request, render_template, send_file, send_from_directory
+from flask import Flask, Response, g, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from business_excel import (BusinessExcelError, MIME as EXCEL_MIME, build_data,
                             build_overview, build_plan, build_report,
                             parse_data, parse_plan)
-from db_backend import (DATABASE_ERRORS, INTEGRITY_ERRORS, connect_database,
-                        is_postgres_database)
+from db_backend import DATABASE_ERRORS, INTEGRITY_ERRORS, connect_database
 from db_schema import initialize_database
 from lims_auth import (CAPABILITIES, bp as auth_bp,
                        authenticate_capable_user, capability_required, consume_forced_authorization,
@@ -36,14 +33,14 @@ from lims_workflow import (CAPABILITY_STATUS_TARGETS, SAMPLE_STATUS_LABELS, SAMP
                            can_transition, next_lims_no,
                            recompute_sample_progress, recompute_task_progress)
 from result_report_excel import build_result_report
-from mutation_guard import (begin_mutation, locked_row, lock_reading,
-                            lock_reading_task, next_updated_at, reading_version, stable_hash)
+from mutation_guard import (locked_row, lock_reading, lock_reading_task,
+                             next_updated_at, reading_version, stable_hash)
 from security import init_security
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 BASE_DIR = Path(__file__).resolve().parent
-# Vite 构建产物（frontend/dist，base 为 /frontend/）；未构建时首页回退到旧模板。
+# Vite build output (frontend/dist, base=/frontend/).
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
 # 反向代理部署时设 LIMS_TRUST_PROXY=1：request.remote_addr 改读 X-Forwarded-For，
@@ -64,8 +61,8 @@ if not app.secret_key:
     app.secret_key = secret_file.read_text(encoding="ascii").strip()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict")
 
-# No implicit database or embedded credentials. Tests may supply a temporary DB.
-DB = os.environ.get("LIMS_DATABASE_URL") or os.environ.get("LIMS_DB")
+# No implicit database or embedded credentials.
+DB = os.environ.get("LIMS_DATABASE_URL")
 # Instrument tokens must also be configured for loopback clients.
 XRF_CLIENT_TOKEN = os.environ.get("LIMS_XRF_CLIENT_TOKEN", "").strip() or ""
 STANDARD_CLIENT_TOKEN = os.environ.get("LIMS_STANDARD_CLIENT_TOKEN", "").strip() or ""
@@ -286,8 +283,8 @@ def clean_sample_tags(value):
 
 def replace_sample_tags(db, sample_id, value):
     tags = clean_sample_tags(value)
-    db.execute("DELETE FROM sample_tags WHERE sample_id=?", (sample_id,))
-    db.executemany("INSERT INTO sample_tags(sample_id,tag) VALUES(?,?)",
+    db.execute("DELETE FROM sample_tags WHERE sample_id=%s", (sample_id,))
+    db.executemany("INSERT INTO sample_tags(sample_id,tag) VALUES(%s,%s)",
                    [(sample_id, tag) for tag in tags])
     return tags
 
@@ -298,7 +295,7 @@ def attach_sample_tags(db, samples):
     ids = [sample["id"] for sample in samples]
     grouped = {sample_id: [] for sample_id in ids}
     for row in db.execute(f"""SELECT sample_id,tag FROM sample_tags
-            WHERE sample_id IN ({','.join('?' for _ in ids)}) ORDER BY tag""", ids):
+            WHERE sample_id IN ({','.join('%s' for _ in ids)}) ORDER BY tag""", ids):
         grouped[row["sample_id"]].append(row["tag"])
     for sample in samples:
         sample["tags"] = grouped.get(sample["id"], [])
@@ -315,8 +312,8 @@ def actor_name(actor=None):
 
 
 def mark_sample_status_actor(db, sample_id, action, actor=None):
-    db.execute("""UPDATE samples SET status_operator=?,status_action=?,
-        status_changed_at=datetime('now','localtime') WHERE id=?""",
+    db.execute("""UPDATE samples SET status_operator=%s,status_action=%s,
+        status_changed_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS') WHERE id=%s""",
         (actor_name(actor), action, sample_id))
 
 
@@ -407,11 +404,9 @@ def calculate_special(schema, raw):
 
 
 def aux_coefficient(aux):
-    """回标系数: 优先用旧格式 coefficient, 否则 expected/measured。"""
+    """Return the correction coefficient from the reference measurement."""
     if not aux.get("use"):
         return 1.0
-    if aux.get("coefficient"):
-        return float(aux["coefficient"])
     if aux.get("expected") and aux.get("measured"):
         return float(aux["expected"]) / float(aux["measured"])
     return 1.0
@@ -534,11 +529,6 @@ def calc_result(sa, is_liquid):
     coeff = aux_coefficient(aux)
     readings = sa.get("readings") or []
     if not readings:
-        # 兼容未被迁移的旧单值
-        if sa["raw"] is not None or (sa["extra"] not in (None, "", "{}")):
-            readings = [{"raw": sa["raw"], "extra": sa["extra"],
-                         "use_avg": 1, "is_final": 0}]
-    if not readings:
         return (None, "未录入" if sa["itype"] else "未选仪器", [])
     details = []
     for rd in readings:
@@ -553,7 +543,6 @@ def calc_result(sa, is_liquid):
         })
     finals = [d for d in details if d["is_final"] and d["value"] is not None]
     included = [d for d in details if d["used"] and not d["is_final"] and d["value"] is not None]
-    # 兼容旧数据：旧终值在首次修改“参与”勾框前仍保持原结果。
     chosen = finals or included
     for d in details:
         d["used"] = d in chosen
@@ -577,12 +566,12 @@ def task_defaults(db, instrument_map, analyte_id):
     instrument = db.execute(
         """SELECT i.id,i.itype FROM instruments i
            JOIN instr_analytes ia ON ia.instrument_id=i.id
-           WHERE i.id=? AND ia.analyte_id=?""", (instrument_id, analyte_id)).fetchone()
+           WHERE i.id=%s AND ia.analyte_id=%s""", (instrument_id, analyte_id)).fetchone()
     if not instrument:
         return None, None
     method_id = config.get("method_id") if instrument["itype"] in {"function", "xrf"} else None
     if method_id and not db.execute(
-            "SELECT 1 FROM methods WHERE id=? AND itype=? AND active=1",
+            "SELECT 1 FROM methods WHERE id=%s AND itype=%s AND active=1",
             (method_id, instrument["itype"])).fetchone():
         method_id = None
     return instrument_id, method_id
@@ -608,7 +597,7 @@ def preparation_dilution_values(db, prep):
         raise ValueError("稀释序列格式无效") from None
     labels, factor = [], 1.0
     for dilution_id in dilution_ids:
-        dilution = db.execute("SELECT label,factor FROM dilutions WHERE id=?", (dilution_id,)).fetchone()
+        dilution = db.execute("SELECT label,factor FROM dilutions WHERE id=%s", (dilution_id,)).fetchone()
         if not dilution:
             raise ValueError("稀释序列中包含不存在的稀释方式")
         labels.append(dilution["label"])
@@ -626,12 +615,12 @@ def preparation_values(db, prep):
 
 def sample_audit_snapshot(db, sample_id):
     """审计用完整样品快照：主表、溶样及检测任务均纳入前后比较。"""
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sample_id,)).fetchone()
     if not sample:
         return None
     preparations = db.execute("""SELECT id,name,mass_g,volume_ml,dilution_id,
             dilution_steps,dilution_factor,dilution_label
-        FROM preparations WHERE sample_id=? ORDER BY id""", (sample_id,)).fetchall()
+        FROM preparations WHERE sample_id=%s ORDER BY id""", (sample_id,)).fetchall()
     tasks = db.execute("""SELECT sa.id,p.name AS preparation,a.name AS analyte,
             i.name AS instrument,m.name AS method,sa.status,sa.selection
         FROM sample_analytes sa
@@ -639,15 +628,15 @@ def sample_audit_snapshot(db, sample_id):
         JOIN analytes a ON a.id=sa.analyte_id
         LEFT JOIN instruments i ON i.id=sa.instrument_id
         LEFT JOIN methods m ON m.id=sa.method_id
-        WHERE sa.sample_id=? ORDER BY sa.id""", (sample_id,)).fetchall()
+        WHERE sa.sample_id=%s ORDER BY sa.id""", (sample_id,)).fetchall()
     special = db.execute("""SELECT sr.method_id,sm.name AS method,sr.raw_data,
         sr.calculated_data,sr.status FROM special_results sr
-        JOIN special_methods sm ON sm.id=sr.method_id WHERE sr.sample_id=?""",
+        JOIN special_methods sm ON sm.id=sr.method_id WHERE sr.sample_id=%s""",
         (sample_id,)).fetchone()
     return {
         "sample": dict(sample),
         "tags": [row["tag"] for row in db.execute(
-            "SELECT tag FROM sample_tags WHERE sample_id=? ORDER BY tag", (sample_id,))],
+            "SELECT tag FROM sample_tags WHERE sample_id=%s ORDER BY tag", (sample_id,))],
         "preparations": {str(row["id"]): {key: row[key] for key in row.keys() if key != "id"}
                          for row in preparations},
         "tasks": {str(row["id"]): {key: row[key] for key in row.keys() if key != "id"}
@@ -661,7 +650,7 @@ def attach_sample_status_history(db, samples):
     if not samples:
         return samples
     sample_ids = [int(sample["id"]) for sample in samples]
-    placeholders = ",".join("?" for _ in sample_ids)
+    placeholders = ",".join("%s" for _ in sample_ids)
     records = db.execute(f"""SELECT al.entity_id,al.action,al.before_json,al.after_json,al.reason,al.created_at,
             COALESCE(NULLIF(u.display_name,''),NULLIF(al.terminal_name,''),al.username,'系统') AS operator
         FROM audit_logs al LEFT JOIN users u ON u.id=al.user_id
@@ -679,20 +668,9 @@ def attach_sample_status_history(db, samples):
             continue
         status = (payload.get("sample") or payload).get("status")
         before_status = (before_payload.get("sample") or before_payload).get("status")
-        legacy_reported = status == "reported"
-        if status == "registered":
-            status = "received"
-        elif status == "reported":
-            status = "reviewed"
-        if before_status == "registered":
-            before_status = "received"
-        elif before_status == "reported":
-            before_status = "reviewed"
         if status not in SAMPLE_STATUS_LABELS:
             continue
         entity_history = histories.setdefault(int(record["entity_id"]), [])
-        if legacy_reported and entity_history and entity_history[-1]["action"] == "reviewed":
-            continue
         entity_history.append({
             "action": status,
             "operator": record["operator"],
@@ -720,10 +698,7 @@ def attach_sample_status_history(db, samples):
 @app.route("/")
 def index():
     built = FRONTEND_DIST / "index.html"
-    if built.exists():
-        response = app.make_response(send_file(built))
-    else:
-        response = app.make_response(render_template("index.html"))
+    response = app.make_response(send_file(built))
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -764,19 +739,19 @@ def site_status():
         FROM audit_logs al LEFT JOIN users u ON u.id=al.user_id"""
     if entity_type == "sample" and entity_id.isdigit():
         candidates = db.execute(columns + """
-            WHERE (al.entity_type='sample' AND al.entity_id=?)
-               OR (al.entity_type='sample_analyte' AND safe_int(al.entity_id) IN
-                   (SELECT id FROM sample_analytes WHERE sample_id=?))
-               OR (al.entity_type='reading' AND safe_int(al.entity_id) IN
+            WHERE (al.entity_type='sample' AND al.entity_id=%s)
+               OR (al.entity_type='sample_analyte' AND CASE WHEN al.entity_id ~ '^[0-9]+$' THEN al.entity_id::INTEGER END IN
+                   (SELECT id FROM sample_analytes WHERE sample_id=%s))
+               OR (al.entity_type='reading' AND CASE WHEN al.entity_id ~ '^[0-9]+$' THEN al.entity_id::INTEGER END IN
                    (SELECT r.id FROM readings r JOIN sample_analytes sa
-                    ON sa.id=r.sample_analyte_id WHERE sa.sample_id=?))
-               OR (al.entity_type='xrf_value' AND safe_int(al.entity_id) IN
+                    ON sa.id=r.sample_analyte_id WHERE sa.sample_id=%s))
+               OR (al.entity_type='xrf_value' AND CASE WHEN al.entity_id ~ '^[0-9]+$' THEN al.entity_id::INTEGER END IN
                    (SELECT xv.id FROM xrf_values xv JOIN xrf_analyses xa
-                    ON xa.id=xv.analysis_id WHERE xa.sample_id=?))
+                    ON xa.id=xv.analysis_id WHERE xa.sample_id=%s))
             ORDER BY al.id DESC LIMIT 200""", (entity_id, entity_id, entity_id, entity_id)).fetchall()
     elif entity_type in allowed_types and entity_id:
         candidates = db.execute(columns + """
-            WHERE al.entity_type=? AND al.entity_id=?
+            WHERE al.entity_type=%s AND al.entity_id=%s
             ORDER BY al.id DESC LIMIT 200""", (entity_type, entity_id)).fetchall()
     latest_change = None
     for candidate in candidates:
@@ -853,7 +828,6 @@ def meta():
     actual_user = dict(g.user) if g.user else None
     if actual_user:
         actual_user["permissions"] = sorted(user_permissions(g.user))
-        actual_user.pop("role", None)
     if actual_user and terminal and terminal["kind"] == "standard":
         actual_user["is_authorized"] = True
     current_user = actual_user or ({
@@ -950,7 +924,7 @@ def _validated_order_template_id(db, value, use_default=True):
         template_id = int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("通用顺序模板无效") from exc
-    if not db.execute("SELECT 1 FROM result_order_templates WHERE id=?", (template_id,)).fetchone():
+    if not db.execute("SELECT 1 FROM result_order_templates WHERE id=%s", (template_id,)).fetchone():
         raise ValueError("通用顺序模板不存在")
     return template_id
 
@@ -962,7 +936,7 @@ def _universal_order_key(db, template_id=None):
     ordered_names = []
     for current_id in dict.fromkeys(item for item in (template_id, default_id) if item):
         row = db.execute(
-            "SELECT items_json FROM result_order_templates WHERE id=?", (current_id,)).fetchone()
+            "SELECT items_json FROM result_order_templates WHERE id=%s", (current_id,)).fetchone()
         try:
             items = json.loads(row["items_json"] or "[]") if row else []
         except (TypeError, json.JSONDecodeError):
@@ -1019,13 +993,14 @@ def add_result_order_template():
         return jsonify(ok=False, error=str(exc)), 400
     db = get_db()
     try:
-        cur = db.execute("INSERT INTO result_order_templates(name,items_json,is_default) VALUES(?,?,0)",
-                         (template["name"], json.dumps(template["items"], ensure_ascii=False)))
+        template_id = db.execute("""INSERT INTO result_order_templates(name,items_json,is_default)
+            VALUES(%s,%s,0) RETURNING id""",
+            (template["name"], json.dumps(template["items"], ensure_ascii=False))).fetchone()["id"]
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="模板名称已存在"), 409
-    audit_event(db, "create", "result_order_template", cur.lastrowid, after=template)
+    audit_event(db, "create", "result_order_template", template_id, after=template)
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=template_id)
 
 
 @app.put("/api/result-order-templates/<int:template_id>")
@@ -1036,17 +1011,17 @@ def update_result_order_template(template_id):
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     db = get_db()
-    before = db.execute("SELECT * FROM result_order_templates WHERE id=?", (template_id,)).fetchone()
+    before = db.execute("SELECT * FROM result_order_templates WHERE id=%s", (template_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="模板不存在"), 404
     try:
-        db.execute("UPDATE result_order_templates SET name=?,items_json=? WHERE id=?",
+        db.execute("UPDATE result_order_templates SET name=%s,items_json=%s WHERE id=%s",
                    (template["name"], json.dumps(template["items"], ensure_ascii=False), template_id))
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="模板名称已存在"), 409
     if (request.json or {}).get("is_default"):
-        db.execute("UPDATE result_order_templates SET is_default=0 WHERE id!=?", (template_id,))
-        db.execute("UPDATE result_order_templates SET is_default=1 WHERE id=?", (template_id,))
+        db.execute("UPDATE result_order_templates SET is_default=0 WHERE id!=%s", (template_id,))
+        db.execute("UPDATE result_order_templates SET is_default=1 WHERE id=%s", (template_id,))
         template["is_default"] = True
     audit_event(db, "update", "result_order_template", template_id, before=before, after=template)
     db.commit()
@@ -1057,14 +1032,14 @@ def update_result_order_template(template_id):
 @capability_required("settings_manage")
 def delete_result_order_template(template_id):
     db = get_db()
-    before = db.execute("SELECT * FROM result_order_templates WHERE id=?", (template_id,)).fetchone()
+    before = db.execute("SELECT * FROM result_order_templates WHERE id=%s", (template_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="模板不存在"), 404
     if before["is_default"]:
         return jsonify(ok=False, error="系统默认顺序模板不能删除，请先将其他模板设为默认"), 409
-    db.execute("UPDATE samples SET order_template_id=NULL WHERE order_template_id=?", (template_id,))
-    db.execute("UPDATE templates SET order_template_id=NULL WHERE order_template_id=?", (template_id,))
-    db.execute("DELETE FROM result_order_templates WHERE id=?", (template_id,))
+    db.execute("UPDATE samples SET order_template_id=NULL WHERE order_template_id=%s", (template_id,))
+    db.execute("UPDATE templates SET order_template_id=NULL WHERE order_template_id=%s", (template_id,))
+    db.execute("DELETE FROM result_order_templates WHERE id=%s", (template_id,))
     audit_event(db, "delete", "result_order_template", template_id, before=before)
     db.commit()
     return jsonify(ok=True)
@@ -1079,34 +1054,35 @@ def add_report_profile():
         return jsonify(ok=False, error=str(exc)), 400
     db = get_db()
     try:
-        cur = db.execute("""INSERT INTO report_profiles(
-            name,company_name_cn,company_name_en,raw_code,final_code) VALUES(?,?,?,?,?)""",
-            tuple(profile[field] for field in ("name", "company_name_cn", "company_name_en", "raw_code", "final_code")))
+        profile_id = db.execute("""INSERT INTO report_profiles(
+            name,company_name_cn,company_name_en,raw_code,final_code)
+            VALUES(%s,%s,%s,%s,%s) RETURNING id""",
+            tuple(profile[field] for field in ("name", "company_name_cn", "company_name_en", "raw_code", "final_code"))).fetchone()["id"]
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="报告版式名称已存在"), 409
-    audit_event(db, "create", "report_profile", cur.lastrowid, after=profile)
+    audit_event(db, "create", "report_profile", profile_id, after=profile)
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=profile_id)
 
 
 @app.put("/api/report-profiles/<int:profile_id>")
 @capability_required("settings_manage")
 def update_report_profile(profile_id):
     db = get_db()
-    before = db.execute("SELECT * FROM report_profiles WHERE id=?", (profile_id,)).fetchone()
+    before = db.execute("SELECT * FROM report_profiles WHERE id=%s", (profile_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="报告版式不存在"), 404
     merged = {key: (request.json or {}).get(key, before[key]) for key in before.keys()}
     try:
         profile = clean_report_profile(merged)
-        db.execute("""UPDATE report_profiles SET name=?,company_name_cn=?,company_name_en=?,
-            raw_code=?,final_code=? WHERE id=?""", tuple(profile[field] for field in (
+        db.execute("""UPDATE report_profiles SET name=%s,company_name_cn=%s,company_name_en=%s,
+            raw_code=%s,final_code=%s WHERE id=%s""", tuple(profile[field] for field in (
                 "name", "company_name_cn", "company_name_en", "raw_code", "final_code")) + (profile_id,))
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="报告版式名称已存在"), 409
-    after = db.execute("SELECT * FROM report_profiles WHERE id=?", (profile_id,)).fetchone()
+    after = db.execute("SELECT * FROM report_profiles WHERE id=%s", (profile_id,)).fetchone()
     audit_event(db, "update", "report_profile", profile_id, before=before, after=after)
     db.commit()
     return jsonify(ok=True)
@@ -1116,13 +1092,13 @@ def update_report_profile(profile_id):
 @capability_required("settings_manage")
 def delete_report_profile(profile_id):
     db = get_db()
-    before = db.execute("SELECT * FROM report_profiles WHERE id=?", (profile_id,)).fetchone()
+    before = db.execute("SELECT * FROM report_profiles WHERE id=%s", (profile_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="报告版式不存在"), 404
     if db.execute("SELECT COUNT(*) FROM report_profiles").fetchone()[0] <= 1:
         return jsonify(ok=False, error="至少保留一套报告版式"), 409
-    db.execute("UPDATE samples SET report_profile_id=NULL WHERE report_profile_id=?", (profile_id,))
-    db.execute("DELETE FROM report_profiles WHERE id=?", (profile_id,))
+    db.execute("UPDATE samples SET report_profile_id=NULL WHERE report_profile_id=%s", (profile_id,))
+    db.execute("DELETE FROM report_profiles WHERE id=%s", (profile_id,))
     audit_event(db, "delete", "report_profile", profile_id, before=before)
     db.commit()
     return jsonify(ok=True)
@@ -1175,7 +1151,7 @@ def _validate_xrf_method(db, data):
         method_id = int(method_id)
     except (TypeError, ValueError) as exc:
         raise BusinessExcelError("XRF方法ID必须是整数") from exc
-    if not db.execute("SELECT 1 FROM methods WHERE id=? AND itype='xrf'", (method_id,)).fetchone():
+    if not db.execute("SELECT 1 FROM methods WHERE id=%s AND itype='xrf'", (method_id,)).fetchone():
         raise BusinessExcelError("XRF方法ID不存在或不是XRF方法")
     return method_id
 
@@ -1183,11 +1159,11 @@ def _validate_xrf_method(db, data):
 def apply_excel_plan(db, data, sid=None):
     """Apply a parsed plan. Existing stable preparation/task IDs retain their results."""
     creating = sid is None
-    existing = None if creating else db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    existing = None if creating else db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not creating:
         if not existing:
             raise BusinessExcelError("样品不存在")
-        if existing["status"] in {"reviewed", "reported", "cancelled"}:
+        if existing["status"] in {"reviewed", "cancelled"}:
             raise BusinessExcelError("已审核、已出报告或已作废的样品不能覆盖方案")
         if data.get("id") != sid or str(data.get("lims_no") or "") != str(existing["lims_no"] or ""):
             raise BusinessExcelError("工作簿样品身份与当前样品不一致")
@@ -1200,25 +1176,24 @@ def apply_excel_plan(db, data, sid=None):
         lims_no = next_lims_no(db)
         is_water_quality = int(bool(data.get("is_water_quality", 0))) if workflow == "regular" else 0
         is_liquid = int(bool(data["is_liquid"]) or is_water_quality) if workflow == "regular" else 0
-        cur = db.execute("""INSERT INTO samples(name,category,is_liquid,is_water_quality,workflow_type,special_method_id,xrf,
+        sid = db.execute("""INSERT INTO samples(name,category,is_liquid,is_water_quality,workflow_type,special_method_id,xrf,
             xrf_method_id,xrf_report_items,customer,report_no,analysis_date,analyst,reviewer,report_order,lims_no,status)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'received')""",
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'received') RETURNING id""",
             (data["name"], str(data.get("category") or "").strip(), is_liquid, is_water_quality, workflow,
              data.get("special_method_id") if workflow == "special" else None, int(data.get("xrf", 0)) if workflow == "regular" else 0,
              _validate_xrf_method(db, data) if workflow == "regular" else None, str(data.get("xrf_report_items") or "").strip(),
              str(data.get("customer") or "").strip(), str(data.get("report_no") or "").strip(),
              str(data.get("analysis_date") or "").strip(), str(data.get("analyst") or "").strip(),
-             str(data.get("reviewer") or "").strip(), json.dumps(data.get("report_order") or []), lims_no))
-        sid = cur.lastrowid
+             str(data.get("reviewer") or "").strip(), json.dumps(data.get("report_order") or []), lims_no)).fetchone()["id"]
         mark_sample_status_actor(db, sid, "received")
     else:
         lims_no = existing["lims_no"]
         before = sample_audit_snapshot(db, sid)
         is_water_quality = int(bool(data.get("is_water_quality", 0))) if workflow == "regular" else 0
         is_liquid = int(bool(data["is_liquid"]) or is_water_quality) if workflow == "regular" else 0
-        db.execute("""UPDATE samples SET name=?,category=?,is_liquid=?,is_water_quality=?,special_method_id=?,xrf=?,xrf_method_id=?,
-            xrf_report_items=?,customer=?,report_no=?,analysis_date=?,analyst=?,reviewer=?,report_order=?,
-            updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+        db.execute("""UPDATE samples SET name=%s,category=%s,is_liquid=%s,is_water_quality=%s,special_method_id=%s,xrf=%s,xrf_method_id=%s,
+            xrf_report_items=%s,customer=%s,report_no=%s,analysis_date=%s,analyst=%s,reviewer=%s,report_order=%s,
+            updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
             (data["name"], str(data.get("category") or "").strip(), is_liquid, is_water_quality,
              data.get("special_method_id") if workflow == "special" else None,
              int(data.get("xrf", 0)) if workflow == "regular" else 0,
@@ -1229,13 +1204,13 @@ def apply_excel_plan(db, data, sid=None):
              json.dumps(data.get("report_order") or []), sid))
     if workflow == "special":
         method_id = data["special_method_id"]
-        current = db.execute("SELECT * FROM special_results WHERE sample_id=?", (sid,)).fetchone()
+        current = db.execute("SELECT * FROM special_results WHERE sample_id=%s", (sid,)).fetchone()
         if current and current["method_id"] != method_id and json.loads(current["raw_data"] or "{}"):
             raise BusinessExcelError("已有专项数据，不能更换专项方法")
-        db.execute("""INSERT INTO special_results(sample_id,method_id) VALUES(?,?)
+        db.execute("""INSERT INTO special_results(sample_id,method_id) VALUES(%s,%s)
             ON CONFLICT(sample_id) DO UPDATE SET method_id=excluded.method_id""", (sid, method_id))
     else:
-        existing_preps = {row["id"]: row for row in db.execute("SELECT * FROM preparations WHERE sample_id=?", (sid,))}
+        existing_preps = {row["id"]: row for row in db.execute("SELECT * FROM preparations WHERE sample_id=%s", (sid,))}
         prep_map, kept_preps = {}, set()
         for prep in data["preps"]:
             try:
@@ -1245,17 +1220,18 @@ def apply_excel_plan(db, data, sid=None):
             exported_id = prep.get("id")
             if not creating and exported_id in existing_preps:
                 pid = exported_id
-                db.execute("""UPDATE preparations SET name=?,mass_g=?,volume_ml=?,dilution_id=?,
-                    dilution_steps=?,dilution_factor=?,dilution_label=? WHERE id=?""", values + (pid,))
+                db.execute("""UPDATE preparations SET name=%s,mass_g=%s,volume_ml=%s,dilution_id=%s,
+                    dilution_steps=%s,dilution_factor=%s,dilution_label=%s WHERE id=%s""", values + (pid,))
             else:
-                cur = db.execute("""INSERT INTO preparations(sample_id,name,mass_g,volume_ml,dilution_id,
-                    dilution_steps,dilution_factor,dilution_label) VALUES(?,?,?,?,?,?,?,?)""", (sid,) + values)
-                pid = cur.lastrowid
+                pid = db.execute("""INSERT INTO preparations(sample_id,name,mass_g,volume_ml,dilution_id,
+                    dilution_steps,dilution_factor,dilution_label)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (sid,) + values).fetchone()["id"]
             prep_map[exported_id] = pid
             prep_map[("name", prep["name"])] = pid
             kept_preps.add(pid)
         existing_tasks = {row["id"]: row for row in db.execute("""SELECT sa.*,i.itype FROM sample_analytes sa
-            LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.sample_id=?""", (sid,))}
+            LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.sample_id=%s""", (sid,))}
         kept_tasks = set()
         wanted_tasks = set()
         for task in data["tasks"]:
@@ -1274,7 +1250,7 @@ def apply_excel_plan(db, data, sid=None):
                 raise BusinessExcelError(f"同一溶样中分析项目重复：{task['prep_name']} / {task['analyte_id']}")
             wanted_tasks.add(task_key)
             old = existing_tasks.get(task.get("id")) if not creating else None
-            new_instrument = (db.execute("SELECT itype FROM instruments WHERE id=?", (task["instrument_id"],)).fetchone()
+            new_instrument = (db.execute("SELECT itype FROM instruments WHERE id=%s", (task["instrument_id"],)).fetchone()
                               if task["instrument_id"] else None)
             new_itype = new_instrument["itype"] if new_instrument else None
             if (old and old["itype"] == "xrf") or new_itype == "xrf":
@@ -1288,25 +1264,26 @@ def apply_excel_plan(db, data, sid=None):
             elif old and old["preparation_id"] == pid and old["analyte_id"] == task["analyte_id"]:
                 task_id = old["id"]
                 changed = (old["instrument_id"], old["method_id"]) != (task["instrument_id"], task["method_id"])
-                db.execute("UPDATE sample_analytes SET instrument_id=?,method_id=?,selection=? WHERE id=?",
+                db.execute("UPDATE sample_analytes SET instrument_id=%s,method_id=%s,selection=%s WHERE id=%s",
                            (task["instrument_id"], task["method_id"], task["selection"], task_id))
                 if changed:
-                    db.execute("DELETE FROM readings WHERE sample_analyte_id=?", (task_id,))
-                    db.execute("DELETE FROM results WHERE sample_analyte_id=?", (task_id,))
-                    db.execute("UPDATE sample_analytes SET status='pending' WHERE id=?", (task_id,))
+                    db.execute("DELETE FROM readings WHERE sample_analyte_id=%s", (task_id,))
+                    db.execute("DELETE FROM results WHERE sample_analyte_id=%s", (task_id,))
+                    db.execute("UPDATE sample_analytes SET status='pending' WHERE id=%s", (task_id,))
             else:
-                cur = db.execute("""INSERT INTO sample_analytes(sample_id,preparation_id,analyte_id,instrument_id,method_id,selection)
-                                  VALUES(?,?,?,?,?,?)""", (sid, pid, task["analyte_id"], task["instrument_id"], task["method_id"], task["selection"]))
-                task_id = cur.lastrowid
+                task_id = db.execute("""INSERT INTO sample_analytes(
+                    sample_id,preparation_id,analyte_id,instrument_id,method_id,selection)
+                    VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (sid, pid, task["analyte_id"], task["instrument_id"], task["method_id"], task["selection"])).fetchone()["id"]
             kept_tasks.add(task_id)
         if not creating:
             removed = set(existing_tasks) - kept_tasks
             if any(existing_tasks[task_id]["itype"] == "xrf" for task_id in removed):
                 raise BusinessExcelError("XRF仪器任务由仪器链路管理，不能通过Excel新增、删除或修改")
             for task_id in removed:
-                db.execute("DELETE FROM sample_analytes WHERE id=?", (task_id,))
+                db.execute("DELETE FROM sample_analytes WHERE id=%s", (task_id,))
             for pid in set(existing_preps) - kept_preps:
-                db.execute("DELETE FROM preparations WHERE id=?", (pid,))
+                db.execute("DELETE FROM preparations WHERE id=%s", (pid,))
         recompute_sample_progress(db, sid)
     action = "excel_plan_create" if creating else "excel_plan_overwrite"
     audit_event(db, action, "sample", sid, before=None if creating else before,
@@ -1318,7 +1295,6 @@ def _import_plan(sid=None):
     db = get_db()
     try:
         data, _ = parse_plan(uploaded_xlsx().stream, db)
-        db.execute("BEGIN IMMEDIATE")
         db.execute("SAVEPOINT business_excel_plan")
         try:
             result_id, lims_no = apply_excel_plan(db, data, sid)
@@ -1370,8 +1346,7 @@ def excel_sample_data_overwrite(sid):
     db = get_db()
     try:
         data, _ = parse_data(uploaded_xlsx().stream)
-        db.execute("BEGIN IMMEDIATE")
-        sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+        sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
         if not sample:
             raise BusinessExcelError("样品不存在")
         identity = data["identity"]
@@ -1383,13 +1358,13 @@ def excel_sample_data_overwrite(sid):
             raise BusinessExcelError("工作簿样品身份与当前样品不一致")
         if str(identity["更新标记"] or "") != str(sample["updated_at"] or ""):
             raise BusinessExcelError("样品已被他人更新，请重新导出后再上传")
-        if sample["status"] in {"registered", "received", "queued", "reviewed", "reported", "cancelled"}:
+        if sample["status"] in {"received", "queued", "reviewed", "cancelled"}:
             raise BusinessExcelError("当前样品状态不能覆盖检测数据")
         db.execute("SAVEPOINT business_excel_data")
         before = sample_audit_snapshot(db, sid)
         if sample["workflow_type"] == "special":
             result = db.execute("""SELECT sr.*,sm.schema_json FROM special_results sr JOIN special_methods sm ON sm.id=sr.method_id
-                                   WHERE sr.sample_id=?""", (sid,)).fetchone()
+                                   WHERE sr.sample_id=%s""", (sid,)).fetchone()
             if not result:
                 raise BusinessExcelError("专项方法尚未建立")
             schema = json.loads(result["schema_json"] or "{}")
@@ -1419,14 +1394,14 @@ def excel_sample_data_overwrite(sid):
                 clean[key] = value
             calculated, complete = calculate_special(schema, clean)
             status = "completed" if complete else ("in_progress" if clean else "pending")
-            db.execute("""UPDATE special_results SET raw_data=?,calculated_data=?,status=?,updated_at=datetime('now','localtime'),updated_by=?
-                          WHERE sample_id=?""", (json.dumps(clean, ensure_ascii=False), json.dumps(calculated, ensure_ascii=False),
+            db.execute("""UPDATE special_results SET raw_data=%s,calculated_data=%s,status=%s,updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),updated_by=%s
+                          WHERE sample_id=%s""", (json.dumps(clean, ensure_ascii=False), json.dumps(calculated, ensure_ascii=False),
                                                    status, g.user["id"], sid))
         else:
             grouped = {}
             for row in data["rows"]:
                 task = db.execute("""SELECT sa.*,i.itype FROM sample_analytes sa
-                    LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=? AND sa.sample_id=?""",
+                    LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=%s AND sa.sample_id=%s""",
                     (row["task_id"], sid)).fetchone()
                 if not task:
                     raise BusinessExcelError(f"任务ID {row['task_id']} 不属于当前样品")
@@ -1435,30 +1410,30 @@ def excel_sample_data_overwrite(sid):
                 grouped.setdefault(row["task_id"], []).append(row)
             for task_id, imported in grouped.items():
                 for row in imported:
-                    if row["reading_id"] and not db.execute("SELECT 1 FROM readings WHERE id=? AND sample_analyte_id=?",
+                    if row["reading_id"] and not db.execute("SELECT 1 FROM readings WHERE id=%s AND sample_analyte_id=%s",
                                                              (row["reading_id"], task_id)).fetchone():
                         raise BusinessExcelError(f"读数ID {row['reading_id']} 不属于任务 {task_id}")
-                db.execute("DELETE FROM readings WHERE sample_analyte_id=?", (task_id,))
+                db.execute("DELETE FROM readings WHERE sample_analyte_id=%s", (task_id,))
                 aux = imported[0]["aux"]
                 selection = imported[0]["selection"]
                 if any(row["aux"] != aux or row["selection"] != selection for row in imported):
                     raise BusinessExcelError(f"任务 {task_id} 各行的辅助校正或报告选择不一致")
                 has_value = any(row["raw"] not in (None, "") or row["extra"] for row in imported)
                 if has_value or aux:
-                    db.execute("""INSERT INTO results(sample_analyte_id,raw,extra,aux) VALUES(?,NULL,'{}',?)
-                        ON CONFLICT(sample_analyte_id) DO UPDATE SET raw=NULL,extra='{}',aux=excluded.aux""",
+                    db.execute("""INSERT INTO results(sample_analyte_id,aux) VALUES(%s,%s)
+                        ON CONFLICT(sample_analyte_id) DO UPDATE SET aux=excluded.aux""",
                                (task_id, json.dumps(aux, ensure_ascii=False)))
                 else:
-                    db.execute("DELETE FROM results WHERE sample_analyte_id=?", (task_id,))
-                db.execute("UPDATE sample_analytes SET selection=? WHERE id=?", (selection, task_id))
+                    db.execute("DELETE FROM results WHERE sample_analyte_id=%s", (task_id,))
+                db.execute("UPDATE sample_analytes SET selection=%s WHERE id=%s", (selection, task_id))
                 for row in imported:
                     if row["raw"] in (None, "") and not row["extra"]:
                         continue
-                    db.execute("INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final) VALUES(?,?,?,?,?)",
+                    db.execute("INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final) VALUES(%s,%s,%s,%s,%s)",
                                (task_id, row["raw"] if row["raw"] != "" else None,
                                 json.dumps(row["extra"], ensure_ascii=False), row["use_avg"], row["is_final"]))
                 recompute_task_progress(db, task_id)
-        db.execute("UPDATE samples SET updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?", (sid,))
+        db.execute("UPDATE samples SET updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s", (sid,))
         recompute_sample_progress(db, sid)
         audit_event(db, "excel_data_overwrite", "sample", sid, before=before,
                     after=sample_audit_snapshot(db, sid), reason="业务Excel数据上传")
@@ -1487,10 +1462,11 @@ def add_analyte():
     if default_unit and default_unit not in RESULT_DISPLAY_UNITS:
         return jsonify(ok=False, error="默认单位无效"), 400
     db = get_db()
-    cur = db.execute("""INSERT OR IGNORE INTO analytes(name,sort_order,default_unit)
-        VALUES(?,COALESCE((SELECT MAX(sort_order)+1 FROM analytes),1),?)""", (name, default_unit))
-    if cur.rowcount:
-        audit_event(db, "create", "analyte", cur.lastrowid,
+    created = db.execute("""INSERT INTO analytes(name,sort_order,default_unit)
+        VALUES(%s,COALESCE((SELECT MAX(sort_order)+1 FROM analytes),1),%s)
+        ON CONFLICT(name) DO NOTHING RETURNING id""", (name, default_unit)).fetchone()
+    if created:
+        audit_event(db, "create", "analyte", created["id"],
                     after={"name": name, "default_unit": default_unit})
     db.commit()
     return jsonify(ok=True)
@@ -1500,19 +1476,19 @@ def add_analyte():
 @capability_required("settings_manage")
 def del_analyte(aid):
     db = get_db()
-    before = db.execute("SELECT * FROM analytes WHERE id=?", (aid,)).fetchone()
+    before = db.execute("SELECT * FROM analytes WHERE id=%s", (aid,)).fetchone()
     if request.method == "PUT":
         if not before:
             return jsonify(ok=False, error="分析项目不存在"), 404
         default_unit = normalized_result_unit((request.json or {}).get("default_unit"))
         if default_unit and default_unit not in RESULT_DISPLAY_UNITS:
             return jsonify(ok=False, error="默认单位无效"), 400
-        db.execute("UPDATE analytes SET default_unit=? WHERE id=?", (default_unit, aid))
-        after = db.execute("SELECT * FROM analytes WHERE id=?", (aid,)).fetchone()
+        db.execute("UPDATE analytes SET default_unit=%s WHERE id=%s", (default_unit, aid))
+        after = db.execute("SELECT * FROM analytes WHERE id=%s", (aid,)).fetchone()
         audit_event(db, "update", "analyte", aid, before=before, after=after)
         db.commit()
         return jsonify(ok=True, default_unit=default_unit)
-    db.execute("DELETE FROM analytes WHERE id=?", (aid,))
+    db.execute("DELETE FROM analytes WHERE id=%s", (aid,))
     if before:
         audit_event(db, "delete", "analyte", aid, before=before)
     db.commit()
@@ -1530,10 +1506,10 @@ def add_instrument():
     if not name:
         return jsonify(ok=False, error="仪器名称不能为空"), 400
     db = get_db()
-    cur = db.execute("""INSERT INTO instruments(name,itype,sort_order)
-        VALUES(?,?,COALESCE((SELECT MAX(sort_order)+1 FROM instruments),1))""",
-                     (name, itype))
-    audit_event(db, "create", "instrument", cur.lastrowid,
+    instrument_id = db.execute("""INSERT INTO instruments(name,itype,sort_order)
+        VALUES(%s,%s,COALESCE((SELECT MAX(sort_order)+1 FROM instruments),1))
+        RETURNING id""", (name, itype)).fetchone()["id"]
+    audit_event(db, "create", "instrument", instrument_id,
                 after={"name": name, "itype": itype})
     db.commit()
     return jsonify(ok=True)
@@ -1543,8 +1519,8 @@ def add_instrument():
 @capability_required("settings_manage")
 def del_instrument(iid):
     db = get_db()
-    before = db.execute("SELECT * FROM instruments WHERE id=?", (iid,)).fetchone()
-    db.execute("DELETE FROM instruments WHERE id=?", (iid,))
+    before = db.execute("SELECT * FROM instruments WHERE id=%s", (iid,)).fetchone()
+    db.execute("DELETE FROM instruments WHERE id=%s", (iid,))
     if before:
         audit_event(db, "delete", "instrument", iid, before=before)
     db.commit()
@@ -1556,7 +1532,7 @@ def del_instrument(iid):
 def set_capabilities(iid):
     db = get_db()
     before_ids = [row[0] for row in db.execute(
-        "SELECT analyte_id FROM instr_analytes WHERE instrument_id=? ORDER BY analyte_id",
+        "SELECT analyte_id FROM instr_analytes WHERE instrument_id=%s ORDER BY analyte_id",
         (iid,))]
     existing_ids = {row[0] for row in db.execute("SELECT id FROM analytes")}
     ids = []
@@ -1567,8 +1543,8 @@ def set_capabilities(iid):
             continue
         if analyte_id in existing_ids and analyte_id not in ids:
             ids.append(analyte_id)
-    db.execute("DELETE FROM instr_analytes WHERE instrument_id=?", (iid,))
-    db.executemany("INSERT INTO instr_analytes VALUES(?,?)", [(iid, a) for a in ids])
+    db.execute("DELETE FROM instr_analytes WHERE instrument_id=%s", (iid,))
+    db.executemany("INSERT INTO instr_analytes VALUES(%s,%s)", [(iid, a) for a in ids])
     after_ids = sorted(ids)
     audit_event(db, "capabilities", "instrument", iid,
                 before={"analyte_ids": before_ids},
@@ -1595,7 +1571,7 @@ def update_order(table, ids):
     entity_type = {"instruments": "instrument", "analytes": "analyte",
                    "methods": "method"}[table]
     for position, item_id in enumerate(ordered, 1):
-        db.execute(f"UPDATE {table} SET sort_order=? WHERE id=?", (position, item_id))
+        db.execute(f"UPDATE {table} SET sort_order=%s WHERE id=%s", (position, item_id))
         audit_event(db, "reorder", entity_type, item_id,
                     before={"sort_order": before_order.get(item_id)},
                     after={"sort_order": position})
@@ -1651,18 +1627,19 @@ def add_dilution():
         if not label or factor <= 0:
             return jsonify(ok=False, error="稀释标签和倍数不能为空"), 400
     db = get_db()
-    existing = db.execute("SELECT id,active FROM dilutions WHERE label=?", (label,)).fetchone()
+    existing = db.execute("SELECT id,active FROM dilutions WHERE label=%s", (label,)).fetchone()
     if existing:
         if existing["active"]:
             return jsonify(ok=False, error=f"稀释方式 {label} 已存在"), 409
-        db.execute("UPDATE dilutions SET factor=?,active=1 WHERE id=?",
+        db.execute("UPDATE dilutions SET factor=%s,active=1 WHERE id=%s",
                    (factor, existing["id"]))
         audit_event(db, "restore", "dilution", existing["id"],
                     after={"label": label, "factor": factor, "active": 1})
         db.commit()
         return jsonify(ok=True, id=existing["id"], label=label, factor=factor, restored=True)
-    cur = db.execute("INSERT INTO dilutions(label,factor) VALUES(?,?)", (label, factor))
-    audit_event(db, "create", "dilution", cur.lastrowid,
+    dilution_id = db.execute("INSERT INTO dilutions(label,factor) VALUES(%s,%s) RETURNING id",
+                             (label, factor)).fetchone()["id"]
+    audit_event(db, "create", "dilution", dilution_id,
                 after={"label": label, "factor": factor, "active": 1})
     db.commit()
     return jsonify(ok=True, label=label, factor=factor)
@@ -1672,7 +1649,7 @@ def add_dilution():
 @capability_required("settings_manage")
 def del_dilution(did):
     db = get_db()
-    dilution = db.execute("SELECT * FROM dilutions WHERE id=?", (did,)).fetchone()
+    dilution = db.execute("SELECT * FROM dilutions WHERE id=%s", (did,)).fetchone()
     if not dilution:
         return jsonify(ok=False, error="稀释方式不存在"), 404
     prep_count = 0
@@ -1687,7 +1664,7 @@ def del_dilution(did):
         return jsonify(ok=True, hidden=True, historical_preparations=prep_count)
     if db.execute("SELECT COUNT(*) FROM dilutions WHERE active=1").fetchone()[0] <= 1:
         return jsonify(ok=False, error="至少需要保留一种可选稀释方式"), 400
-    db.execute("UPDATE dilutions SET active=0 WHERE id=?", (did,))
+    db.execute("UPDATE dilutions SET active=0 WHERE id=%s", (did,))
     audit_event(db, "disable", "dilution", did, before=dilution,
                 after={"active": 0}, reason=f"保留 {prep_count} 条历史溶样引用")
     db.commit()
@@ -1733,37 +1710,37 @@ def add_preparation_combination():
     db = get_db()
     try:
         name, config = clean_preparation_combination(db, request.json or {})
-        cur = db.execute("INSERT INTO preparation_combinations(name,config_json) VALUES(?,?)",
-                         (name, json.dumps(config)))
+        combination_id = db.execute("""INSERT INTO preparation_combinations(name,config_json)
+            VALUES(%s,%s) RETURNING id""", (name, json.dumps(config))).fetchone()["id"]
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="溶样组合名称已存在"), 409
-    audit_event(db, "create", "preparation_combination", cur.lastrowid,
-                after=db.execute("SELECT * FROM preparation_combinations WHERE id=?",
-                                 (cur.lastrowid,)).fetchone())
+    audit_event(db, "create", "preparation_combination", combination_id,
+                after=db.execute("SELECT * FROM preparation_combinations WHERE id=%s",
+                                 (combination_id,)).fetchone())
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=combination_id)
 
 
 @app.put("/api/preparation-combinations/<int:combination_id>")
 @capability_required("settings_manage")
 def update_preparation_combination(combination_id):
     db = get_db()
-    before = db.execute("SELECT * FROM preparation_combinations WHERE id=?",
+    before = db.execute("SELECT * FROM preparation_combinations WHERE id=%s",
                         (combination_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="溶样组合不存在"), 404
     try:
         name, config = clean_preparation_combination(db, request.json or {})
-        db.execute("UPDATE preparation_combinations SET name=?,config_json=? WHERE id=?",
+        db.execute("UPDATE preparation_combinations SET name=%s,config_json=%s WHERE id=%s",
                    (name, json.dumps(config), combination_id))
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     except INTEGRITY_ERRORS:
         return jsonify(ok=False, error="溶样组合名称已存在"), 409
     audit_event(db, "update", "preparation_combination", combination_id, before=before,
-                after=db.execute("SELECT * FROM preparation_combinations WHERE id=?",
+                after=db.execute("SELECT * FROM preparation_combinations WHERE id=%s",
                                  (combination_id,)).fetchone())
     db.commit()
     return jsonify(ok=True, id=combination_id)
@@ -1773,11 +1750,11 @@ def update_preparation_combination(combination_id):
 @capability_required("settings_manage")
 def delete_preparation_combination(combination_id):
     db = get_db()
-    before = db.execute("SELECT * FROM preparation_combinations WHERE id=?",
+    before = db.execute("SELECT * FROM preparation_combinations WHERE id=%s",
                         (combination_id,)).fetchone()
     if not before:
         return jsonify(ok=False, error="溶样组合不存在"), 404
-    db.execute("DELETE FROM preparation_combinations WHERE id=?", (combination_id,))
+    db.execute("DELETE FROM preparation_combinations WHERE id=%s", (combination_id,))
     audit_event(db, "delete", "preparation_combination", combination_id, before=before)
     db.commit()
     return jsonify(ok=True)
@@ -1793,31 +1770,32 @@ def add_volume_preset():
     if not math.isfinite(volume_ml) or volume_ml <= 0:
         return jsonify(ok=False, error="定容容量必须大于 0"), 400
     db = get_db()
-    existing = db.execute("SELECT id,active FROM volume_presets WHERE volume_ml=?",
+    existing = db.execute("SELECT id,active FROM volume_presets WHERE volume_ml=%s",
                           (volume_ml,)).fetchone()
     if existing:
         if existing["active"]:
             return jsonify(ok=False, error=f"定容容量 {volume_ml:g} mL 已存在"), 409
-        db.execute("UPDATE volume_presets SET active=1 WHERE id=?", (existing["id"],))
+        db.execute("UPDATE volume_presets SET active=1 WHERE id=%s", (existing["id"],))
         audit_event(db, "restore", "volume_preset", existing["id"],
                     after={"volume_ml": volume_ml, "active": 1})
         db.commit()
         return jsonify(ok=True, id=existing["id"], volume_ml=volume_ml, restored=True)
-    cur = db.execute("INSERT INTO volume_presets(volume_ml) VALUES(?)", (volume_ml,))
-    audit_event(db, "create", "volume_preset", cur.lastrowid,
+    preset_id = db.execute("INSERT INTO volume_presets(volume_ml) VALUES(%s) RETURNING id",
+                           (volume_ml,)).fetchone()["id"]
+    audit_event(db, "create", "volume_preset", preset_id,
                 after={"volume_ml": volume_ml, "active": 1})
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid, volume_ml=volume_ml)
+    return jsonify(ok=True, id=preset_id, volume_ml=volume_ml)
 
 
 @app.delete("/api/volume-presets/<int:preset_id>")
 @capability_required("settings_manage")
 def delete_volume_preset(preset_id):
     db = get_db()
-    preset = db.execute("SELECT * FROM volume_presets WHERE id=?", (preset_id,)).fetchone()
+    preset = db.execute("SELECT * FROM volume_presets WHERE id=%s", (preset_id,)).fetchone()
     if not preset:
         return jsonify(ok=False, error="定容容量选项不存在"), 404
-    historical = db.execute("SELECT COUNT(*) FROM preparations WHERE volume_ml=?",
+    historical = db.execute("SELECT COUNT(*) FROM preparations WHERE volume_ml=%s",
                             (preset["volume_ml"],)).fetchone()[0]
     if not preset["active"]:
         return jsonify(ok=True, hidden=True, historical_preparations=historical)
@@ -1825,7 +1803,7 @@ def delete_volume_preset(preset_id):
         return jsonify(ok=False, error="250 mL 是新建溶样的默认容量，不能移除"), 400
     if db.execute("SELECT COUNT(*) FROM volume_presets WHERE active=1").fetchone()[0] <= 1:
         return jsonify(ok=False, error="至少需要保留一种可选定容容量"), 400
-    db.execute("UPDATE volume_presets SET active=0 WHERE id=?", (preset_id,))
+    db.execute("UPDATE volume_presets SET active=0 WHERE id=%s", (preset_id,))
     audit_event(db, "disable", "volume_preset", preset_id, before=preset,
                 after={"active": 0}, reason=f"保留 {historical} 条历史溶样容量")
     db.commit()
@@ -1869,10 +1847,11 @@ def add_method():
     db = get_db()
     if itype == "xrf":
         f, constants, output_unit = "", {}, "%"
-    cur = db.execute("""INSERT INTO methods(name,itype,formula,constants,note,output_unit,target,sort_order)
-                      VALUES(?,?,?,?,?,?,?,COALESCE((SELECT MAX(sort_order)+1 FROM methods),1))""",
-                     (d["name"].strip(), itype, f, json.dumps(constants), note, output_unit, target))
-    audit_event(db, "create", "method", cur.lastrowid,
+    method_id = db.execute("""INSERT INTO methods(name,itype,formula,constants,note,output_unit,target,sort_order)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,COALESCE((SELECT MAX(sort_order)+1 FROM methods),1))
+        RETURNING id""",
+        (d["name"].strip(), itype, f, json.dumps(constants), note, output_unit, target)).fetchone()["id"]
+    audit_event(db, "create", "method", method_id,
                 after={"name": d["name"].strip(), "itype": itype,
                         "formula": f, "constants": constants, "output_unit": output_unit,
                         "target": target})
@@ -1884,7 +1863,7 @@ def add_method():
 @capability_required("settings_manage")
 def update_method_note(mid):
     db = get_db()
-    before = db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone()
+    before = db.execute("SELECT * FROM methods WHERE id=%s", (mid,)).fetchone()
     if not before:
         return jsonify(ok=False, error="分析方法不存在"), 404
     data = request.json or {}
@@ -1905,10 +1884,10 @@ def update_method_note(mid):
         active = 1 if int(data.get("active", before["active"])) else 0
     except (TypeError, ValueError):
         return jsonify(ok=False, error="启用状态无效"), 400
-    db.execute("UPDATE methods SET note=?,output_unit=?,active=?,target=? WHERE id=?",
+    db.execute("UPDATE methods SET note=%s,output_unit=%s,active=%s,target=%s WHERE id=%s",
                (note, output_unit, active, target, mid))
     audit_event(db, "update", "method", mid, before=before,
-                after=db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone())
+                after=db.execute("SELECT * FROM methods WHERE id=%s", (mid,)).fetchone())
     db.commit()
     return jsonify(ok=True)
 
@@ -1917,10 +1896,10 @@ def update_method_note(mid):
 @capability_required("settings_manage")
 def del_method(mid):
     db = get_db()
-    before = db.execute("SELECT * FROM methods WHERE id=?", (mid,)).fetchone()
-    if db.execute("SELECT 1 FROM sample_analytes WHERE method_id=? LIMIT 1", (mid,)).fetchone():
+    before = db.execute("SELECT * FROM methods WHERE id=%s", (mid,)).fetchone()
+    if db.execute("SELECT 1 FROM sample_analytes WHERE method_id=%s LIMIT 1", (mid,)).fetchone():
         return jsonify(ok=False, error="方法已被样品使用，请改为停用以保留历史结果"), 409
-    db.execute("DELETE FROM methods WHERE id=?", (mid,))
+    db.execute("DELETE FROM methods WHERE id=%s", (mid,))
     if before:
         audit_event(db, "delete", "method", mid, before=before)
     db.commit()
@@ -1939,17 +1918,17 @@ def add_template():
         template_tags = clean_sample_tags(d.get("tags", []))
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
-    cur = db.execute("""INSERT INTO templates(
+    template_id = db.execute("""INSERT INTO templates(
         name,category,tags_json,is_liquid,is_water_quality,dilution_id,xrf,analyte_ids,prep_config,instrument_config,
-        order_template_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        order_template_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                (d["name"].strip(), str(d.get("category", "")).strip(),
                   json.dumps(template_tags, ensure_ascii=False), is_liquid, is_water_quality, d.get("dilution_id"),
                   int(d.get("xrf", 0)), json.dumps(d.get("analyte_ids", [])),
                   json.dumps(d.get("preps", [])), json.dumps(d.get("instrument_map", {})),
-                  order_template_id))
-    audit_event(db, "create", "template", cur.lastrowid, after={"name": d["name"].strip()})
+                   order_template_id)).fetchone()["id"]
+    audit_event(db, "create", "template", template_id, after={"name": d["name"].strip()})
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid)
+    return jsonify(ok=True, id=template_id)
 
 
 @app.route("/api/templates/<int:tid>", methods=["PUT"])
@@ -1964,9 +1943,9 @@ def update_template(tid):
         template_tags = clean_sample_tags(d.get("tags", []))
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
-    before = db.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
-    cur = db.execute("""UPDATE templates SET name=?,category=?,tags_json=?,is_liquid=?,is_water_quality=?,dilution_id=?,xrf=?,
-        analyte_ids=?,prep_config=?,instrument_config=?,order_template_id=? WHERE id=?""",
+    before = db.execute("SELECT * FROM templates WHERE id=%s", (tid,)).fetchone()
+    cur = db.execute("""UPDATE templates SET name=%s,category=%s,tags_json=%s,is_liquid=%s,is_water_quality=%s,dilution_id=%s,xrf=%s,
+        analyte_ids=%s,prep_config=%s,instrument_config=%s,order_template_id=%s WHERE id=%s""",
         (d["name"].strip(), str(d.get("category", "")).strip(),
          json.dumps(template_tags, ensure_ascii=False), is_liquid, is_water_quality, d.get("dilution_id"),
          int(d.get("xrf", 0)), json.dumps(d.get("analyte_ids", [])),
@@ -1975,7 +1954,7 @@ def update_template(tid):
     if not cur.rowcount:
         return jsonify(ok=False, error="模板不存在"), 404
     audit_event(db, "update", "template", tid, before=before,
-                after=db.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone())
+                after=db.execute("SELECT * FROM templates WHERE id=%s", (tid,)).fetchone())
     db.commit()
     return jsonify(ok=True, id=tid)
 
@@ -1984,8 +1963,8 @@ def update_template(tid):
 @capability_required("settings_manage")
 def del_template(tid):
     db = get_db()
-    before = db.execute("SELECT * FROM templates WHERE id=?", (tid,)).fetchone()
-    db.execute("DELETE FROM templates WHERE id=?", (tid,))
+    before = db.execute("SELECT * FROM templates WHERE id=%s", (tid,)).fetchone()
+    db.execute("DELETE FROM templates WHERE id=%s", (tid,))
     if before:
         audit_event(db, "delete", "template", tid, before=before)
     db.commit()
@@ -2013,20 +1992,20 @@ def list_samples():
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     for tag in requested_tags:
-        conditions.append("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag=?)")
+        conditions.append("EXISTS(SELECT 1 FROM sample_tags st WHERE st.sample_id=s.id AND st.tag=%s)")
         args.append(tag)
     if query:
-        conditions.append("""(s.name LIKE ? OR s.lims_no LIKE ? OR CAST(s.id AS TEXT)=? OR EXISTS(
+        conditions.append("""(s.name LIKE %s OR s.lims_no LIKE %s OR CAST(s.id AS TEXT)=%s OR EXISTS(
             SELECT 1 FROM sample_analytes sx JOIN analytes ax ON ax.id=sx.analyte_id
-            WHERE sx.sample_id=s.id AND ax.name LIKE ?) OR EXISTS(
+            WHERE sx.sample_id=s.id AND ax.name LIKE %s) OR EXISTS(
             SELECT 1 FROM special_methods smx WHERE smx.id=s.special_method_id
-            AND (smx.name LIKE ? OR smx.instrument LIKE ?)))""")
+            AND (smx.name LIKE %s OR smx.instrument LIKE %s)))""")
         args.extend((f"%{query}%", f"%{query}%", query.lstrip("#"), f"%{query}%",
                      f"%{query}%", f"%{query}%"))
     if request.args.get("include_cancelled") != "1":
         conditions.append("COALESCE(s.status,'received')!='cancelled'")
     if requested_statuses:
-        conditions.append(f"s.status IN ({','.join('?' for _ in requested_statuses)})")
+        conditions.append(f"s.status IN ({','.join('%s' for _ in requested_statuses)})")
         args.extend(requested_statuses)
     if request.args.get("xrf") == "1":
         conditions.append("s.xrf=1 AND COALESCE(s.workflow_type,'regular')='regular'")
@@ -2044,17 +2023,17 @@ def list_samples():
     total = get_db().execute(f"SELECT COUNT(*) FROM samples s {where}", args).fetchone()[0]
     page_args = args + [limit, offset]
     data = rows(f"""SELECT s.*, sm.name AS special_method_name, sm.instrument AS special_instrument,
-                           (SELECT group_concat(name, ' ') FROM preparations
+                           (SELECT string_agg(name, ' ' ORDER BY id) FROM preparations
                             WHERE sample_id=s.id) AS prep_names,
                            (SELECT COUNT(*) FROM preparations
                             WHERE sample_id=s.id) AS prep_count,
-                           (SELECT group_concat(name, ', ') FROM (
+                           (SELECT string_agg(name, ', ' ORDER BY analyte_sort_id) FROM (
                                SELECT DISTINCT a.name, a.id AS analyte_sort_id
                                FROM sample_analytes sa JOIN analytes a ON a.id=sa.analyte_id
                                WHERE sa.sample_id=s.id ORDER BY analyte_sort_id
-                            )) AS analyte_names
+                             ) AS sample_analytes) AS analyte_names
                            FROM samples s LEFT JOIN special_methods sm ON sm.id=s.special_method_id
-                            {where} ORDER BY s.id DESC LIMIT ? OFFSET ?""", page_args)
+                            {where} ORDER BY s.id DESC LIMIT %s OFFSET %s""", page_args)
     order_keys = {}
     for sample in data:
         names = [name.strip() for name in str(sample.get("analyte_names") or "").split(",")
@@ -2085,22 +2064,21 @@ def add_sample():
         return jsonify(ok=False, error="水质样不能使用其他样流程"), 400
     if workflow_type == "special":
         special_method_id = d.get("special_method_id")
-        if not db.execute("SELECT 1 FROM special_methods WHERE id=? AND active=1",
+        if not db.execute("SELECT 1 FROM special_methods WHERE id=%s AND active=1",
                           (special_method_id,)).fetchone():
             return jsonify(ok=False, error="请选择有效的专项检测方法"), 400
         lims_no = next_lims_no(db)
-        cur = db.execute("""INSERT INTO samples(name,category,is_liquid,workflow_type,
+        sid = db.execute("""INSERT INTO samples(name,category,is_liquid,workflow_type,
             special_method_id,xrf,lims_no,status,report_order)
-            VALUES(?,?,0,'special',?,0,?,'received','[]')""",
-            (name, str(d.get("category", "")).strip(), special_method_id, lims_no))
-        sid = cur.lastrowid
+            VALUES(%s,%s,0,'special',%s,0,%s,'received','[]') RETURNING id""",
+            (name, str(d.get("category", "")).strip(), special_method_id, lims_no)).fetchone()["id"]
         try:
             replace_sample_tags(db, sid, d.get("tags", []))
         except ValueError as exc:
             db.rollback()
             return jsonify(ok=False, error=str(exc)), 400
         mark_sample_status_actor(db, sid, "received")
-        db.execute("INSERT INTO special_results(sample_id,method_id) VALUES(?,?)",
+        db.execute("INSERT INTO special_results(sample_id,method_id) VALUES(%s,%s)",
                    (sid, special_method_id))
         audit_event(db, "create", "sample", sid, after=sample_audit_snapshot(db, sid))
         db.commit()
@@ -2119,21 +2097,20 @@ def add_sample():
     xrf_enabled = int(bool(d.get("xrf", 0)))
     xrf_method_id = d.get("xrf_method_id") if xrf_enabled else None
     if xrf_enabled and not db.execute(
-            "SELECT 1 FROM methods WHERE id=? AND itype='xrf'", (xrf_method_id,)).fetchone():
+            "SELECT 1 FROM methods WHERE id=%s AND itype='xrf'", (xrf_method_id,)).fetchone():
         return jsonify(ok=False, error="请选择有效的 XRF 方法"), 400
     try:
         prepared_rows = [(p, preparation_values(db, p)) for p in d.get("preps", [])]
     except (KeyError, ValueError) as exc:
         return jsonify(ok=False, error=str(exc) or "溶样名称不能为空"), 400
     lims_no = next_lims_no(db)
-    cur = db.execute("""INSERT INTO samples(
+    sid = db.execute("""INSERT INTO samples(
         name,category,is_liquid,density_g_ml,is_water_quality,xrf,xrf_method_id,xrf_report_items,
         lims_no,status,report_order,order_template_id)
-        VALUES(?,?,?,?,?,?,?,?,?,'received',?,?)""",
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'received',%s,%s) RETURNING id""",
         (name, d.get("category", "").strip(), is_liquid, density_g_ml, is_water_quality,
          xrf_enabled, xrf_method_id, str(d.get("xrf_report_items", "")).strip(),
-         lims_no, json.dumps(d.get("report_order", [])), order_template_id))
-    sid = cur.lastrowid
+         lims_no, json.dumps(d.get("report_order", [])), order_template_id)).fetchone()["id"]
     try:
         replace_sample_tags(db, sid, d.get("tags", []))
     except ValueError as exc:
@@ -2144,17 +2121,17 @@ def add_sample():
         _sync_sample_xrf_targets(db, sid, str(d.get("xrf_report_items", "")))
     for p, values in prepared_rows:
         prep_instrument_map = p.get("instrument_map", instrument_map)
-        cur = db.execute(
-            """INSERT INTO preparations(sample_id,name,mass_g,volume_ml,dilution_id,
-                dilution_steps,dilution_factor,dilution_label) VALUES(?,?,?,?,?,?,?,?)""",
-            (sid,) + values)
-        pid = cur.lastrowid
+        pid = db.execute("""INSERT INTO preparations(sample_id,name,mass_g,volume_ml,dilution_id,
+                dilution_steps,dilution_factor,dilution_label)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (sid,) + values).fetchone()["id"]
         for a in p.get("analyte_ids", []):
             instrument_id, method_id = task_defaults(db, prep_instrument_map, a)
             db.execute(
-                """INSERT OR IGNORE INTO sample_analytes(
+                """INSERT INTO sample_analytes(
                     sample_id,preparation_id,analyte_id,instrument_id,method_id)
-                   VALUES(?,?,?,?,?)""", (sid, pid, a, instrument_id, method_id))
+                   VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                (sid, pid, a, instrument_id, method_id))
     audit_event(db, "create", "sample", sid, after=sample_audit_snapshot(db, sid))
     db.commit()
     return jsonify(ok=True, id=sid, lims_no=lims_no, status="received")
@@ -2163,23 +2140,23 @@ def add_sample():
 @app.route("/api/samples/<int:sid>", methods=["DELETE"])
 @capability_required("sample_manage")
 def del_sample(sid):
-    """兼容旧客户端：DELETE 现在执行可追溯的业务作废，不物理删除。"""
+    """Cancel a sample while preserving its auditable business record."""
     db = get_db()
-    before = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    before = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not before:
         return jsonify(ok=False, error="样品不存在"), 404
     if before["status"] == "cancelled":
         return jsonify(ok=True, cancelled=True)
-    if before["status"] in {"reviewed", "reported"}:
+    if before["status"] == "reviewed":
         return jsonify(ok=False, error="已审核样品不能作废；如需修改请先执行特权审核退回"), 409
-    reason = str((request.json or {}).get("reason", "旧版删除操作")).strip()
-    db.execute("""UPDATE samples SET status='cancelled',cancelled_at=datetime('now','localtime'),
-        cancelled_by=?,cancel_reason=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+    reason = str((request.json or {}).get("reason", "用户作废样品")).strip()
+    db.execute("""UPDATE samples SET status='cancelled',cancelled_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),
+        cancelled_by=%s,cancel_reason=%s,updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
         (g.user["id"], reason, sid))
     mark_sample_status_actor(db, sid, "cancelled")
-    db.execute("UPDATE sample_analytes SET status='cancelled' WHERE sample_id=?", (sid,))
-    db.execute("UPDATE special_results SET status='cancelled' WHERE sample_id=?", (sid,))
-    after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    db.execute("UPDATE sample_analytes SET status='cancelled' WHERE sample_id=%s", (sid,))
+    db.execute("UPDATE special_results SET status='cancelled' WHERE sample_id=%s", (sid,))
+    after = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     audit_event(db, "cancel", "sample", sid, before=before, after=after, reason=reason)
     db.commit()
     return jsonify(ok=True, cancelled=True)
@@ -2191,11 +2168,11 @@ def update_sample_status(sid):
     target = data.get("status")
     reason = str(data.get("reason", "")).strip()
     db = get_db()
-    before = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    before = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not before:
         return jsonify(ok=False, error="样品不存在"), 404
     permissions = user_permissions(g.user)
-    privileged_rollback = before["status"] in {"reviewed", "reported"} and target == "completed"
+    privileged_rollback = before["status"] == "reviewed" and target == "completed"
     privileged_actor = None
     if privileged_rollback:
         if "result_override" not in permissions:
@@ -2212,37 +2189,37 @@ def update_sample_status(sid):
         return jsonify(ok=False, error="当前状态或用户能力不允许执行此转换"), 400
     if target in {"completed", "reviewed"}:
         if before["workflow_type"] == "special":
-            result = db.execute("SELECT status FROM special_results WHERE sample_id=?", (sid,)).fetchone()
+            result = db.execute("SELECT status FROM special_results WHERE sample_id=%s", (sid,)).fetchone()
             incomplete = 0 if result and result["status"] == "completed" else 1
         else:
             incomplete = db.execute("""SELECT COUNT(*) FROM sample_analytes sa
                 LEFT JOIN instruments i ON i.id=sa.instrument_id
-                WHERE sa.sample_id=? AND sa.status!='completed' AND COALESCE(i.itype,'')!='xrf'""",
+                WHERE sa.sample_id=%s AND sa.status!='completed' AND COALESCE(i.itype,'')!='xrf'""",
                 (sid,)).fetchone()[0]
             if before["xrf"] and not db.execute(
-                    "SELECT 1 FROM xrf_analyses WHERE sample_id=? LIMIT 1", (sid,)).fetchone():
+                    "SELECT 1 FROM xrf_analyses WHERE sample_id=%s LIMIT 1", (sid,)).fetchone():
                 incomplete += 1
         if incomplete:
             return jsonify(ok=False, error=f"还有 {incomplete} 个分析任务未完成，不能完成或审核"), 409
     if target == "cancelled" and not reason:
         return jsonify(ok=False, error="作废样品必须填写原因"), 400
     if target == "cancelled":
-        db.execute("""UPDATE samples SET status=?,cancelled_at=datetime('now','localtime'),
-            cancelled_by=?,cancel_reason=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+        db.execute("""UPDATE samples SET status=%s,cancelled_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),
+            cancelled_by=%s,cancel_reason=%s,updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
             (target, g.user["id"], reason, sid))
-        db.execute("UPDATE sample_analytes SET status='cancelled' WHERE sample_id=?", (sid,))
-        db.execute("UPDATE special_results SET status='cancelled' WHERE sample_id=?", (sid,))
+        db.execute("UPDATE sample_analytes SET status='cancelled' WHERE sample_id=%s", (sid,))
+        db.execute("UPDATE special_results SET status='cancelled' WHERE sample_id=%s", (sid,))
     else:
-        db.execute("UPDATE samples SET status=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?",
+        db.execute("UPDATE samples SET status=%s,updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s",
                    (target, sid))
     if target == "measuring" and not before["analyst"]:
-        db.execute("UPDATE samples SET analyst=? WHERE id=?", (current_actor_name(), sid))
+        db.execute("UPDATE samples SET analyst=%s WHERE id=%s", (current_actor_name(), sid))
     if target == "reviewed":
-        db.execute("UPDATE samples SET reviewer=? WHERE id=?", (current_actor_name(), sid))
+        db.execute("UPDATE samples SET reviewer=%s WHERE id=%s", (current_actor_name(), sid))
     elif target == "completed" and privileged_rollback:
-        db.execute("UPDATE samples SET reviewer='' WHERE id=?", (sid,))
+        db.execute("UPDATE samples SET reviewer='' WHERE id=%s", (sid,))
     mark_sample_status_actor(db, sid, target, privileged_actor)
-    after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    after = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     audit_event(db, "status_change", "sample", sid, before=before, after=after,
                 reason=reason, user=privileged_actor)
     db.commit()
@@ -2252,7 +2229,7 @@ def update_sample_status(sid):
 @app.route("/api/samples/<int:sid>")
 def sample_detail(sid):
     db = get_db()
-    sample_row = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample_row = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample_row:
         return jsonify(ok=False, error="样品不存在"), 404
     sample = dict(sample_row)
@@ -2261,7 +2238,7 @@ def sample_detail(sid):
     if sample["workflow_type"] == "special":
         special = db.execute("""SELECT sr.*,sm.code,sm.name AS method_name,
             sm.instrument,sm.schema_json FROM special_results sr
-            JOIN special_methods sm ON sm.id=sr.method_id WHERE sr.sample_id=?""", (sid,)).fetchone()
+            JOIN special_methods sm ON sm.id=sr.method_id WHERE sr.sample_id=%s""", (sid,)).fetchone()
         special_data = dict(special) if special else None
         if special_data:
             special_data["schema"] = json.loads(special_data.pop("schema_json") or "{}")
@@ -2269,7 +2246,7 @@ def sample_detail(sid):
             special_data["calculated_data"] = json.loads(special_data["calculated_data"] or "{}")
         return jsonify({"sample": sample, "preps": [], "items": [], "special": special_data})
     preps = rows("""SELECT p.*,p.dilution_factor AS factor
-                    FROM preparations p WHERE p.sample_id=? ORDER BY p.id""", (sid,))
+                    FROM preparations p WHERE p.sample_id=%s ORDER BY p.id""", (sid,))
     for prep in preps:
         prep["dilution_ids"] = json.loads(prep.get("dilution_steps") or "[]")
     items = rows("""SELECT sa.*, a.name AS analyte,
@@ -2278,7 +2255,7 @@ def sample_detail(sid):
                            i.sort_order AS instrument_sort_order,
                            m.name AS method_name, m.formula, m.note AS method_note,
                             m.constants AS method_constants, m.output_unit AS method_output_unit,
-                            r.raw, r.extra, r.aux,
+                            r.aux,
                            p.name AS prep_name, p.mass_g AS prep_mass,
                            p.volume_ml AS prep_vol, p.dilution_factor AS prep_factor,
                            p.dilution_label AS prep_dilution
@@ -2288,10 +2265,10 @@ def sample_detail(sid):
                     LEFT JOIN methods m ON m.id=sa.method_id
                     LEFT JOIN results r ON r.sample_analyte_id=sa.id
                     LEFT JOIN preparations p ON p.id=sa.preparation_id
-                    WHERE sa.sample_id=? ORDER BY sa.id""", (sid,))
+                    WHERE sa.sample_id=%s ORDER BY sa.id""", (sid,))
     reads = rows("""SELECT rd.* FROM readings rd
                     JOIN sample_analytes sa ON sa.id=rd.sample_analyte_id
-                    WHERE sa.sample_id=? ORDER BY rd.id""", (sid,))
+                    WHERE sa.sample_id=%s ORDER BY rd.id""", (sid,))
     by_task = {}
     for rd in reads:
         rd["version"] = reading_version(rd)
@@ -2309,10 +2286,10 @@ def sample_detail(sid):
 @capability_required("report_edit")
 def set_sample_report_order(sid):
     db = get_db()
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="样品不存在"), 404
-    if sample["status"] in {"reported", "cancelled"}:
+    if sample["status"] == "cancelled":
         return jsonify(ok=False, error="已作废的样品不能调整元素顺序"), 409
     requested = (request.json or {}).get("analyte_ids", [])
     has_template = "order_template_id" in (request.json or {})
@@ -2323,7 +2300,7 @@ def set_sample_report_order(sid):
     except ValueError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     available = {row[0] for row in db.execute(
-        "SELECT DISTINCT analyte_id FROM sample_analytes WHERE sample_id=?", (sid,))}
+        "SELECT DISTINCT analyte_id FROM sample_analytes WHERE sample_id=%s", (sid,))}
     ordered = []
     for item in requested:
         try:
@@ -2334,8 +2311,8 @@ def set_sample_report_order(sid):
             ordered.append(aid)
     before = {"report_order": sample["report_order"],
               "order_template_id": sample["order_template_id"]}
-    db.execute("""UPDATE samples SET report_order=?,order_template_id=?,
-        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+    db.execute("""UPDATE samples SET report_order=%s,order_template_id=%s,
+        updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
                (json.dumps(ordered), order_template_id, sid))
     audit_event(db, "report_order", "sample", sid,
                 before=before, after={"report_order": ordered,
@@ -2357,10 +2334,10 @@ def _report_print_excludes(sample):
 def set_report_print(sid):
     """报告编排：只控制某元素是否打印，不改变任何检测结果。"""
     db = get_db()
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="样品不存在"), 404
-    if sample["status"] in {"reported", "cancelled"}:
+    if sample["status"] == "cancelled":
         return jsonify(ok=False, error="已作废的样品不能调整打印内容"), 409
     requested = (request.json or {}).get("excludes", [])
     if not isinstance(requested, list) or len(requested) > 500:
@@ -2373,7 +2350,7 @@ def set_report_print(sid):
             if text not in excludes:
                 excludes.append(text)
     before = sample["report_excludes"]
-    db.execute("UPDATE samples SET report_excludes=?,updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?",
+    db.execute("UPDATE samples SET report_excludes=%s,updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s",
                (json.dumps(excludes, ensure_ascii=False), sid))
     audit_event(db, "report_print", "sample", sid,
                 before={"report_excludes": before}, after={"report_excludes": excludes})
@@ -2385,10 +2362,10 @@ def set_report_print(sid):
 @capability_required("report_edit")
 def set_result_unit(sid):
     db = get_db()
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="样品不存在"), 404
-    if sample["status"] in {"reported", "cancelled"}:
+    if sample["status"] == "cancelled":
         return jsonify(ok=False, error="已出报告或已作废的样品不能修改结果单位"), 409
     data = request.json or {}
     key = str(data.get("key", "")).strip()
@@ -2410,8 +2387,8 @@ def set_result_unit(sid):
         current = {}
     before = dict(current)
     current[key] = unit
-    db.execute("""UPDATE samples SET result_units=?,
-        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+    db.execute("""UPDATE samples SET result_units=%s,
+        updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
                (json.dumps(current, ensure_ascii=False), sid))
     audit_event(db, "result_unit", "sample", sid,
                 before={"result_units": before}, after={"result_units": current})
@@ -2428,14 +2405,13 @@ def update_sample(sid):
     if not name:
         return jsonify(ok=False, error="来样序号不能为空"), 400
     db = get_db()
-    begin_mutation(db)
-    before_row = locked_row(db, "SELECT * FROM samples WHERE id=?", (sid,))
+    before_row = locked_row(db, "SELECT * FROM samples WHERE id=%s", (sid,))
     if not before_row:
         return jsonify(ok=False, error="样品不存在"), 404
     if "expected_updated_at" in d and d["expected_updated_at"] != before_row["updated_at"]:
         db.rollback()
         return jsonify(ok=False, code="version_conflict", error="Sample changed; reload before saving"), 409
-    if before_row["status"] in {"reviewed", "reported", "cancelled"}:
+    if before_row["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="已审核、已出报告或已作废的样品不能直接修改"), 409
     before = sample_audit_snapshot(db, sid)
     requested_workflow = "special" if d.get("workflow_type") == "special" else "regular"
@@ -2445,11 +2421,11 @@ def update_sample(sid):
         if before_row["workflow_type"] != requested_workflow:
             return jsonify(ok=False, error="常规样和专项样不能相互转换，请新建样品"), 409
         special_method_id = d.get("special_method_id")
-        method = db.execute("SELECT * FROM special_methods WHERE id=? AND active=1",
+        method = db.execute("SELECT * FROM special_methods WHERE id=%s AND active=1",
                             (special_method_id,)).fetchone()
         if not method:
             return jsonify(ok=False, error="请选择有效的专项检测方法"), 400
-        result = db.execute("SELECT * FROM special_results WHERE sample_id=?", (sid,)).fetchone()
+        result = db.execute("SELECT * FROM special_results WHERE sample_id=%s", (sid,)).fetchone()
         if result and result["method_id"] != special_method_id and json.loads(result["raw_data"] or "{}"):
             return jsonify(ok=False, error="已有专项数据，不能直接更换方法；请新建样品"), 409
         if "tags" in d:
@@ -2457,14 +2433,14 @@ def update_sample(sid):
                 replace_sample_tags(db, sid, d.get("tags"))
             except ValueError as exc:
                 return jsonify(ok=False, error=str(exc)), 400
-        db.execute("""UPDATE samples SET name=?,category=?,special_method_id=?,
-            updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+        db.execute("""UPDATE samples SET name=%s,category=%s,special_method_id=%s,
+            updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
             (name, str(d.get("category", "")).strip(), special_method_id, sid))
-        db.execute("""INSERT INTO special_results(sample_id,method_id) VALUES(?,?)
+        db.execute("""INSERT INTO special_results(sample_id,method_id) VALUES(%s,%s)
             ON CONFLICT(sample_id) DO UPDATE SET method_id=excluded.method_id""",
             (sid, special_method_id))
         updated_at = next_updated_at(before_row["updated_at"])
-        db.execute("UPDATE samples SET updated_at=? WHERE id=?", (updated_at, sid))
+        db.execute("UPDATE samples SET updated_at=%s WHERE id=%s", (updated_at, sid))
         audit_event(db, "update", "sample", sid, before=before,
                     after=sample_audit_snapshot(db, sid))
         db.commit()
@@ -2484,7 +2460,7 @@ def update_sample(sid):
     xrf_enabled = int(bool(d.get("xrf", 0)))
     xrf_method_id = d.get("xrf_method_id") if xrf_enabled else None
     if xrf_enabled and not db.execute(
-            "SELECT 1 FROM methods WHERE id=? AND itype='xrf'", (xrf_method_id,)).fetchone():
+            "SELECT 1 FROM methods WHERE id=%s AND itype='xrf'", (xrf_method_id,)).fetchone():
         return jsonify(ok=False, error="请选择有效的 XRF 方法"), 400
 
     report_order = d.get("report_order")
@@ -2500,10 +2476,10 @@ def update_sample(sid):
     except (KeyError, ValueError) as exc:
         return jsonify(ok=False, error=str(exc) or "溶样名称不能为空"), 400
     report_order_json = None if report_order is None else json.dumps(report_order)
-    db.execute("""UPDATE samples SET name=?,category=?,is_liquid=?,density_g_ml=?,is_water_quality=?,xrf=?,
-                   xrf_method_id=?,xrf_report_items=?,
-                   report_order=COALESCE(?,report_order),order_template_id=?,
-             updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+    db.execute("""UPDATE samples SET name=%s,category=%s,is_liquid=%s,density_g_ml=%s,is_water_quality=%s,xrf=%s,
+                   xrf_method_id=%s,xrf_report_items=%s,
+                   report_order=COALESCE(%s,report_order),order_template_id=%s,
+             updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
                (name, d.get("category", "").strip(), is_liquid, density_g_ml, is_water_quality,
                   xrf_enabled, xrf_method_id, str(d.get("xrf_report_items", "")).strip(),
                   report_order_json, order_template_id, sid))
@@ -2511,7 +2487,7 @@ def update_sample(sid):
         replace_sample_tags(db, sid, requested_tags)
     _sync_sample_xrf_targets(db, sid, str(d.get("xrf_report_items", "")))
     existing_pids = {r[0] for r in db.execute(
-        "SELECT id FROM preparations WHERE sample_id=?", (sid,))}
+        "SELECT id FROM preparations WHERE sample_id=%s", (sid,))}
     kept_pids = set()
 
     for p, values in prepared_rows:
@@ -2519,45 +2495,42 @@ def update_sample(sid):
         has_prep_instrument_map = "instrument_map" in p
         pid = p.get("id")
         if pid in existing_pids:
-            db.execute("""UPDATE preparations SET name=?,mass_g=?,volume_ml=?,dilution_id=?,
-                       dilution_steps=?,dilution_factor=?,dilution_label=?
-                       WHERE id=? AND sample_id=?""", values + (pid, sid))
+            db.execute("""UPDATE preparations SET name=%s,mass_g=%s,volume_ml=%s,dilution_id=%s,
+                       dilution_steps=%s,dilution_factor=%s,dilution_label=%s
+                       WHERE id=%s AND sample_id=%s""", values + (pid, sid))
         else:
-            cur = db.execute(
-                """INSERT INTO preparations(sample_id,name,mass_g,volume_ml,dilution_id,
-                    dilution_steps,dilution_factor,dilution_label) VALUES(?,?,?,?,?,?,?,?)""",
-                (sid,) + values)
-            pid = cur.lastrowid
+            pid = db.execute("""INSERT INTO preparations(sample_id,name,mass_g,volume_ml,dilution_id,
+                    dilution_steps,dilution_factor,dilution_label)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (sid,) + values).fetchone()["id"]
         kept_pids.add(pid)
         wanted = {int(a) for a in p.get("analyte_ids", [])}
         current = {r["analyte_id"]: r for r in db.execute(
             """SELECT analyte_id,id,instrument_id,method_id FROM sample_analytes
-               WHERE sample_id=? AND preparation_id=?""", (sid, pid))}
+               WHERE sample_id=%s AND preparation_id=%s""", (sid, pid))}
         for aid, task in current.items():
             if aid not in wanted:
-                db.execute("DELETE FROM sample_analytes WHERE id=?", (task["id"],))
+                db.execute("DELETE FROM sample_analytes WHERE id=%s", (task["id"],))
             elif has_prep_instrument_map or str(aid) in instrument_map:
                 instrument_id, method_id = task_defaults(db, prep_instrument_map, aid)
                 if (task["instrument_id"], task["method_id"]) != (instrument_id, method_id):
-                    db.execute("""UPDATE sample_analytes SET instrument_id=?,method_id=?,
-                        status='pending' WHERE id=?""", (instrument_id, method_id, task["id"]))
-                    db.execute("DELETE FROM results WHERE sample_analyte_id=?", (task["id"],))
-                    db.execute("DELETE FROM readings WHERE sample_analyte_id=?", (task["id"],))
+                    db.execute("""UPDATE sample_analytes SET instrument_id=%s,method_id=%s,
+                        status='pending' WHERE id=%s""", (instrument_id, method_id, task["id"]))
+                    db.execute("DELETE FROM results WHERE sample_analyte_id=%s", (task["id"],))
+                    db.execute("DELETE FROM readings WHERE sample_analyte_id=%s", (task["id"],))
         for aid in wanted - set(current):
             instrument_id, method_id = task_defaults(db, prep_instrument_map, aid)
-            db.execute("""INSERT OR IGNORE INTO sample_analytes(
+            db.execute("""INSERT INTO sample_analytes(
                 sample_id,preparation_id,analyte_id,instrument_id,method_id)
-                VALUES(?,?,?,?,?)""", (sid, pid, aid, instrument_id, method_id))
+                VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                (sid, pid, aid, instrument_id, method_id))
 
     for pid in existing_pids - kept_pids:
-        # 兼容早期迁移库：旧 preparation_id 外键没有 ON DELETE CASCADE。
-        db.execute("DELETE FROM sample_analytes WHERE sample_id=? AND preparation_id=?",
-                   (sid, pid))
-        db.execute("DELETE FROM preparations WHERE id=?", (pid,))
+        db.execute("DELETE FROM preparations WHERE id=%s", (pid,))
 
     recompute_sample_progress(db, sid)
-    db.execute("UPDATE samples SET updated_at=? WHERE id=?", (next_updated_at(before_row["updated_at"]), sid))
-    after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    db.execute("UPDATE samples SET updated_at=%s WHERE id=%s", (next_updated_at(before_row["updated_at"]), sid))
+    after = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     audit_event(db, "update", "sample", sid, before=before,
                 after=sample_audit_snapshot(db, sid))
     db.commit()
@@ -2571,28 +2544,27 @@ def update_report_meta(sid):
     """保存可编辑票面信息；审核人只能由审核动作写入。"""
     d = request.json or {}
     db = get_db()
-    begin_mutation(db)
-    before = locked_row(db, "SELECT * FROM samples WHERE id=?", (sid,))
+    before = locked_row(db, "SELECT * FROM samples WHERE id=%s", (sid,))
     if not before:
         return jsonify(ok=False, error="样品不存在"), 404
     if "expected_updated_at" in d and d["expected_updated_at"] != before["updated_at"]:
         db.rollback()
         return jsonify(ok=False, code="version_conflict", error="Sample changed; reload before saving"), 409
-    if before["status"] in {"reported", "cancelled"}:
+    if before["status"] == "cancelled":
         return jsonify(ok=False, error="已作废的样品不能修改票面信息"), 409
     profile_id = d.get("report_profile_id")
     try:
         profile_id = int(profile_id) if profile_id not in (None, "") else None
     except (TypeError, ValueError):
         return jsonify(ok=False, error="报告版式无效"), 400
-    if profile_id and not db.execute("SELECT 1 FROM report_profiles WHERE id=?", (profile_id,)).fetchone():
+    if profile_id and not db.execute("SELECT 1 FROM report_profiles WHERE id=%s", (profile_id,)).fetchone():
         return jsonify(ok=False, error="报告版式不存在"), 400
     fields = ("customer", "report_no", "analysis_date", "analyst")
     values = [str(d.get(field, "")).strip() for field in fields]
-    db.execute("""UPDATE samples SET customer=?,report_no=?,analysis_date=?,
-                  analyst=?,report_profile_id=?,updated_at=? WHERE id=?""",
+    db.execute("""UPDATE samples SET customer=%s,report_no=%s,analysis_date=%s,
+                  analyst=%s,report_profile_id=%s,updated_at=%s WHERE id=%s""",
                values + [profile_id, next_updated_at(before["updated_at"]), sid])
-    after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    after = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     audit_event(db, "report_meta", "sample", sid, before=before, after=after)
     db.commit()
     return jsonify(ok=True, updated_at=after["updated_at"])
@@ -2604,55 +2576,52 @@ def save_result():
     d = request.json or {}
     db = get_db()
     said = d.get("sample_analyte_id")
-    begin_mutation(db)
     lock_reading_task(db, said)
     task = db.execute("""SELECT sa.*,s.status AS sample_status,s.updated_at AS sample_updated_at,i.itype FROM sample_analytes sa
         JOIN samples s ON s.id=sa.sample_id
-        LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=?""", (said,)).fetchone()
+        LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=%s""", (said,)).fetchone()
     if not task:
         return jsonify(ok=False, error="分析任务不存在"), 404
     if "expected_updated_at" in d and d["expected_updated_at"] != task["sample_updated_at"]:
         db.rollback()
         return jsonify(ok=False, code="version_conflict", error="Sample changed; reload before saving"), 409
-    if task["sample_status"] in {"registered", "received", "queued"} and task["itype"] != "xrf":
+    if task["sample_status"] in {"received", "queued"} and task["itype"] != "xrf":
         return jsonify(ok=False, error="请先完成制样并开始测量"), 409
-    if task["sample_status"] in {"reviewed", "reported", "cancelled"}:
+    if task["sample_status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="该样品已锁定，不能修改结果"), 409
-    before_task = db.execute("SELECT * FROM sample_analytes WHERE id=?", (said,)).fetchone()
+    before_task = db.execute("SELECT * FROM sample_analytes WHERE id=%s", (said,)).fetchone()
     before = {"task": dict(before_task), "result": dict(db.execute(
-        "SELECT * FROM results WHERE sample_analyte_id=?", (said,)).fetchone() or {})}
+        "SELECT * FROM results WHERE sample_analyte_id=%s", (said,)).fetchone() or {})}
     if "selection" in d:
-        db.execute("UPDATE sample_analytes SET selection=? WHERE id=?",
+        db.execute("UPDATE sample_analytes SET selection=%s WHERE id=%s",
                    (d["selection"], said))
     if "instrument_id" in d:            # 换仪器：原数据作废
-        db.execute("UPDATE sample_analytes SET instrument_id=?,method_id=NULL,selection=NULL WHERE id=?",
+        db.execute("UPDATE sample_analytes SET instrument_id=%s,method_id=NULL,selection=NULL WHERE id=%s",
                    (d["instrument_id"], said))
-        db.execute("DELETE FROM results WHERE sample_analyte_id=?", (said,))
+        db.execute("DELETE FROM results WHERE sample_analyte_id=%s", (said,))
     if "method_id" in d:
-        db.execute("UPDATE sample_analytes SET method_id=? WHERE id=?",
+        db.execute("UPDATE sample_analytes SET method_id=%s WHERE id=%s",
                    (d["method_id"], said))
-        db.execute("DELETE FROM results WHERE sample_analyte_id=?", (said,))
-    if "raw" in d or "extra" in d or "aux" in d:
+        db.execute("DELETE FROM results WHERE sample_analyte_id=%s", (said,))
+    if "raw" in d or "extra" in d:
+        return jsonify(ok=False, error="原始值必须通过读数接口保存"), 400
+    if "aux" in d:
         existing = db.execute(
-            "SELECT raw,extra,aux FROM results WHERE sample_analyte_id=?", (said,)
+            "SELECT aux FROM results WHERE sample_analyte_id=%s", (said,)
         ).fetchone()
-        raw = d["raw"] if "raw" in d else (existing["raw"] if existing else None)
-        extra = d.get("extra")
-        if extra is None and existing:
-            extra = json.loads(existing["extra"] or "{}")
         aux = d.get("aux")
         if aux is None and existing:
             aux = json.loads(existing["aux"] or "{}")
         db.execute(
-            """INSERT INTO results(sample_analyte_id,raw,extra,aux) VALUES(?,?,?,?)
+            """INSERT INTO results(sample_analyte_id,aux) VALUES(%s,%s)
                ON CONFLICT(sample_analyte_id) DO UPDATE
-               SET raw=excluded.raw, extra=excluded.extra, aux=excluded.aux""",
-            (said, raw, json.dumps(extra or {}), json.dumps(aux or {})))
+               SET aux=excluded.aux""",
+            (said, json.dumps(aux or {})))
     recompute_task_progress(db, said)
     updated_at = next_updated_at(task["sample_updated_at"])
-    db.execute("UPDATE samples SET updated_at=? WHERE id=?", (updated_at, task["sample_id"]))
-    after = {"task": dict(db.execute("SELECT * FROM sample_analytes WHERE id=?", (said,)).fetchone()),
-             "result": dict(db.execute("SELECT * FROM results WHERE sample_analyte_id=?",
+    db.execute("UPDATE samples SET updated_at=%s WHERE id=%s", (updated_at, task["sample_id"]))
+    after = {"task": dict(db.execute("SELECT * FROM sample_analytes WHERE id=%s", (said,)).fetchone()),
+             "result": dict(db.execute("SELECT * FROM results WHERE sample_analyte_id=%s",
                                        (said,)).fetchone() or {})}
     audit_event(db, "result_update", "sample_analyte", said, before=before, after=after)
     db.commit()
@@ -2665,16 +2634,16 @@ def set_report_use(said):
     """选择同一元素的某条仪器/溶样结果是否参与最终报告汇总。"""
     db = get_db()
     task = db.execute("""SELECT sa.*,s.status AS sample_status FROM sample_analytes sa
-        JOIN samples s ON s.id=sa.sample_id WHERE sa.id=?""", (said,)).fetchone()
+        JOIN samples s ON s.id=sa.sample_id WHERE sa.id=%s""", (said,)).fetchone()
     if not task:
         return jsonify(ok=False, error="分析任务不存在"), 404
-    if task["sample_status"] in {"reviewed", "reported", "cancelled"}:
+    if task["sample_status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="已审核或已作废，不能改变结果参与计算状态"), 409
     use = bool((request.json or {}).get("use", True))
     before = dict(task)
-    db.execute("UPDATE sample_analytes SET selection=? WHERE id=?",
+    db.execute("UPDATE sample_analytes SET selection=%s WHERE id=%s",
                (None if use else "exclude", said))
-    after = db.execute("SELECT * FROM sample_analytes WHERE id=?", (said,)).fetchone()
+    after = db.execute("SELECT * FROM sample_analytes WHERE id=%s", (said,)).fetchone()
     audit_event(db, "report_use", "sample_analyte", said, before=before, after=after)
     db.commit()
     return jsonify(ok=True, use=use)
@@ -2709,13 +2678,12 @@ def add_reading():
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         return jsonify(ok=False, error=str(exc)), 400
     db = get_db()
-    begin_mutation(db)
     if client_key:
         # The unique key reservation and the reading/audit commit together. Keep
         # this record without a cascading FK so deleted readings cannot reappear.
         inserted = db.execute("""INSERT INTO reading_create_requests(client_reading_id,payload_hash)
-            VALUES(?,?) ON CONFLICT(client_reading_id) DO NOTHING""", (client_key, payload_hash)).rowcount
-        saved = locked_row(db, "SELECT * FROM reading_create_requests WHERE client_reading_id=?", (client_key,))
+            VALUES(%s,%s) ON CONFLICT(client_reading_id) DO NOTHING""", (client_key, payload_hash)).rowcount
+        saved = locked_row(db, "SELECT * FROM reading_create_requests WHERE client_reading_id=%s", (client_key,))
         if not inserted:
             if saved["payload_hash"] != payload_hash:
                 db.rollback()
@@ -2731,30 +2699,31 @@ def add_reading():
     lock_reading_task(db, said)
     task = db.execute("""SELECT sa.sample_id,s.status,s.updated_at,i.itype FROM sample_analytes sa
         JOIN samples s ON s.id=sa.sample_id
-        LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=?""", (said,)).fetchone()
+        LEFT JOIN instruments i ON i.id=sa.instrument_id WHERE sa.id=%s""", (said,)).fetchone()
     if not task:
         return jsonify(ok=False, error="分析任务不存在"), 404
-    if task["status"] in {"registered", "received", "queued"} and task["itype"] != "xrf":
+    if task["status"] in {"received", "queued"} and task["itype"] != "xrf":
         return jsonify(ok=False, error="请先完成制样并开始测量"), 409
-    if task["status"] in {"reviewed", "reported", "cancelled"}:
+    if task["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="该样品已锁定，不能增加读数"), 409
     if payload["is_final"]:
-        db.execute("UPDATE readings SET is_final=0 WHERE sample_analyte_id=?", (said,))
-    cur = db.execute("""INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final)
-        VALUES(?,?,?,?,?)""", (said, payload["raw"], json.dumps(extra, sort_keys=True),
-                              payload["use_avg"], payload["is_final"]))
-    created = db.execute("SELECT * FROM readings WHERE id=?", (cur.lastrowid,)).fetchone()
+        db.execute("UPDATE readings SET is_final=0 WHERE sample_analyte_id=%s", (said,))
+    created = db.execute("""INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final)
+        VALUES(%s,%s,%s,%s,%s) RETURNING *""",
+        (said, payload["raw"], json.dumps(extra, sort_keys=True),
+         payload["use_avg"], payload["is_final"])).fetchone()
+    reading_id = created["id"]
     version = reading_version(created)
     if client_key:
-        db.execute("UPDATE reading_create_requests SET reading_id=?,version=? WHERE client_reading_id=?",
-                   (cur.lastrowid, version, client_key))
+        db.execute("UPDATE reading_create_requests SET reading_id=%s,version=%s WHERE client_reading_id=%s",
+                   (reading_id, version, client_key))
     recompute_task_progress(db, said)
-    db.execute("UPDATE samples SET updated_at=? WHERE id=?",
+    db.execute("UPDATE samples SET updated_at=%s WHERE id=%s",
                (next_updated_at(task["updated_at"]), task["sample_id"]))
-    audit_event(db, "create", "reading", cur.lastrowid,
+    audit_event(db, "create", "reading", reading_id,
                 after=created)
     db.commit()
-    return jsonify(ok=True, id=cur.lastrowid, version=version, replayed=False)
+    return jsonify(ok=True, id=reading_id, version=version, replayed=False)
 
 
 @app.route("/api/readings/<int:rid>", methods=["PUT"])
@@ -2762,7 +2731,6 @@ def add_reading():
 def update_reading(rid):
     d = request.json or {}
     db = get_db()
-    begin_mutation(db)
     row = lock_reading(db, rid)
     if "expected_version" in d and (not row or d["expected_version"] != reading_version(row)):
         db.rollback()
@@ -2771,29 +2739,29 @@ def update_reading(rid):
         return jsonify(ok=False, error="读数不存在"), 404
     sample = db.execute("""SELECT s.id,s.status,s.updated_at,i.itype FROM samples s JOIN sample_analytes sa
         ON sa.sample_id=s.id LEFT JOIN instruments i ON i.id=sa.instrument_id
-        WHERE sa.id=?""", (row["sample_analyte_id"],)).fetchone()
-    if sample["status"] in {"registered", "received", "queued"} and sample["itype"] != "xrf":
+        WHERE sa.id=%s""", (row["sample_analyte_id"],)).fetchone()
+    if sample["status"] in {"received", "queued"} and sample["itype"] != "xrf":
         return jsonify(ok=False, error="请先完成制样并开始测量"), 409
-    if sample["status"] in {"reviewed", "reported", "cancelled"}:
+    if sample["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="该样品已锁定，不能修改读数"), 409
     if d.get("is_final"):     # 同一任务只允许一个终值读数
-        db.execute("UPDATE readings SET is_final=0 WHERE sample_analyte_id=?",
+        db.execute("UPDATE readings SET is_final=0 WHERE sample_analyte_id=%s",
                    (row["sample_analyte_id"],))
     if "raw" in d:
-        db.execute("UPDATE readings SET raw=? WHERE id=?", (d["raw"], rid))
+        db.execute("UPDATE readings SET raw=%s WHERE id=%s", (d["raw"], rid))
     if "extra" in d:
-        db.execute("UPDATE readings SET extra=? WHERE id=?",
+        db.execute("UPDATE readings SET extra=%s WHERE id=%s",
                    (json.dumps(d["extra"]), rid))
     if "use_avg" in d:
-        db.execute("UPDATE readings SET use_avg=? WHERE id=?",
+        db.execute("UPDATE readings SET use_avg=%s WHERE id=%s",
                    (int(bool(d["use_avg"])), rid))
     if "is_final" in d:
-        db.execute("UPDATE readings SET is_final=? WHERE id=?",
+        db.execute("UPDATE readings SET is_final=%s WHERE id=%s",
                    (int(bool(d["is_final"])), rid))
     recompute_task_progress(db, row["sample_analyte_id"])
-    db.execute("UPDATE samples SET updated_at=? WHERE id=?",
+    db.execute("UPDATE samples SET updated_at=%s WHERE id=%s",
                (next_updated_at(sample["updated_at"]), sample["id"]))
-    after = db.execute("SELECT * FROM readings WHERE id=?", (rid,)).fetchone()
+    after = db.execute("SELECT * FROM readings WHERE id=%s", (rid,)).fetchone()
     version = reading_version(after)
     audit_event(db, "update", "reading", rid, before=row, after=after)
     db.commit()
@@ -2805,7 +2773,6 @@ def update_reading(rid):
 def del_reading(rid):
     d = (request.get_json() if request.is_json else {}) or {}
     db = get_db()
-    begin_mutation(db)
     before = lock_reading(db, rid)
     if "expected_version" in d and (not before or d["expected_version"] != reading_version(before)):
         db.rollback()
@@ -2814,14 +2781,14 @@ def del_reading(rid):
         return jsonify(ok=False, error="读数不存在"), 404
     sample = db.execute("""SELECT s.id,s.status,s.updated_at,i.itype FROM samples s JOIN sample_analytes sa
         ON sa.sample_id=s.id LEFT JOIN instruments i ON i.id=sa.instrument_id
-        WHERE sa.id=?""", (before["sample_analyte_id"],)).fetchone()
-    if sample["status"] in {"registered", "received", "queued"} and sample["itype"] != "xrf":
+        WHERE sa.id=%s""", (before["sample_analyte_id"],)).fetchone()
+    if sample["status"] in {"received", "queued"} and sample["itype"] != "xrf":
         return jsonify(ok=False, error="请先完成制样并开始测量"), 409
-    if sample["status"] in {"reviewed", "reported", "cancelled"}:
+    if sample["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="该样品已锁定，不能删除读数"), 409
-    db.execute("DELETE FROM readings WHERE id=?", (rid,))
+    db.execute("DELETE FROM readings WHERE id=%s", (rid,))
     recompute_task_progress(db, before["sample_analyte_id"])
-    db.execute("UPDATE samples SET updated_at=? WHERE id=?",
+    db.execute("UPDATE samples SET updated_at=%s WHERE id=%s",
                (next_updated_at(sample["updated_at"]), sample["id"]))
     audit_event(db, "delete", "reading", rid, before=before)
     db.commit()
@@ -2843,13 +2810,13 @@ def _standard_session_user(db, capability="result_edit"):
         return None
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     row = db.execute("""SELECT scs.token_hash,scs.last_activity,
-            u.id,u.username,u.display_name,u.role,u.permissions,u.active
+            u.id,u.username,u.display_name,u.permissions,u.active
         FROM standard_client_sessions scs JOIN users u ON u.id=scs.user_id
-        WHERE scs.token_hash=? AND u.active=1""", (token_hash,)).fetchone()
+        WHERE scs.token_hash=%s AND u.active=1""", (token_hash,)).fetchone()
     now = datetime.now().timestamp()
     if not row or now - float(row["last_activity"]) > _STANDARD_SESSION_SECONDS:
         if row:
-            db.execute("DELETE FROM standard_client_sessions WHERE token_hash=?", (token_hash,))
+            db.execute("DELETE FROM standard_client_sessions WHERE token_hash=%s", (token_hash,))
             db.commit()
         return None
     return row if capability in user_permissions(row) else None
@@ -2865,7 +2832,7 @@ def _touch_standard_session(db):
         return
     token = request.headers.get("X-User-Authorization", "").strip()
     if token:
-        db.execute("UPDATE standard_client_sessions SET last_activity=? WHERE token_hash=?",
+        db.execute("UPDATE standard_client_sessions SET last_activity=%s WHERE token_hash=%s",
                    (datetime.now().timestamp(), hashlib.sha256(token.encode("utf-8")).hexdigest()))
 
 
@@ -2881,10 +2848,10 @@ def standard_client_authorize():
         return jsonify(ok=False, error=error), 401 if "密码" in str(error) else 403
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    db.execute("DELETE FROM standard_client_sessions WHERE client_id=? AND user_id=?",
+    db.execute("DELETE FROM standard_client_sessions WHERE client_id=%s AND user_id=%s",
                (client_id, user["id"]))
     db.execute("""INSERT INTO standard_client_sessions(token_hash,user_id,client_id,last_activity)
-        VALUES(?,?,?,?)""", (token_hash, user["id"], client_id, datetime.now().timestamp()))
+        VALUES(%s,%s,%s,%s)""", (token_hash, user["id"], client_id, datetime.now().timestamp()))
     audit_event(db, "instrument_login", "session", client_id,
                 after={"client_id": client_id}, user=user)
     db.commit()
@@ -2911,7 +2878,7 @@ def standard_client_logout():
     db = get_db()
     token = request.headers.get("X-User-Authorization", "").strip()
     if token:
-        db.execute("DELETE FROM standard_client_sessions WHERE token_hash=?",
+        db.execute("DELETE FROM standard_client_sessions WHERE token_hash=%s",
                    (hashlib.sha256(token.encode("utf-8")).hexdigest(),))
         db.commit()
     return jsonify(ok=True)
@@ -2941,18 +2908,18 @@ def standard_client_status():
     if not client_id:
         return jsonify(ok=False, error="缺少终端标识"), 400
     db = get_db()
-    if not db.execute("""SELECT 1 FROM instruments WHERE id=?
+    if not db.execute("""SELECT 1 FROM instruments WHERE id=%s
             AND itype IN ('ppm','ppb','mol','percent','ph')""", (instrument_id,)).fetchone():
         return jsonify(ok=False, error="仪器不存在或不支持标准单值录入"), 404
     user = _standard_session_user(db)
     db.execute("""INSERT INTO standard_client_status(
         client_id,machine_name,client_version,instrument_id,network_position,user_id,seen_at,updated_at)
-        VALUES(?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))
+        VALUES(%s,%s,%s,%s,%s,%s,to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'))
         ON CONFLICT(client_id) DO UPDATE SET
           machine_name=excluded.machine_name,client_version=excluded.client_version,
           instrument_id=excluded.instrument_id,network_position=excluded.network_position,
-          user_id=excluded.user_id,seen_at=datetime('now','localtime'),
-          updated_at=datetime('now','localtime')""", (
+          user_id=excluded.user_id,seen_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),
+          updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS')""", (
         client_id, machine_name, str(data.get("version") or "").strip()[:40], instrument_id,
         request.remote_addr or "", user["id"] if user else None))
     db.commit()
@@ -2969,7 +2936,7 @@ def standard_client_tasks():
     db = get_db()
     if not _standard_session_user(db):
         return _standard_authorization_error()
-    instrument = db.execute("""SELECT id,name,itype FROM instruments WHERE id=?
+    instrument = db.execute("""SELECT id,name,itype FROM instruments WHERE id=%s
         AND itype IN ('ppm','ppb','mol','percent','ph')""", (instrument_id,)).fetchone()
     if not instrument:
         return jsonify(ok=False, error="仪器不存在或不支持单值录入"), 404
@@ -2980,13 +2947,13 @@ def standard_client_tasks():
         FROM sample_analytes sa JOIN samples s ON s.id=sa.sample_id
         JOIN analytes a ON a.id=sa.analyte_id
         LEFT JOIN preparations p ON p.id=sa.preparation_id
-        WHERE sa.instrument_id=? AND sa.status!='cancelled'
+        WHERE sa.instrument_id=%s AND sa.status!='cancelled'
           AND s.status IN ('queued','measuring','partially_done','completed')
         ORDER BY s.id,a.sort_order,a.id,p.id,sa.id""", (instrument_id,)).fetchall()
     task_ids = [row["task_id"] for row in task_rows]
     reading_map = {}
     if task_ids:
-        placeholders = ",".join("?" for _ in task_ids)
+        placeholders = ",".join("%s" for _ in task_ids)
         for reading in db.execute(f"""SELECT id,sample_analyte_id,raw,use_avg,is_final
             FROM readings WHERE sample_analyte_id IN ({placeholders}) ORDER BY id""", task_ids):
             item = dict(reading)
@@ -3030,21 +2997,21 @@ def standard_client_start_sample(sid):
     user = _standard_session_user(db)
     if not user:
         return _standard_authorization_error()
-    before = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    before = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not before:
         return jsonify(ok=False, error="样品不存在"), 404
     if before["status"] != "queued":
         return jsonify(ok=False, error="只有未测量样品可以开始测量"), 409
-    if not db.execute("""SELECT 1 FROM sample_analytes WHERE sample_id=?
-            AND instrument_id=? AND status!='cancelled' LIMIT 1""", (sid, instrument_id)).fetchone():
+    if not db.execute("""SELECT 1 FROM sample_analytes WHERE sample_id=%s
+            AND instrument_id=%s AND status!='cancelled' LIMIT 1""", (sid, instrument_id)).fetchone():
         return jsonify(ok=False, error="该样品没有分配给当前仪器的任务"), 409
     actor = user["display_name"] or user["username"]
     db.execute("""UPDATE samples SET status='measuring',
-        analyst=CASE WHEN COALESCE(analyst,'')='' THEN ? ELSE analyst END,
-        status_operator=?,status_action='measuring',status_changed_at=datetime('now','localtime'),
-        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+        analyst=CASE WHEN COALESCE(analyst,'')='' THEN %s ELSE analyst END,
+        status_operator=%s,status_action='measuring',status_changed_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),
+        updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
         (actor, actor, sid))
-    after = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    after = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     audit_event(db, "status_change", "sample", sid, before=before, after=after, user=user)
     _touch_standard_session(db)
     db.commit()
@@ -3069,12 +3036,12 @@ def standard_client_submit():
     if not user:
         return _standard_authorization_error()
     previous = db.execute("""SELECT response_json FROM standard_client_submissions
-        WHERE client_id=? AND submission_id=?""", (client_id, submission_id)).fetchone()
+        WHERE client_id=%s AND submission_id=%s""", (client_id, submission_id)).fetchone()
     if previous:
         response = json.loads(previous["response_json"] or "{}")
         response["duplicate"] = True
         return jsonify(response)
-    instrument = db.execute("""SELECT id,name,itype FROM instruments WHERE id=?
+    instrument = db.execute("""SELECT id,name,itype FROM instruments WHERE id=%s
         AND itype IN ('ppm','ppb','mol','percent','ph')""", (instrument_id,)).fetchone()
     if not instrument:
         return jsonify(ok=False, error="仪器不存在或不支持单值录入"), 404
@@ -3096,7 +3063,7 @@ def standard_client_submit():
         task = db.execute("""SELECT sa.id,sa.sample_id,sa.instrument_id,sa.status,
                 s.status AS sample_status,a.name AS analyte
             FROM sample_analytes sa JOIN samples s ON s.id=sa.sample_id
-            JOIN analytes a ON a.id=sa.analyte_id WHERE sa.id=?""", (task_id,)).fetchone()
+            JOIN analytes a ON a.id=sa.analyte_id WHERE sa.id=%s""", (task_id,)).fetchone()
         if not task or task["instrument_id"] != instrument_id:
             return jsonify(ok=False, error=f"任务 {task_id} 不属于当前仪器"), 409
         if task["status"] == "cancelled" or task["sample_status"] not in {
@@ -3107,14 +3074,13 @@ def standard_client_submit():
     imported = []
     sample_ids = set()
     for task, value in clean:
-        cur = db.execute("""INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final)
-            VALUES(?,?,'{}',1,0)""", (task["id"], value))
-        reading = db.execute("SELECT * FROM readings WHERE id=?", (cur.lastrowid,)).fetchone()
-        audit_event(db, "instrument_reading", "reading", cur.lastrowid,
+        reading = db.execute("""INSERT INTO readings(sample_analyte_id,raw,extra,use_avg,is_final)
+            VALUES(%s,%s,'{}',1,0) RETURNING *""", (task["id"], value)).fetchone()
+        audit_event(db, "instrument_reading", "reading", reading["id"],
                     after=reading, user=actor)
         recompute_task_progress(db, task["id"])
         sample_ids.add(task["sample_id"])
-        imported.append({"task_id": task["id"], "reading_id": cur.lastrowid,
+        imported.append({"task_id": task["id"], "reading_id": reading["id"],
                          "analyte": task["analyte"], "value": value})
     for sample_id in sample_ids:
         recompute_sample_progress(db, sample_id)
@@ -3122,7 +3088,7 @@ def standard_client_submit():
                 "imported": imported}
     db.execute("""INSERT INTO standard_client_submissions(
         client_id,submission_id,instrument_id,payload_json,response_json)
-        VALUES(?,?,?,?,?)""", (client_id, submission_id, instrument_id,
+        VALUES(%s,%s,%s,%s,%s)""", (client_id, submission_id, instrument_id,
         json.dumps(data, ensure_ascii=False), json.dumps(response, ensure_ascii=False)))
     audit_event(db, "instrument_submit", "standard_submission", submission_id,
                 after={"instrument": instrument["name"], "client_id": client_id,
@@ -3142,7 +3108,7 @@ def xrf_client_tasks():
             s.category,s.status AS sample_status,s.xrf_report_items,
             m.id AS method_id,m.name AS method_name
         FROM samples s LEFT JOIN methods m ON m.id=s.xrf_method_id
-        WHERE s.xrf=1 AND s.status NOT IN ('reviewed','reported','cancelled')
+        WHERE s.xrf=1 AND s.status NOT IN ('reviewed','cancelled')
           AND NOT EXISTS(SELECT 1 FROM xrf_analyses xa WHERE xa.sample_id=s.id)
         ORDER BY s.id""")
     for sample in samples:
@@ -3165,12 +3131,12 @@ def xrf_client_status():
         state = "idle"
     current = d.get("current") if isinstance(d.get("current"), dict) else {}
     db = get_db()
-    before = db.execute("SELECT * FROM xrf_client_status WHERE client_id=?", (machine,)).fetchone()
+    before = db.execute("SELECT * FROM xrf_client_status WHERE client_id=%s", (machine,)).fetchone()
     db.execute("""INSERT INTO xrf_client_status(
         client_id,machine_name,client_version,state,current_sample,current_method,
         current_batch,current_run_id,current_position,current_started_at,
         message,seen_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'))
         ON CONFLICT(client_id) DO UPDATE SET
           machine_name=excluded.machine_name, client_version=excluded.client_version,
           state=excluded.state, current_sample=excluded.current_sample,
@@ -3178,8 +3144,8 @@ def xrf_client_status():
           current_run_id=excluded.current_run_id,
           current_position=excluded.current_position,
           current_started_at=excluded.current_started_at,
-          message=excluded.message, seen_at=datetime('now','localtime'),
-          updated_at=datetime('now','localtime')""", (
+          message=excluded.message, seen_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),
+          updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS')""", (
         machine, machine, str(d.get("version", "")).strip(), state,
         str(current.get("sample") or current.get("sample_name") or "").strip(),
         str(current.get("method") or current.get("method_name") or "").strip(),
@@ -3188,7 +3154,7 @@ def xrf_client_status():
         str(current.get("position") or "").strip(),
         str(current.get("started_at") or "").strip(),
         str(d.get("message", "")).strip()[:500]))
-    after = db.execute("SELECT * FROM xrf_client_status WHERE client_id=?", (machine,)).fetchone()
+    after = db.execute("SELECT * FROM xrf_client_status WHERE client_id=%s", (machine,)).fetchone()
     watch = ("state", "current_sample", "current_method", "current_batch",
              "current_run_id", "current_position", "current_started_at", "message")
     if before is None or any(before[k] != after[k] for k in watch):
@@ -3273,8 +3239,7 @@ def _xrf_target_family(token, elements, oxides):
 def _derive_xrf_targets(text, elements, oxides):
     """把逗号分隔的报告项目文本解析为按元素族单选的结构化口径。
 
-    同一族出现多个口径（如 Fe 与 Fe2O3）时，先出现的为准，
-    保证旧样品的既有语义不被静默改写。
+    同一族出现多个口径（如 Fe 与 Fe2O3）时，以先出现的项目为准。
     """
     targets, seen = [], set()
     for part in re.split(r"[,，、;；\s]+", text or ""):
@@ -3296,16 +3261,16 @@ def _derive_xrf_targets(text, elements, oxides):
 def _load_xrf_targets(db, sid):
     return [dict(row) for row in db.execute(
         """SELECT id,family,target,include,allow_conversion FROM xrf_report_targets
-        WHERE sample_id=? ORDER BY id""", (sid,))]
+        WHERE sample_id=%s ORDER BY id""", (sid,))]
 
 
 def _sync_sample_xrf_targets(db, sid, text):
     elements, oxides = _xrf_reference(db)
     targets = _derive_xrf_targets(text, elements, oxides)
-    db.execute("DELETE FROM xrf_report_targets WHERE sample_id=?", (sid,))
+    db.execute("DELETE FROM xrf_report_targets WHERE sample_id=%s", (sid,))
     for target in targets:
         db.execute("""INSERT INTO xrf_report_targets(sample_id,family,target,include,allow_conversion)
-            VALUES(?,?,?,?,?)""", (sid, target["family"], target["target"],
+            VALUES(%s,%s,%s,%s,%s)""", (sid, target["family"], target["target"],
                                    target["include"], target["allow_conversion"]))
     return targets
 
@@ -3472,17 +3437,17 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
     if not clean_results:
         return {"ok": False, "error": "分析中没有有效的定量结果", "skipped": list(skipped.values())}, 422
 
-    existing = db.execute("SELECT * FROM xrf_analyses WHERE source=? AND external_id=?",
+    existing = db.execute("SELECT * FROM xrf_analyses WHERE source=%s AND external_id=%s",
                           (source, external_id)).fetchone()
     if existing and existing["sample_id"]:
-        existing_sample = db.execute("SELECT status FROM samples WHERE id=?",
+        existing_sample = db.execute("SELECT status FROM samples WHERE id=%s",
                                      (existing["sample_id"],)).fetchone()
-        if existing_sample and existing_sample["status"] in {"reviewed", "reported", "cancelled"}:
+        if existing_sample and existing_sample["status"] in {"reviewed", "cancelled"}:
             return {"ok": True, "duplicate": True, "analysis_id": existing["id"],
                     "matched": True, "sample_id": existing["sample_id"],
                     "sample_locked": True, "imported": [],
                     "skipped": list(skipped.values())}, 200
-    linked_sample = db.execute("SELECT * FROM samples WHERE id=?", (existing["sample_id"],)).fetchone() \
+    linked_sample = db.execute("SELECT * FROM samples WHERE id=%s", (existing["sample_id"],)).fetchone() \
         if existing and existing["sample_id"] else None
     options = data.get("options") if isinstance(data.get("options"), dict) else {}
     job = data.get("job") if isinstance(data.get("job"), dict) else {}
@@ -3498,7 +3463,7 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
     if existing and str(existing["kind"] or "") == str(kind or ""):
         current_values = {
             row["name"]: (row["value"], row["alt_name"] or "", int(bool(row["use_report"])))
-            for row in db.execute("SELECT name,value,alt_name,use_report FROM xrf_values WHERE analysis_id=?",
+            for row in db.execute("SELECT name,value,alt_name,use_report FROM xrf_values WHERE analysis_id=%s",
                                   (existing["id"],))
         }
         incoming_values = {
@@ -3513,23 +3478,23 @@ def _store_xrf_scan(db, data, *, source, kind, external_id, sample_name):
                     "imported": [], "skipped": list(skipped.values())}, 200
     db.execute("""INSERT INTO xrf_analyses(
         sample_id,sample_name,external_id,method,batch,analyzed_at,source,kind,remark,options_json)
-        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,external_id) DO UPDATE SET
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(source,external_id) DO UPDATE SET
           sample_name=excluded.sample_name,method=excluded.method,batch=excluded.batch,
           analyzed_at=excluded.analyzed_at,kind=excluded.kind,
           remark=excluded.remark,options_json=excluded.options_json""", (
         None, str(data.get("raw_sample_name") or sample_name).strip(),
         external_id, str(data.get("method") or "").strip(), str(data.get("batch") or "").strip(),
         data.get("analyzed_at"), source, kind, remark, json.dumps(options, ensure_ascii=False)))
-    analysis = db.execute("SELECT * FROM xrf_analyses WHERE source=? AND external_id=?",
+    analysis = db.execute("SELECT * FROM xrf_analyses WHERE source=%s AND external_id=%s",
                           (source, external_id)).fetchone()
-    db.execute("DELETE FROM xrf_values WHERE analysis_id=?", (analysis["id"],))
+    db.execute("DELETE FROM xrf_values WHERE analysis_id=%s", (analysis["id"],))
     imported = []
     for name, (value, alt_name) in clean_results.items():
-        cur = db.execute("""INSERT INTO xrf_values(analysis_id,name,value,use_report,alt_name)
-            VALUES(?,?,?,?,?)""", (analysis["id"], name, value,
-                                   int(name.casefold() in defaults), alt_name))
+        value_id = db.execute("""INSERT INTO xrf_values(analysis_id,name,value,use_report,alt_name)
+            VALUES(%s,%s,%s,%s,%s) RETURNING id""", (analysis["id"], name, value,
+                                   int(name.casefold() in defaults), alt_name)).fetchone()["id"]
         imported.append({"name": name, "value": value, "alt_name": alt_name,
-                         "xrf_value_id": cur.lastrowid})
+                         "xrf_value_id": value_id})
     for affected in {old_sample_id, linked_sample["id"] if linked_sample else None} - {None}:
         recompute_sample_progress(db, affected)
         _report_cache_note_write()
@@ -3654,7 +3619,7 @@ def xrf_sync_state():
     ordinary, uq = 0, 0
     ordinary_ids, uq_ids = [], []
     for row in get_db().execute("""SELECT source,external_id,sample_id FROM xrf_analyses
-            WHERE source IN (?,?)""", ("OXSAS", "OXSAS-UniQuant")).fetchall():
+            WHERE source IN (%s,%s)""", ("OXSAS", "OXSAS-UniQuant")).fetchall():
         try:
             if row["source"] == "OXSAS":
                 ordinary = max(ordinary, int(row["external_id"]))
@@ -3674,13 +3639,13 @@ def xrf_sync_state():
 @capability_required("result_edit")
 def update_special_result(sid):
     db = get_db()
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample or sample["workflow_type"] != "special":
         return jsonify(ok=False, error="专项样品不存在"), 404
-    if sample["status"] in {"registered", "received", "queued", "reviewed", "reported", "cancelled"}:
+    if sample["status"] in {"received", "queued", "reviewed", "cancelled"}:
         return jsonify(ok=False, error="当前样品状态不能录入专项数据"), 409
     result = db.execute("""SELECT sr.*,sm.schema_json FROM special_results sr
-        JOIN special_methods sm ON sm.id=sr.method_id WHERE sr.sample_id=?""", (sid,)).fetchone()
+        JOIN special_methods sm ON sm.id=sr.method_id WHERE sr.sample_id=%s""", (sid,)).fetchone()
     if not result:
         return jsonify(ok=False, error="专项方法尚未建立"), 409
     raw = (request.json or {}).get("raw_data", {})
@@ -3702,11 +3667,11 @@ def update_special_result(sid):
     before = {"raw_data": json.loads(result["raw_data"] or "{}"),
               "calculated_data": json.loads(result["calculated_data"] or "{}"),
               "status": result["status"]}
-    db.execute("""UPDATE special_results SET raw_data=?,calculated_data=?,status=?,
-        updated_at=datetime('now','localtime'),updated_by=? WHERE sample_id=?""",
+    db.execute("""UPDATE special_results SET raw_data=%s,calculated_data=%s,status=%s,
+        updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'),updated_by=%s WHERE sample_id=%s""",
         (json.dumps(clean, ensure_ascii=False), json.dumps(calculated, ensure_ascii=False),
          status, g.user["id"], sid))
-    db.execute("UPDATE samples SET updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?", (sid,))
+    db.execute("UPDATE samples SET updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s", (sid,))
     audit_event(db, "special_result", "sample", sid, before=before,
                 after={"raw_data": clean, "calculated_data": calculated, "status": status})
     db.commit()
@@ -3753,7 +3718,7 @@ def _clean_report_rows(value):
 def _attach_report_override(db, sid, payload):
     default_rows = _default_report_rows(payload.get("groups", []))
     override = db.execute("""SELECT ro.*,u.display_name,u.username FROM report_overrides ro
-        LEFT JOIN users u ON u.id=ro.updated_by WHERE ro.sample_id=?""", (sid,)).fetchone()
+        LEFT JOIN users u ON u.id=ro.updated_by WHERE ro.sample_id=%s""", (sid,)).fetchone()
     manual = None
     if override:
         try:
@@ -3782,7 +3747,7 @@ def _attach_report_profile(db, payload):
     sample = payload["sample"]
     profile = None
     if sample.get("report_profile_id"):
-        profile = db.execute("SELECT * FROM report_profiles WHERE id=?",
+        profile = db.execute("SELECT * FROM report_profiles WHERE id=%s",
                              (sample["report_profile_id"],)).fetchone()
     if not profile:
         profile = db.execute("SELECT * FROM report_profiles ORDER BY id LIMIT 1").fetchone()
@@ -3809,14 +3774,14 @@ def _sample_data_editors(db, sid):
             FROM audit_logs al
             WHERE al.entity_type='reading' AND CAST(al.entity_id AS INTEGER) IN (
                 SELECT r.id FROM readings r JOIN sample_analytes sa ON sa.id=r.sample_analyte_id
-                WHERE sa.sample_id=?)
+                WHERE sa.sample_id=%s)
             GROUP BY al.user_id, al.username""", (sid,)):
         record(row["username"], row["user_id"], row["cnt"])
     for row in db.execute("""
             SELECT al.username, al.user_id, COUNT(*) AS cnt
             FROM audit_logs al
             WHERE al.entity_type='sample_analyte' AND CAST(al.entity_id AS INTEGER) IN (
-                SELECT sa.id FROM sample_analytes sa WHERE sa.sample_id=?)
+                SELECT sa.id FROM sample_analytes sa WHERE sa.sample_id=%s)
             GROUP BY al.user_id, al.username""", (sid,)):
         record(row["username"], row["user_id"], row["cnt"])
     for row in db.execute("""
@@ -3824,15 +3789,15 @@ def _sample_data_editors(db, sid):
             FROM audit_logs al
             WHERE (al.entity_type='xrf_value' AND CAST(al.entity_id AS INTEGER) IN (
                     SELECT xv.id FROM xrf_values xv JOIN xrf_analyses xa ON xa.id=xv.analysis_id
-                    WHERE xa.sample_id=?))
+                    WHERE xa.sample_id=%s))
                 OR (al.entity_type='xrf_analysis' AND CAST(al.entity_id AS INTEGER) IN (
-                    SELECT xa.id FROM xrf_analyses xa WHERE xa.sample_id=?))
+                    SELECT xa.id FROM xrf_analyses xa WHERE xa.sample_id=%s))
             GROUP BY al.user_id, al.username""", (sid, sid)):
         record(row["username"], row["user_id"], row["cnt"])
     for row in db.execute("""
             SELECT al.username, al.user_id, COUNT(*) AS cnt
             FROM audit_logs al
-            WHERE al.entity_type='sample' AND al.entity_id=? AND al.action IN
+            WHERE al.entity_type='sample' AND al.entity_id=%s AND al.action IN
                 ('excel_data_overwrite','special_result','result_override')
             GROUP BY al.user_id, al.username""", (str(sid),)):
         record(row["username"], row["user_id"], row["cnt"])
@@ -3841,7 +3806,7 @@ def _sample_data_editors(db, sid):
     for entry in counts.values():
         display = entry["username"]
         if entry["user_id"]:
-            user = db.execute("SELECT display_name FROM users WHERE id=?",
+            user = db.execute("SELECT display_name FROM users WHERE id=%s",
                               (entry["user_id"],)).fetchone()
             if user and user["display_name"]:
                 display = user["display_name"]
@@ -3852,7 +3817,7 @@ def _sample_data_editors(db, sid):
 
 def build_report_payload(db, sid):
     """Build the single calculated payload shared by JSON and Excel reports."""
-    sample_row = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample_row = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample_row:
         raise BusinessExcelError("样品不存在")
     sample = dict(sample_row)
@@ -3860,7 +3825,7 @@ def build_report_payload(db, sid):
     if sample.get("workflow_type") == "special":
         special_row = db.execute("""SELECT sr.*,sm.code,sm.name AS method_name,
             sm.instrument,sm.schema_json FROM special_results sr JOIN special_methods sm
-            ON sm.id=sr.method_id WHERE sr.sample_id=?""", (sid,)).fetchone()
+            ON sm.id=sr.method_id WHERE sr.sample_id=%s""", (sid,)).fetchone()
         special = dict(special_row) if special_row else None
         if special:
             special["schema"] = json.loads(special.pop("schema_json") or "{}")
@@ -3872,18 +3837,18 @@ def build_report_payload(db, sid):
         })
     preps = [dict(row) for row in db.execute("""SELECT p.*,p.dilution_factor AS factor
         FROM preparations p
-        WHERE p.sample_id=? ORDER BY p.id""", (sid,))]
+        WHERE p.sample_id=%s ORDER BY p.id""", (sid,))]
     items = [dict(row) for row in db.execute("""SELECT sa.*,a.name AS analyte,
         a.sort_order AS analyte_sort_order,a.default_unit AS analyte_default_unit,i.name AS instrument,i.itype,
         i.sort_order AS instrument_sort_order,m.name AS method_name,m.formula,m.note AS method_note,
-        m.constants AS method_constants,m.output_unit AS method_output_unit,r.raw,r.extra,r.aux,p.name AS prep_name,
+        m.constants AS method_constants,m.output_unit AS method_output_unit,r.aux,p.name AS prep_name,
         p.mass_g AS prep_mass,p.volume_ml AS prep_vol,p.dilution_factor AS prep_factor,
         p.dilution_label AS prep_dilution FROM sample_analytes sa JOIN analytes a ON a.id=sa.analyte_id
         LEFT JOIN instruments i ON i.id=sa.instrument_id LEFT JOIN methods m ON m.id=sa.method_id
         LEFT JOIN results r ON r.sample_analyte_id=sa.id LEFT JOIN preparations p ON p.id=sa.preparation_id
-        WHERE sa.sample_id=? ORDER BY sa.id""", (sid,))]
+        WHERE sa.sample_id=%s ORDER BY sa.id""", (sid,))]
     readings = db.execute("""SELECT rd.* FROM readings rd JOIN sample_analytes sa
-        ON sa.id=rd.sample_analyte_id WHERE sa.sample_id=? ORDER BY rd.id""", (sid,)).fetchall()
+        ON sa.id=rd.sample_analyte_id WHERE sa.sample_id=%s ORDER BY rd.id""", (sid,)).fetchall()
     by_task_readings = {}
     for reading in readings:
         by_task_readings.setdefault(reading["sample_analyte_id"], []).append(dict(reading))
@@ -3920,7 +3885,7 @@ def build_report_payload(db, sid):
             a.id AS analyte_id, a.sort_order AS analyte_sort_order
         FROM xrf_values xv JOIN xrf_analyses xa ON xa.id=xv.analysis_id
         LEFT JOIN analytes a ON lower(a.name)=lower(xv.name)
-        WHERE xa.sample_id=? ORDER BY xa.analyzed_at DESC, xv.id""", (sid,))]
+        WHERE xa.sample_id=%s ORDER BY xa.analyzed_at DESC, xv.id""", (sid,))]
     xrf_warnings = []
     xrf_targets = _load_xrf_targets(db, sid)
     if xrf_targets:
@@ -4139,12 +4104,12 @@ def report(sid):
 def manual_report(sid):
     db = get_db()
     data = request.get_json(silent=True) or {}
-    sample = db.execute("SELECT id,status,workflow_type FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT id,status,workflow_type FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="样品不存在"), 404
     if sample["workflow_type"] != "regular":
         return jsonify(ok=False, error="专项检测报告暂不使用手工报告表"), 400
-    if sample["status"] not in {"completed", "reviewed", "reported"}:
+    if sample["status"] not in {"completed", "reviewed"}:
         return jsonify(ok=False, error="样品测量完成后才能手工补录结果"), 409
     reason = str(data.get("reason", "")).strip()
     if not reason:
@@ -4169,13 +4134,13 @@ def manual_report(sid):
     if old_rows == target_rows and old_source == target_source:
         return jsonify(ok=True, changed=False)
     if target_source == "system":
-        db.execute("DELETE FROM report_overrides WHERE sample_id=?", (sid,))
+        db.execute("DELETE FROM report_overrides WHERE sample_id=%s", (sid,))
     else:
         db.execute("""INSERT INTO report_overrides(sample_id,rows_json,updated_by,updated_at)
-            VALUES(?,?,?,datetime('now','localtime')) ON CONFLICT(sample_id) DO UPDATE SET
+            VALUES(%s,%s,%s,to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS')) ON CONFLICT(sample_id) DO UPDATE SET
             rows_json=excluded.rows_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
             (sid, json.dumps(submitted, ensure_ascii=False), actor["id"]))
-    db.execute("UPDATE samples SET updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?", (sid,))
+    db.execute("UPDATE samples SET updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s", (sid,))
     audit_event(db, "result_override", "sample", sid,
                 before={"source": old_source, "report_rows": old_rows},
                 after={"source": target_source, "report_rows": target_rows},
@@ -4213,7 +4178,7 @@ def excel_results_report():
     template_id = None
     if requested_template_id:
         try:
-            template = db.execute("SELECT name,items_json FROM result_order_templates WHERE id=?",
+            template = db.execute("SELECT name,items_json FROM result_order_templates WHERE id=%s",
                                   (int(requested_template_id),)).fetchone()
         except ValueError:
             template = None
@@ -4224,7 +4189,7 @@ def excel_results_report():
         template_name = template["name"] or "系统默认"
     else:
         template_id = _default_order_template_id(db)
-        template = db.execute("SELECT name FROM result_order_templates WHERE id=?",
+        template = db.execute("SELECT name FROM result_order_templates WHERE id=%s",
                               (template_id,)).fetchone() if template_id else None
         if template and template["name"]:
             template_name = template["name"]
@@ -4236,7 +4201,7 @@ def excel_results_report():
             return excel_error(exc, 404)
         sample = payload["sample"]
         if sample.get("workflow_type") != "regular" or sample.get("status") not in {
-                "completed", "reviewed", "reported"}:
+                "completed", "reviewed"}:
             return jsonify(ok=False, error="结果矩阵只能导出测量完成的常规样品"), 409
         payloads.append(payload)
     columns, column_keys = [], set()
@@ -4297,17 +4262,17 @@ def xrf_sample_results(sid):
     db = get_db()
     sample = db.execute("""SELECT s.id,s.name,s.lims_no,s.status,s.xrf,s.xrf_report_items,
         m.name AS method_name FROM samples s LEFT JOIN methods m ON m.id=s.xrf_method_id
-        WHERE s.id=?""", (sid,)).fetchone()
+        WHERE s.id=%s""", (sid,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="样品不存在"), 404
-    analyses = rows("SELECT * FROM xrf_analyses WHERE sample_id=? ORDER BY id DESC", (sid,))
+    analyses = rows("SELECT * FROM xrf_analyses WHERE sample_id=%s ORDER BY id DESC", (sid,))
     for analysis in analyses:
         try:
             analysis["options"] = json.loads(analysis.get("options_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             analysis["options"] = {}
         analysis["values"] = rows("""SELECT id,name,value,use_report,alt_name FROM xrf_values
-            WHERE analysis_id=? AND lower(substr(name,1,2))<>'bg'
+            WHERE analysis_id=%s AND lower(substr(name,1,2))<>'bg'
             ORDER BY value DESC,id""", (analysis["id"],))
     return jsonify(ok=True, sample=dict(sample), analyses=analyses,
                    targets=_load_xrf_targets(db, sid))
@@ -4318,10 +4283,10 @@ def xrf_sample_results(sid):
 def xrf_sample_targets(sid):
     """保存样品级 XRF 报告口径：每个元素族只选一个目标。"""
     db = get_db()
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sid,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sid,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="样品不存在"), 404
-    if sample["status"] in {"reviewed", "reported", "cancelled"}:
+    if sample["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="已审核、已出报告或已作废样品不能修改报告口径"), 409
     submitted = (request.json or {}).get("targets")
     if not isinstance(submitted, list):
@@ -4346,21 +4311,21 @@ def xrf_sample_targets(sid):
                         "include": int(bool(item.get("include", True))),
                         "allow_conversion": allow})
     before = _load_xrf_targets(db, sid)
-    db.execute("DELETE FROM xrf_report_targets WHERE sample_id=?", (sid,))
+    db.execute("DELETE FROM xrf_report_targets WHERE sample_id=%s", (sid,))
     for item in cleaned:
         db.execute("""INSERT INTO xrf_report_targets(sample_id,family,target,include,allow_conversion)
-            VALUES(?,?,?,?,?)""", (sid, item["family"], item["target"],
+            VALUES(%s,%s,%s,%s,%s)""", (sid, item["family"], item["target"],
                                    item["include"], item["allow_conversion"]))
     report_items = ", ".join(item["target"] for item in cleaned if item["include"])
-    db.execute("""UPDATE samples SET xrf_report_items=?,
-        updated_at=strftime('%Y-%m-%d %H:%M:%f','now','localtime') WHERE id=?""",
+    db.execute("""UPDATE samples SET xrf_report_items=%s,
+        updated_at=to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.MS') WHERE id=%s""",
                (report_items, sid))
     included = {item["target"].casefold() for item in cleaned if item["include"]}
     db.execute("""UPDATE xrf_values SET use_report=0 WHERE analysis_id IN
-        (SELECT id FROM xrf_analyses WHERE sample_id=?)""", (sid,))
+        (SELECT id FROM xrf_analyses WHERE sample_id=%s)""", (sid,))
     for name in included:
-        db.execute("""UPDATE xrf_values SET use_report=1 WHERE lower(name)=? AND analysis_id IN
-            (SELECT id FROM xrf_analyses WHERE sample_id=?)""", (name, sid))
+        db.execute("""UPDATE xrf_values SET use_report=1 WHERE lower(name)=%s AND analysis_id IN
+            (SELECT id FROM xrf_analyses WHERE sample_id=%s)""", (name, sid))
     after = _load_xrf_targets(db, sid)
     audit_event(db, "xrf_targets_update", "sample", sid,
                 before={"targets": before, "xrf_report_items": sample["xrf_report_items"]},
@@ -4373,21 +4338,21 @@ def xrf_sample_targets(sid):
 @capability_required("result_edit")
 def assign_xrf_analysis(analysis_id):
     db = get_db()
-    analysis = db.execute("SELECT * FROM xrf_analyses WHERE id=?", (analysis_id,)).fetchone()
+    analysis = db.execute("SELECT * FROM xrf_analyses WHERE id=%s", (analysis_id,)).fetchone()
     if not analysis:
         return jsonify(ok=False, error="XRF 扫描不存在"), 404
     if request.method == "DELETE":
         old_sample_id = analysis["sample_id"]
         if old_sample_id is None:
             return jsonify(ok=True, analysis_id=analysis_id, sample_id=None, unchanged=True)
-        sample = db.execute("SELECT * FROM samples WHERE id=?", (old_sample_id,)).fetchone()
-        if sample and sample["status"] in {"reviewed", "reported", "cancelled"}:
+        sample = db.execute("SELECT * FROM samples WHERE id=%s", (old_sample_id,)).fetchone()
+        if sample and sample["status"] in {"reviewed", "cancelled"}:
             return jsonify(ok=False, error="已审核或已作废样品不能解绑 XRF 扫描"), 409
         before = dict(analysis)
-        db.execute("UPDATE xrf_analyses SET sample_id=NULL WHERE id=?", (analysis_id,))
-        db.execute("UPDATE xrf_values SET use_report=0 WHERE analysis_id=?", (analysis_id,))
+        db.execute("UPDATE xrf_analyses SET sample_id=NULL WHERE id=%s", (analysis_id,))
+        db.execute("UPDATE xrf_values SET use_report=0 WHERE analysis_id=%s", (analysis_id,))
         recompute_sample_progress(db, old_sample_id)
-        after = dict(db.execute("SELECT * FROM xrf_analyses WHERE id=?", (analysis_id,)).fetchone())
+        after = dict(db.execute("SELECT * FROM xrf_analyses WHERE id=%s", (analysis_id,)).fetchone())
         audit_event(db, "xrf_unassign", "xrf_analysis", analysis_id, before=before, after=after)
         db.commit()
         return jsonify(ok=True, analysis_id=analysis_id, sample_id=None)
@@ -4395,19 +4360,19 @@ def assign_xrf_analysis(analysis_id):
         sample_id = int((request.json or {}).get("sample_id"))
     except (TypeError, ValueError):
         return jsonify(ok=False, error="请选择要关联的 LIMS 样品"), 400
-    sample = db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    sample = db.execute("SELECT * FROM samples WHERE id=%s", (sample_id,)).fetchone()
     if not sample:
         return jsonify(ok=False, error="LIMS 样品不存在"), 404
     if (sample["workflow_type"] or "regular") != "regular" or not sample["xrf"]:
         return jsonify(ok=False, error="只能关联已启用 XRF 的常规样品"), 409
-    if sample["status"] in {"reviewed", "reported", "cancelled"}:
+    if sample["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="已审核或已作废样品不能关联 XRF 扫描"), 409
     old_sample_id = analysis["sample_id"]
     if old_sample_id == sample_id:
         return jsonify(ok=True, analysis_id=analysis_id, sample_id=sample_id, unchanged=True)
     if old_sample_id is not None:
         return jsonify(ok=False, error="该 XRF 扫描已关联其他样品"), 409
-    occupied = db.execute("SELECT id FROM xrf_analyses WHERE sample_id=? LIMIT 1",
+    occupied = db.execute("SELECT id FROM xrf_analyses WHERE sample_id=%s LIMIT 1",
                           (sample_id,)).fetchone()
     if occupied:
         return jsonify(ok=False, error="该样品已关联 XRF 扫描，请先解绑原扫描"), 409
@@ -4416,20 +4381,20 @@ def assign_xrf_analysis(analysis_id):
         r"[,，、;；\s]+", sample["xrf_report_items"] or "") if part.strip()}
     before = dict(analysis)
     try:
-        assigned = db.execute("UPDATE xrf_analyses SET sample_id=? WHERE id=? AND sample_id IS NULL",
+        assigned = db.execute("UPDATE xrf_analyses SET sample_id=%s WHERE id=%s AND sample_id IS NULL",
                               (sample_id, analysis_id))
     except INTEGRITY_ERRORS:
         db.rollback()
         return jsonify(ok=False, error="该样品已关联 XRF 扫描，请先解绑原扫描"), 409
     if assigned.rowcount != 1:
         return jsonify(ok=False, error="该 XRF 扫描已关联其他样品"), 409
-    db.execute("UPDATE xrf_values SET use_report=0 WHERE analysis_id=?", (analysis_id,))
+    db.execute("UPDATE xrf_values SET use_report=0 WHERE analysis_id=%s", (analysis_id,))
     if defaults:
-        values = db.execute("SELECT id,name FROM xrf_values WHERE analysis_id=?", (analysis_id,)).fetchall()
-        db.executemany("UPDATE xrf_values SET use_report=1 WHERE id=?",
+        values = db.execute("SELECT id,name FROM xrf_values WHERE analysis_id=%s", (analysis_id,)).fetchall()
+        db.executemany("UPDATE xrf_values SET use_report=1 WHERE id=%s",
                        [(value["id"],) for value in values if value["name"].casefold() in defaults])
     recompute_sample_progress(db, sample_id)
-    after = dict(db.execute("SELECT * FROM xrf_analyses WHERE id=?", (analysis_id,)).fetchone())
+    after = dict(db.execute("SELECT * FROM xrf_analyses WHERE id=%s", (analysis_id,)).fetchone())
     audit_event(db, "xrf_assign", "xrf_analysis", analysis_id, before=before, after=after)
     db.commit()
     return jsonify(ok=True, analysis_id=analysis_id, sample_id=sample_id,
@@ -4455,11 +4420,11 @@ def xrf_monitor():
         FROM standard_client_status scs
         LEFT JOIN instruments i ON i.id=scs.instrument_id
         LEFT JOIN users u ON u.id=scs.user_id
-        WHERE datetime(scs.seen_at)>=datetime('now','localtime','-60 seconds')
+        WHERE scs.seen_at::timestamp >= clock_timestamp() - interval '60 seconds'
         ORDER BY scs.seen_at DESC,scs.client_id""")
     for standard_client in standard_clients:
         latest = db.execute("""SELECT response_json,created_at
-            FROM standard_client_submissions WHERE client_id=? ORDER BY id DESC LIMIT 1""",
+            FROM standard_client_submissions WHERE client_id=%s ORDER BY id DESC LIMIT 1""",
                             (standard_client["client_id"],)).fetchone()
         standard_client["recent_entry"] = None
         if latest:
@@ -4484,10 +4449,10 @@ def xrf_monitor():
     if query:
         conditions.append("""lower(COALESCE(xa.sample_name,'') || ' ' || COALESCE(s.name,'') ||
             ' ' || COALESCE(s.lims_no,'') || ' ' || COALESCE(xa.method,'') ||
-            ' ' || COALESCE(xa.batch,'') || ' ' || COALESCE(xa.external_id,'')) LIKE ?""")
+            ' ' || COALESCE(xa.batch,'') || ' ' || COALESCE(xa.external_id,'')) LIKE %s""")
         params.append(f"%{query}%")
     if kind in {"quant", "uq"}:
-        conditions.append("COALESCE(xa.kind,'quant')=?")
+        conditions.append("COALESCE(xa.kind,'quant')=%s")
         params.append(kind)
     if match == "matched":
         conditions.append("xa.sample_id IS NOT NULL")
@@ -4501,7 +4466,7 @@ def xrf_monitor():
     scans = rows(f"""SELECT xa.*,s.name AS lims_sample_name,s.lims_no,
             s.status AS sample_status FROM xrf_analyses xa
         LEFT JOIN samples s ON s.id=xa.sample_id WHERE {where}
-        ORDER BY COALESCE(xa.analyzed_at,xa.created_at) DESC,xa.id DESC LIMIT ? OFFSET ?""",
+        ORDER BY COALESCE(xa.analyzed_at,xa.created_at) DESC,xa.id DESC LIMIT %s OFFSET %s""",
                  (*params, page_size, (page - 1) * page_size))
     option_labels = {
         "chemistry": "化学表示", "shape": "Shape", "case_nb": "Case",
@@ -4534,7 +4499,7 @@ def xrf_monitor():
             details.append({"label": label, "value": value})
         scan["option_details"] = details
         values = rows("""SELECT id,name,value,use_report FROM xrf_values
-            WHERE analysis_id=? AND lower(substr(name,1,2))<>'bg'
+            WHERE analysis_id=%s AND lower(substr(name,1,2))<>'bg'
             ORDER BY value DESC,id""", (scan["id"],))
         scan["values"] = values
         scan["value_count"] = len(values)
@@ -4552,7 +4517,7 @@ def xrf_uq_detail(uid):
     db = get_db()
     analysis = db.execute("""SELECT ua.*,s.name AS lims_sample_name,s.lims_no,
             s.status AS sample_status FROM uq_analyses ua
-            LEFT JOIN samples s ON s.id=ua.sample_id WHERE ua.id=?""", (uid,)).fetchone()
+            LEFT JOIN samples s ON s.id=ua.sample_id WHERE ua.id=%s""", (uid,)).fetchone()
     if not analysis:
         return jsonify(ok=False, error="UniQuant 记录不存在"), 404
     result = dict(analysis)
@@ -4561,7 +4526,7 @@ def xrf_uq_detail(uid):
             result[target] = json.loads(result.pop(source) or "{}")
         except (TypeError, json.JSONDecodeError):
             result[target] = {}
-    channels = rows("SELECT * FROM uq_channels WHERE uq_analysis_id=? ORDER BY id", (uid,))
+    channels = rows("SELECT * FROM uq_channels WHERE uq_analysis_id=%s ORDER BY id", (uid,))
     for channel in channels:
         try:
             channel["payload"] = json.loads(channel.pop("payload_json") or "{}")
@@ -4577,13 +4542,13 @@ def xrf_report_use(vid):
     db = get_db()
     row = db.execute("""SELECT xv.*,xa.sample_id,s.status FROM xrf_values xv
         JOIN xrf_analyses xa ON xa.id=xv.analysis_id JOIN samples s ON s.id=xa.sample_id
-        WHERE xv.id=?""", (vid,)).fetchone()
+        WHERE xv.id=%s""", (vid,)).fetchone()
     if not row:
         return jsonify(ok=False, error="XRF 结果不存在"), 404
-    if row["status"] in {"reviewed", "reported", "cancelled"}:
+    if row["status"] in {"reviewed", "cancelled"}:
         return jsonify(ok=False, error="已审核或已作废，不能改变结果参与计算状态"), 409
     use = bool((request.json or {}).get("use", True))
-    db.execute("UPDATE xrf_values SET use_report=? WHERE id=?", (int(use), vid))
+    db.execute("UPDATE xrf_values SET use_report=%s WHERE id=%s", (int(use), vid))
     audit_event(db, "xrf_report_use", "xrf_value", vid, before=dict(row),
                 after={"use_report": int(use)})
     db.commit()

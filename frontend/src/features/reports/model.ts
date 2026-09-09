@@ -15,7 +15,7 @@ export interface Measurement {
   sample_analyte_id?: number | null; xrf_value_id?: number; prep?: string; instrument?: string | null;
   method?: string; value?: Value; unit?: string; selection?: string | null; readings?: Reading[];
   mass_g?: Value; volume_ml?: Value; dilution?: string;
-  aux?: { use?: boolean; expected?: number; measured?: number; coefficient?: number };
+  aux?: { use?: boolean; expected?: number; measured?: number };
   xrf_resolution?: { via: string; note: string };
 }
 export interface Group {
